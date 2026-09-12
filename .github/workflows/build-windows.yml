@@ -51,8 +51,8 @@ jobs:
         buildPreset: release-windows-${{ matrix.arch.name }}
     - uses: actions/upload-artifact@v7
       with:
-        name: melonDS-windows-${{ matrix.arch.name }}
-        path: .\build\release-windows-${{ matrix.arch.name }}\melonDS.exe
+        name: melonDS-Multiplayer-windows-${{ matrix.arch.name }}
+        path: .\build\release-windows-${{ matrix.arch.name }}\melonDS.exe  # Note: Tauri app will have different output path
     - name: Save vcpkg cache
       uses: actions/cache/save@v4
       with:

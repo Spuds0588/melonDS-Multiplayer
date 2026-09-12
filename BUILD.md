@@ -1,4 +1,10 @@
-# Building melonDS
+# Building melonDS Multiplayer
+
+This project is based on melonDS. See the original [BUILD.md](https://github.com/melonDS-emu/melonDS/blob/master/BUILD.md) for detailed build instructions for the emulator core.
+
+The build process below applies to the melonDS core. For the Tauri frontend, see the Tauri documentation.
+
+## Building the melonDS Core
 
 * [Linux](#linux)
 * [Windows](#windows)

@@ -1,5 +1,4 @@
-{
-  description = "Nintendo DS emulator";
+{  description = "Nintendo DS emulator with multiplayer support (Tauri/WebRTC)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -20,8 +19,8 @@
         else sourceInfo.shortRev;
 
       melonDS = pkgs.stdenv.mkDerivation {
-        pname = "melonDS";
-        version = "1.1-${shortRevision}";
+        pname = "melonDS-Multiplayer";
+        version = "0.1.0-${shortRevision}";
         src = ./.;
 
         nativeBuildInputs = with pkgs; [

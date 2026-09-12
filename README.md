@@ -1,71 +1,108 @@
-<p align="center"><img src="https://raw.githubusercontent.com/melonDS-emu/melonDS/master/res/icon/melon_128x128.png"></p>
-<h2 align="center"><b>melonDS</b></h2>
+# melonDS Multiplayer
+
 <p align="center">
-<a href="http://melonds.kuribo64.net/" alt="melonDS website"><img src="https://img.shields.io/badge/website-melonds.kuribo64.net-%2331352e.svg"></a>
-<a href="http://melonds.kuribo64.net/downloads.php" alt="Release: 1.1"><img src="https://img.shields.io/badge/release-1.1-%235c913b.svg"></a>
-<a href="https://www.gnu.org/licenses/gpl-3.0" alt="License: GPLv3"><img src="https://img.shields.io/badge/License-GPL%20v3-%23ff554d.svg"></a>
-<a href="https://kiwiirc.com/client/irc.badnik.net/?nick=IRC-Source_?#melonds" alt="IRC channel: #melonds"><img src="https://img.shields.io/badge/IRC%20chat-%23melonds-%23dd2e44.svg"></a>
-<a href="https://discord.gg/pAMAtExcqV" alt="Discord"><img src="https://img.shields.io/badge/Discord-Kuribo64-7289da?logo=discord&logoColor=white"></a>
-<br>
-<a href="https://github.com/melonDS-emu/melonDS/actions/workflows/build-windows.yml?query=event%3Apush"><img src="https://github.com/melonDS-emu/melonDS/actions/workflows/build-windows.yml/badge.svg" /></a>
-<a href="https://github.com/melonDS-emu/melonDS/actions/workflows/build-ubuntu.yml?query=event%3Apush"><img src="https://github.com/melonDS-emu/melonDS/actions/workflows/build-ubuntu.yml/badge.svg" /></a>
-<a href="https://github.com/melonDS-emu/melonDS/actions/workflows/build-macos.yml?query=event%3Apush"><img src="https://github.com/melonDS-emu/melonDS/actions/workflows/build-macos.yml/badge.svg" /></a>
-<a href="https://github.com/melonDS-emu/melonDS/actions/workflows/build-bsd.yml?query=event%3Apush"><img src="https://github.com/melonDS-emu/melonDS/actions/workflows/build-bsd.yml/badge.svg" /></a>
+  <img src="res/icon/melon_128x128.png" width="128">
 </p>
-DS emulator, sorta
 
-The goal is to do things right and fast, akin to blargSNES (but hopefully better). But also to, you know, have a fun challenge :)
-<hr>
+<h2 align="center"><b>melonDS Multiplayer</b></h2>
+<p align="center">
+  <a href="https://github.com/Spuds0588/melonDS-Multiplayer" alt="GitHub Repository"><img src="https://img.shields.io/badge/GitHub-melonDS--Multiplayer-%23333.svg"></a>
+  <a href="https://tauri.app/" alt="Built with Tauri"><img src="https://img.shields.io/badge/Built%20with-Tauri-FFC131?logo=tauri"></a>
+</p>
 
-## How to use
+**DS emulator, multiplayer edition.**
 
-Firmware boot (not direct boot) requires a BIOS/firmware dump from an original DS or DS Lite.
-DS firmwares dumped from a DSi or 3DS aren't bootable and only contain configuration data, thus they are only suitable when booting games directly.
+A Tauri-based desktop application that runs multiple linked melonDS emulator instances for a splitscreen multiplayer experience. Remote players connect via a web browser through WebRTC, while the host handles all emulation in native code.
 
-### Possible firmware sizes
+> **Note:** This is a fork of the [melonDS](https://github.com/melonDS-emu/melonDS) emulator, adapted for multiplayer functionality using a thin-client architecture. This is a separate project from the main melonDS emulator.
 
- * 128KB: DSi/3DS DS-mode firmware (reduced size due to lacking bootcode)
- * 256KB: regular DS firmware
- * 512KB: iQue DS firmware
+---
 
-DS BIOS dumps from a DSi or 3DS can be used with no compatibility issues. DSi BIOS dumps (in DSi mode) are not compatible. Or maybe they are. I don't know.
+## About
 
-As for the rest, the interface should be pretty straightforward. If you have a question, don't hesitate to ask, though!
+melonDS Multiplayer is a project that adapts the melonDS Nintendo DS emulator for online multiplayer gaming. It uses a "thin client" architecture where:
 
-## How to build
-See [BUILD.md](./BUILD.md) for build instructions.
+- **Host (Tauri App):** Runs the native desktop application that handles all emulation and virtual Wi-Fi routing
+- **Web Clients:** Remote players join via a simple web URL and receive low-latency WebRTC video streams
 
-## TODO LIST
+The goal is to enable seamless, zero-desync local multiplayer over the internet for games like Mario Kart DS, Pokémon, and other multiplayer NDS titles.
 
- * better DSi emulation
- * better OpenGL rendering
- * netplay
- * the impossible quest of pixel-perfect 3D graphics
- * support for rendering screens to separate windows
- * emulating some fancy addons
- * other non-core shit (debugger, graphics viewers, etc)
+## Features
 
-### TODO LIST FOR LATER (low priority)
+- Native desktop application built with Tauri (Rust + Webview)
+- Multiple simultaneous melonDS emulator instances
+- Virtual Wi-Fi networking for in-game multiplayer
+- WebRTC streaming for remote players
+- Zero-install for remote players (just a web browser)
+- Keyboard/mouse input mapping for touch screens
+- Save state support on the host
 
- * big-endian compatibility (Wii, etc)
- * LCD refresh time (used by some games for blending effects)
- * any feature you can eventually ask for that isn't outright stupid
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      HOST (Tauri App)                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+│  │ MelonDS #1   │  │ MelonDS #2   │  │ MelonDS #N   │    │
+│  │ (NDS #1)     │  │ (NDS #2)     │  │ (NDS #N)     │    │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘    │
+│         │                 │                 │             │
+│         └─────────────────┼─────────────────┘             │
+│                           │                                 │
+│                    [Virtual Wi-Fi Routing]                  │
+│                           │                                 │
+│         ┌─────────────────┼─────────────────┐             │
+│         │       Frontend (WebView)          │             │
+│         │   - WebRTC Gateway                │             │
+│         │   - Framebuffer rendering         │             │
+│         │   - Input routing                 │             │
+│         └──────────────┬────────────────────┘             │
+└────────────────────────┼───────────────────────────────────┘
+                         │
+              ┌──────────┴──────────┐
+              │   WebRTC (P2P)      │
+              └──────────┬──────────┘
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+   [Player 2]      [Player 3]      [Player N]
+   Web Browser     Web Browser     Web Browser
+   (Thin Client)   (Thin Client)   (Thin Client)
+```
+
+## Requirements
+
+### For Host
+- Windows, macOS, or Linux
+- Rust (for building from source)
+- Nintendo DS ROM files
+- BIOS/firmware files (for firmware boot)
+
+### For Remote Players
+- Any modern web browser
+- Stable internet connection
+- No installation required
+
+## Building from Source
+
+See [BUILD.md](./BUILD.md) for detailed build instructions.
+
+## Project Status
+
+This project is currently in development. See [to-do.md](./to-do.md) for the development roadmap.
 
 ## Credits
 
- * Martin for GBAtek, a good piece of documentation
- * Cydrak for the extra 3D GPU research
- * limittox for the icon
- * All of you comrades who have been testing melonDS, reporting issues, suggesting shit, etc
+Based on [melonDS](https://github.com/melonDS-emu/melonDS) by Arisotura.
 
-## Licenses
+- Martin for GBAtek, a good piece of documentation
+- Cydrak for the extra 3D GPU research
+- limittox for the icon
+- All of you comrades who have been testing melonDS, reporting issues, suggesting shit, etc
 
-[![GNU GPLv3 Image](https://www.gnu.org/graphics/gplv3-127x51.png)](http://www.gnu.org/licenses/gpl-3.0.en.html)
+## License
 
-melonDS is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+This project incorporates code from melonDS which is licensed under the GNU GPL v3. See the [LICENSE](./LICENSE) file for details.
 
 ### External
 * Images used in the Input Config Dialog - see `src/frontend/qt_sdl/InputConfig/resources/LICENSE.md`

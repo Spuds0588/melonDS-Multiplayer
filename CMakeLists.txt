@@ -16,10 +16,10 @@ if (USE_VCPKG)
 	include(ConfigureVcpkg)
 endif()
 
-project(melonDS
-    VERSION 1.1
-    DESCRIPTION "DS emulator, sorta"
-    HOMEPAGE_URL "https://melonds.kuribo64.net"
+project(melonDS-Multiplayer
+    VERSION 0.1.0
+    DESCRIPTION "DS emulator with multiplayer support via Tauri/WebRTC"
+    HOMEPAGE_URL "https://github.com/Spuds0588/melonDS-Multiplayer"
     LANGUAGES C CXX)
 
 include(CheckSymbolExists)

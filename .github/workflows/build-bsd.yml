@@ -102,5 +102,5 @@ jobs:
     - name: Upload binary
       uses: actions/upload-artifact@v7
       with:
-        name: melonDS-${{ matrix.os }}-${{ matrix.arch }}
+        name: melonDS-Multiplayer-${{ matrix.os }}-${{ matrix.arch }}
         path: build/melonDS
