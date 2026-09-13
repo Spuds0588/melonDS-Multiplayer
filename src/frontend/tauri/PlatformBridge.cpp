@@ -450,7 +450,10 @@ int MP_SendPacket(u8* data, int len, u64 timestamp, void* userdata)
     auto* bus = md::link_bus();
     const int slot = md::slot_for(userdata);
     if (!bus || slot < 0) return 0;
-    return bus->SendPacket(slot, data, len, timestamp);
+
+    const int queued = bus->SendPacket(slot, data, len, timestamp);
+    md::note_packet_sent(userdata, queued);
+    return queued;
 }
 
 int MP_RecvPacket(u8* data, u64* timestamp, void* userdata)
@@ -458,7 +461,10 @@ int MP_RecvPacket(u8* data, u64* timestamp, void* userdata)
     auto* bus = md::link_bus();
     const int slot = md::slot_for(userdata);
     if (!bus || slot < 0) return 0;
-    return bus->RecvPacket(slot, data, timestamp);
+
+    const int got = bus->RecvPacket(slot, data, timestamp);
+    md::note_packet_received(userdata, got);
+    return got;
 }
 
 int MP_SendCmd(u8* data, int len, u64 timestamp, void* userdata)
@@ -466,7 +472,10 @@ int MP_SendCmd(u8* data, int len, u64 timestamp, void* userdata)
     auto* bus = md::link_bus();
     const int slot = md::slot_for(userdata);
     if (!bus || slot < 0) return 0;
-    return bus->SendCmd(slot, data, len, timestamp);
+
+    const int queued = bus->SendCmd(slot, data, len, timestamp);
+    md::note_packet_sent(userdata, queued);
+    return queued;
 }
 
 int MP_SendReply(u8* data, int len, u64 timestamp, u16 aid, void* userdata)
@@ -474,7 +483,10 @@ int MP_SendReply(u8* data, int len, u64 timestamp, u16 aid, void* userdata)
     auto* bus = md::link_bus();
     const int slot = md::slot_for(userdata);
     if (!bus || slot < 0) return 0;
-    return bus->SendReply(slot, data, len, timestamp, aid);
+
+    const int queued = bus->SendReply(slot, data, len, timestamp, aid);
+    md::note_packet_sent(userdata, queued);
+    return queued;
 }
 
 int MP_SendAck(u8* data, int len, u64 timestamp, void* userdata)
@@ -482,7 +494,10 @@ int MP_SendAck(u8* data, int len, u64 timestamp, void* userdata)
     auto* bus = md::link_bus();
     const int slot = md::slot_for(userdata);
     if (!bus || slot < 0) return 0;
-    return bus->SendAck(slot, data, len, timestamp);
+
+    const int queued = bus->SendAck(slot, data, len, timestamp);
+    md::note_packet_sent(userdata, queued);
+    return queued;
 }
 
 int MP_RecvHostPacket(u8* data, u64* timestamp, void* userdata)
@@ -490,7 +505,10 @@ int MP_RecvHostPacket(u8* data, u64* timestamp, void* userdata)
     auto* bus = md::link_bus();
     const int slot = md::slot_for(userdata);
     if (!bus || slot < 0) return 0;
-    return bus->RecvHostPacket(slot, data, timestamp);
+
+    const int got = bus->RecvHostPacket(slot, data, timestamp);
+    md::note_packet_received(userdata, got);
+    return got;
 }
 
 u16 MP_RecvReplies(u8* data, u64 timestamp, u16 aidmask, void* userdata)
@@ -498,7 +516,13 @@ u16 MP_RecvReplies(u8* data, u64 timestamp, u16 aidmask, void* userdata)
     auto* bus = md::link_bus();
     const int slot = md::slot_for(userdata);
     if (!bus || slot < 0) return 0;
-    return bus->RecvReplies(slot, data, timestamp, aidmask);
+
+    const u16 replied = bus->RecvReplies(slot, data, timestamp, aidmask);
+
+    /* Counted as a packet but not as bytes: this one reports which clients
+       replied rather than how much was read, so a byte total would be a guess. */
+    if (replied) md::note_packet_received(userdata, 0);
+    return replied;
 }
 
 /* ---------------------------------------------------------------- internet comm */

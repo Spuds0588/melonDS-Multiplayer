@@ -52,8 +52,20 @@ public:
     static MPInterfaceType GetType() { return CurrentType; }
     static void Set(MPInterfaceType type);
 
+    /* How long a console blocks waiting for a frame from a peer. melonDS's own
+       frontend runs one real-time thread per console, so waiting is right there.
+       An embedding host that advances several consoles in lockstep must set this
+       to zero: a console waiting for a frame the peer cannot produce until it
+       finishes the same frame is a deadlock, not a delay. */
     [[nodiscard]] int GetRecvTimeout() const noexcept { return RecvTimeout; }
     void SetRecvTimeout(int timeout) noexcept { RecvTimeout = timeout; }
+
+    /* How long a host blocks collecting multiplayer replies. This one is worth
+       a short wait even in a lockstep host: the host asks for replies once per
+       command slot, and the clients' replies are racing it, so giving up
+       instantly makes the host retry a handshake it could have completed. */
+    [[nodiscard]] int GetReplyTimeout() const noexcept { return ReplyTimeout; }
+    void SetReplyTimeout(int timeout) noexcept { ReplyTimeout = timeout; }
 
     // function called every video frame
     virtual void Process() = 0;
@@ -71,6 +83,7 @@ public:
 
 protected:
     int RecvTimeout = 25;
+    int ReplyTimeout = 25;
 
 private:
     static MPInterfaceType CurrentType;

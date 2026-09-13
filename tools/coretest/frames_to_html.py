@@ -12,7 +12,13 @@ button blocks on the bottom screen and reports which buttons are lit. That turns
 others", which is the property the product actually depends on.
 
 Usage:
-    python3 frames_to_html.py captures/
+    python3 frames_to_html.py captures/ [--plain] [--grid] [--mark X,Y]
+
+    --plain   a real game rather than the diagnostic ROM, so skip the
+              button-block sensors and just show the frames
+    --grid    overlay a coordinate ruler on both screens
+    --mark    draw a crosshair (repeatable, "top:X,Y" for the top screen)
+    --only    keep only these host frames, e.g. --only 1200,1210,1230
 """
 
 from __future__ import annotations
@@ -25,6 +31,45 @@ from pathlib import Path
 
 SCREEN_W, SCREEN_H = 256, 192
 FRAME_H = SCREEN_H * 2            # top screen stacked above bottom screen
+
+# The diagnostic-ROM specific checks only make sense for frames captured from
+# tools/mkdiagrom. Running a real game instead shows the frames plainly: the
+# button-block sensors would be reading whatever the game happens to draw.
+PLAIN = "--plain" in sys.argv
+if PLAIN:
+    sys.argv.remove("--plain")
+
+# Measuring the touch screen by eye is hopeless: the game's own UI is the only
+# thing that defines where a button is, and guessing at coordinates wastes runs.
+# --grid draws a coordinate ruler over both screens and --mark draws a crosshair,
+# so a capture can be read off instead of guessed at. Marks are bottom-screen
+# coordinates unless prefixed "top:" (e.g. --mark 67,145 --mark top:128,68).
+GRID = "--grid" in sys.argv
+if GRID:
+    sys.argv.remove("--grid")
+
+# Reviewing a long run means looking at a handful of frames, not all 200 of
+# them: --only keeps just those, by host frame number.
+ONLY: set[int] | None = None
+if "--only" in sys.argv:
+    at = sys.argv.index("--only")
+    if at + 1 >= len(sys.argv):
+        raise SystemExit("--only needs a comma-separated list of frames")
+    ONLY = {int(v) for v in sys.argv[at + 1].split(",")}
+    del sys.argv[at:at + 2]
+
+MARKS: list[tuple[str, int, int]] = []
+while "--mark" in sys.argv:
+    at = sys.argv.index("--mark")
+    if at + 1 >= len(sys.argv):
+        raise SystemExit("--mark needs X,Y")
+    spec = sys.argv[at + 1]
+    del sys.argv[at:at + 2]
+    screen = "bottom"
+    if ":" in spec:
+        screen, spec = spec.split(":", 1)
+    mx, my = (int(v) for v in spec.split(","))
+    MARKS.append((screen, mx, my))
 
 # --- Diagnostic ROM geometry (keep in step with tools/mkdiagrom/mkdiagrom.py) --
 NUM_BUTTONS = 12
@@ -118,10 +163,15 @@ class Frame:
         return {BUTTON_NAMES[i] for i in range(NUM_BUTTONS)
                 if self.block_rgb(i) != idle[i]}
 
-    def to_png_base64(self) -> str:
-        """Compose the two screens with a divider and encode as a data URI."""
-        divider = bytes((0x20, 0x20, 0x28, 0xFF)) * SCREEN_W
-        rows = []
+    def to_png_base64(self, grid: bool = False,
+                      marks: list[tuple[str, int, int]] | None = None) -> str:
+        """Compose the two screens with a divider and encode as a data URI.
+
+        `grid` draws a coordinate ruler over both screens - verticals every 32
+        pixels, horizontals every 32 - and `marks` draws crosshairs, so a capture
+        can be measured rather than eyeballed.
+        """
+        rows: list[bytearray] = []
         for y in range(FRAME_H):
             stride = y * SCREEN_W * 4
             row = self.data[stride:stride + SCREEN_W * 4]
@@ -129,11 +179,36 @@ class Frame:
             for x in range(SCREEN_W):
                 b, g, r, a = row[x * 4:x * 4 + 4]
                 rgba += bytes((r, g, b, a if a else 0xFF))
-            rows.append(bytes(rgba))
+            rows.append(rgba)
             if y == SCREEN_H - 1:
-                rows.append(divider)
+                rows.append(bytearray(bytes((0x20, 0x20, 0x28, 0xFF)) * SCREEN_W))
 
-        png = png_encode(SCREEN_W, len(rows), b"".join(rows))
+        def put(screen: str, x: int, y: int, colour: tuple[int, int, int]) -> None:
+            """Set one composed pixel, ignoring anything off that screen."""
+            if not (0 <= x < SCREEN_W and 0 <= y < SCREEN_H):
+                return
+            row = rows[y if screen == "top" else y + SCREEN_H + 1]
+            off = x * 4
+            row[off:off + 4] = bytes((colour[0], colour[1], colour[2], 0xFF))
+
+        if grid:
+            for screen in ("top", "bottom"):
+                for x in range(0, SCREEN_W, 32):
+                    for y in range(SCREEN_H):
+                        put(screen, x, y, (0, 190, 0))
+                for y in range(0, SCREEN_H, 32):
+                    for x in range(SCREEN_W):
+                        put(screen, x, y, (215, 215, 0))
+
+        for screen, x, y in (marks or []):
+            for d in range(-7, 8):
+                put(screen, x + d, y, (255, 0, 0))
+                put(screen, x, y + d, (255, 0, 0))
+            for d in (-1, 0, 1):
+                put(screen, x + d, y - 1, (255, 0, 0))
+                put(screen, x + d, y + 1, (255, 0, 0))
+
+        png = png_encode(SCREEN_W, len(rows), b"".join(bytes(r) for r in rows))
         return base64.b64encode(png).decode("ascii")
 
 
@@ -169,6 +244,12 @@ def main() -> int:
             "note": note,
         })
 
+    if ONLY is not None:
+        entries = [e for e in entries if e["frame"] in ONLY]
+        if not entries:
+            print(f"no captures in {outdir} match --only")
+            return 1
+
     frames: dict[tuple[str, str], Frame] = {}
     checks: list[tuple[bool, str]] = []
 
@@ -183,20 +264,75 @@ def main() -> int:
 
     # Calibrate the idle colour per instance, then mark up every capture.
     for instance in sorted({e["instance"] for e in entries}):
-        idle = idle_colours([e["img"] for e in entries if e["instance"] == instance])
+        idle = [] if PLAIN else idle_colours(
+            [e["img"] for e in entries if e["instance"] == instance])
         for entry in entries:
             if entry["instance"] != instance:
                 continue
             entry["idle"] = idle
-            entry["lit"] = sorted(entry["img"].lit_buttons(idle))
+            entry["lit"] = sorted(entry["img"].lit_buttons(idle)) if idle else []
             entry["colours"] = len(entry["img"].distinct_colours())
-            entry["png"] = entry["img"].to_png_base64()
+            entry["png"] = entry["img"].to_png_base64(GRID, MARKS)
 
     # ---- the checks a human would otherwise have to eyeball ------------------
     for entry in entries:
         checks.append((entry["colours"] >= 2,
                        f"{label_of[entry['file']]}: not a blank screen "
                        f"({entry['colours']}+ colours)"))
+
+    if PLAIN:
+        # A real game: all we can assert without knowing the game is that the
+        # picture is not blank, and the cards are there to be looked at.
+        passed = sum(1 for ok, _ in checks if ok)
+        cards = "".join(
+            f"""
+      <figure class="card">
+        <div class="meta"><strong>{e['instance']}</strong>
+          <span class="tag">frame {e['frame']}</span></div>
+        <img alt="{e['file']}" src="data:image/png;base64,{e['png']}">
+        <figcaption><p class="note">{e['note']}</p>
+          <p class="sensors">{e['colours']}+ colours</p></figcaption>
+      </figure>""" for e in entries)
+        results = "\n".join(
+            f'<li class="{"ok" if ok else "fail"}">{"PASS" if ok else "FAIL"} &mdash; {t}</li>'
+            for ok, t in checks)
+        html = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>melonDS Multiplayer - game frames</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{ margin: 0; padding: 28px; background: #14161a; color: #e8e8ec;
+          font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; }}
+  h1 {{ font-size: 20px; margin: 0 0 4px; }}
+  .sub {{ color: #9aa0aa; margin-bottom: 22px; }}
+  .summary {{ background: #1c1f26; border: 1px solid #2b2f38; border-radius: 10px;
+              padding: 14px 18px; margin-bottom: 26px; }}
+  ul {{ margin: 0; padding-left: 0; list-style: none; }}
+  li {{ padding: 3px 0 3px 26px; position: relative; }}
+  li::before {{ position: absolute; left: 0; font-weight: 700; }}
+  li.ok::before {{ content: "\\2713"; color: #56d364; }}
+  li.fail::before {{ content: "\\2717"; color: #f85149; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr)); gap: 20px; }}
+  .card {{ margin: 0; background: #1c1f26; border: 1px solid #2b2f38; border-radius: 10px;
+           overflow: hidden; }}
+  .meta {{ display: flex; align-items: baseline; gap: 8px; padding: 9px 12px;
+           border-bottom: 1px solid #2b2f38; font-size: 13px; }}
+  .tag {{ margin-left: auto; color: #6e7681; font-size: 11px; }}
+  img {{ display: block; width: 100%; image-rendering: pixelated; background: #000; }}
+  figcaption {{ padding: 9px 12px 12px; }}
+  .note {{ margin: 0 0 6px; color: #c9cdd4; font-size: 12.5px; }}
+  .sensors {{ margin: 0; color: #8b919b; font-size: 11.5px; }}
+</style></head><body>
+  <h1>melonDS Multiplayer &mdash; real game frames</h1>
+  <div class="sub">Top screen above, bottom screen below, straight out of the software renderer.</div>
+  <div class="summary"><h2>{passed}/{len(checks)} checks</h2><ul>{results}</ul></div>
+  <div class="grid">{cards}</div>
+</body></html>"""
+        (outdir / "sheet.html").write_text(html)
+        print(f"{passed}/{len(checks)} checks")
+        for ok, text in checks:
+            print(f"  {'PASS' if ok else 'FAIL'}  {text}")
+        print(f"\nwrote {outdir / 'sheet.html'}")
+        return 0 if passed == len(checks) else 1
 
     idles = [("player1", "idle"), ("player2", "idle"), ("player3", "idle")]
     for i in range(len(idles)):

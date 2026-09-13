@@ -26,12 +26,26 @@ freebios/FreeBIOS_Data.h
 freebios/bios*
 freebios/build/
 
+# ---------------------------------------------------------------------------
+# Game ROMs. Never commit these, and never commit anything derived from them:
+# they are copyrighted, they are large, and they are user-supplied by design.
+# The folder is deliberately ignored as a whole so a new file dropped into it
+# cannot be picked up by accident.
+Test Roms/
+*.nds
+*.sav
+*.dsv
+*.nds.bak
+
 # Generated diagnostic ROM (rebuild with tools/mkdiagrom/mkdiagrom.py)
 tools/mkdiagrom/*.nds
 __pycache__/
 
 # Visual capture output (rebuild with md_capture + frames_to_html.py)
 captures/
+# Frames and reports from running real games; may contain game imagery.
+game-captures/
+reports/
 
 # Rust / Tauri build output
 src-tauri/target/

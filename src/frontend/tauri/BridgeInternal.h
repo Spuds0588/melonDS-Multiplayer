@@ -37,6 +37,12 @@ void notify_firmware_write(void* userdata, const melonDS::Firmware& firmware,
 void notify_mp_begin(void* userdata);
 void notify_mp_end(void* userdata);
 
+/* Called on every wireless frame the emulated console sends and accepts, so the
+   host can report whether a link is actually carrying traffic. Note that a send
+   with no listener still counts: the console transmitted regardless. */
+void note_packet_sent(void* userdata, int len);
+void note_packet_received(void* userdata, int len);
+
 /* Shared link bus. Both return nullptr while linking is disabled. */
 melonDS::LocalMP* link_bus();
 bool link_enabled();

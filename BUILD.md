@@ -78,6 +78,64 @@ This is not decoration: the contact sheet caught a bug the smoke test had been
 passing straight through, where every console rendered the ROM's fallback colour
 and was only distinguishable by its player pips.
 
+Both tools take options that matter when you are reading a real game rather than
+the diagnostic ROM:
+
+```bash
+# a real game: skip the button-block sensors, and rule the screens to measure them
+python3 tools/coretest/frames_to_html.py --plain --grid game-captures/run
+# show only these host frames, and mark a candidate touch point
+python3 tools/coretest/frames_to_html.py --plain --grid \
+  --only 1200,1230,1300 --mark 128,157 game-captures/run
+```
+
+`--grid` draws a coordinate ruler on both screens and `--mark X,Y` draws a
+crosshair (add `top:` for the top screen). That turns "where is that button"
+from guesswork into reading a number off the picture, which is the difference
+between one run and five.
+
+### Real game session
+
+`md_game_session` boots a commercial ROM into one or more consoles and reports
+what happened: whether each console kept producing frames, whether the game
+powered its wireless on, whether the link carried traffic, and how fast it ran.
+It can also drive the game's menus, by button **and by touch screen**, so a
+session can be walked to an in-game multiplayer lobby and beyond. No ROM is
+shipped or required by the build; point it at one you own.
+
+```bash
+./build-tauri/md_game_session "path/to/game.nds" --players 2 --frames 14000 \
+  --shot-dir game-captures/run --shot-every 200 \
+  --all-players --touch 600:128:68 --touch 1000:128:157@1 \
+  --touch 1400:128:68@1 --touch 1700:127:23@2 \
+  --autotap A:6500:90
+python3 tools/coretest/frames_to_html.py --plain game-captures/run
+```
+
+Input options (`--tap`, `--hold`, `--autotap`, `--touch`, `--holdtouch`,
+`--touchtap`) each take an optional `@P` suffix naming which consoles to drive,
+1-based and comma separated, so a host can be driven differently from the
+consoles joining it. Touch coordinates are touch-screen pixels: 0..255 across,
+0..191 down, origin top-left.
+
+Three settings are load-bearing, and `--serial` or a non-zero `--recv-timeout`
+will respectively crawl or hang rather than fail cleanly:
+
+| option | default | why |
+| --- | --- | --- |
+| threading | one thread per console | a console waiting for a peer's wireless frame can only be answered while the peer runs; in sequence every blocking receive waits out its full timeout |
+| `--recv-timeout` | `0` (poll) | melonDS's 25ms blocking receive assumes real-time consoles and deadlocks a lockstep host |
+| `--reply-timeout` | `2` | the host's reply collection genuinely races the clients, so polling there strands handshakes |
+
+Expect a little under 3x realtime for two linked consoles of a 3D game on a
+fairly ordinary laptop, and around 6x for a single console.
+
+### Linking two real games
+
+`tools/coretest` also documents a worked 2-console run of Mario Kart DS, menu
+coordinates included, in [history.md](./history.md). It is a useful starting
+point for driving any DS game into local wireless play.
+
 ## Building the melonDS Core
 
 * [Linux](#linux)

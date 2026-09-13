@@ -197,6 +197,146 @@ wireless stack in the diagnostic ROM.
   ROM whose own wireless stack runs. That is the next real milestone, and it is
   where the receive timeout and frame pacing will start to matter.
 
+### v0.1.3 - A Real Game Actually Links (September 2026)
+
+**Status**: Two commercial ROMs play a linked multiplayer race against each other.
+
+Mario Kart DS, two consoles, one process: both boot, discover each other over the
+emulated local wireless, join the same group, pick a game, both appear on the
+character-select screen, and race each other on the same course at 50cc - the
+same racetrack, the same clock, and complementary placings (1st and 2nd).
+
+That is the milestone the whole project exists for, and it needed three fixes
+that only a real game could have exposed. All three were in our own code or
+configuration, and all three failed *silently* - the game simply reported a
+communication error.
+
+**1. Consoles must run at the same time, not in turn.** The first harness drove
+console 1's frame, then console 2's, in a loop. That is fine for the diagnostic
+ROM and fatal for a link: a console that has to wait for its peer's wireless
+frame can only be answered *while the peer is running*. The harness now gives
+each console its own thread and meets at a per-frame barrier. It is also two to
+three times faster, which is a nice side effect of not deadlocking.
+
+**2. melonDS's blocking receive is wrong for a lockstep host.** `LocalMP` waits
+up to 25ms for a peer's frame. That is right for melonDS's own frontend, which
+runs one console per real-time thread, where the host really does put a beacon on
+the wire a few milliseconds later. In a lockstep host it is a deadlock by
+construction: the client blocks waiting for the host's beacon, the host is at the
+frame barrier waiting for the client to finish its frame, and `Wifi::USTimer`
+only advances its sync counter when a receive *succeeds*, so the client blocks
+again on the very next tick. Measured at roughly four seconds per frame, which is
+indistinguishable from a hang.
+
+The receive timeout is now settable, and a lockstep host sets it to 0. A frame
+the peer has not produced yet simply arrives next frame.
+
+**3. ...but the host's reply collection is the opposite case.** With everything
+polling, the session reached the character-select screen and then died with a
+communication error. The character-select handshake needs the host to collect its
+clients' replies, and it asks for them once per command slot while the clients are
+genuinely racing it - so polling meant the host kept giving up on handshakes it
+could have completed. A second, separate timeout now covers the reply path
+(`GetReplyTimeout`), defaulting to 2ms, while the peer-frame path stays at 0. Two
+milliseconds on the host is affordable because it is one wait per command slot,
+and the session went from "communication error" to a running race.
+
+With all three fixed: **two linked consoles of a 3D game at just under 3x
+realtime**, one console alone at around 6x.
+
+#### What the link carried
+
+The counters tell a clean story, and the byte totals matching exactly is the
+single most reassuring number in this project so far:
+
+| | player 1 (host) | player 2 (client) |
+| --- | --- | --- |
+| frames/session | 14000 | 14000 |
+| wireless on/off | 4/4 | 3/3 |
+| packets sent | 36876 | 18059 |
+| bytes sent | 2471216 | 550616 |
+| bytes received | (see note) | 2471054 |
+
+Player 2 received 2471054 bytes of the 2471216 player 1 sent. The 162-byte gap is
+frames in flight when the session ended, and it is the clearest possible evidence
+that the two consoles were talking to each other rather than merely both running.
+
+Note the asymmetry in the received column: a host collects its clients' replies
+through `LocalMP::RecvReplies`, which returns a bitmask of *who* replied and
+leaves the payload in the caller's buffer, so the platform layer never learns how
+many bytes arrived that way. The host's byte count is a lower bound; the sender's
+`bytes_sent` is the true figure. This is documented on the `MDLinkStats` field.
+
+#### Driving a real game's menus
+
+The harness can press buttons and the touch screen, with an optional `@P` suffix
+selecting which consoles to drive (`--touch 1000:128:157@1`). Mario Kart DS's
+route to local play, as measured off captured frames rather than guessed:
+
+1. **MULTIPLAYER** on the main menu - touch `(128, 68)`.
+2. It asks to confirm your nickname, then that it may show your name during
+   races, then whether to make an emblem. Yes is `(67, 145)`, roughly six seconds
+   in the lobby's own time. **The touch screen is the only way through these** -
+   they do not respond to the d-pad, which is what stalled the first attempts.
+3. **The group list**, whose four empty slots each show their own icon. A console
+   that stays here *scans*; a group appears as a cyan bar at the top, and joining
+   it is a tap at `(127, 23)`.
+4. **CREATE GROUP** is the button at the bottom of that same list, `(128, 157)` -
+   and it is at the *same* x as the group bar, so a coordinate guessed for one
+   silently presses the other.
+5. **NORMAL vs SIMPLE** (`(128, 68)` / `(67, 145)`): NORMAL is multi-card, every
+   console runs the ROM. SIMPLE is single-card download play. The two sit
+   vertically adjacent, and picking the wrong one still gets you to *a* lobby, so
+   the mistake is easy to miss.
+6. The host taps **CUT OFF** (`(149, 167)`) to stop accepting racers, then
+   **VS** (`(128, 22)`) on the game-select screen.
+7. Character select and game settings follow, and both consoles advance together.
+   Pressing A starts the race.
+
+The order surprised us: CREATE GROUP comes *before* the NORMAL/SIMPLE choice, not
+after. A first-time setup wizard also runs once and is then saved into the game's
+`.sav`, so the same script behaves differently on a second run - which is worth
+knowing before concluding that a menu was skipped.
+
+Because none of that geometry is guessable, `frames_to_html.py` grew `--grid`
+(a coordinate ruler on both screens) and `--mark X,Y` (a crosshair), plus `--only`
+to show a handful of chosen frames. Reading a button's position off a ruled
+screenshot is the difference between one run and five; two of the coordinates
+above were wrong before the ruler existed, both by less than 20 pixels.
+
+#### Smaller findings
+
+* **A one-shot tap used to stick.** The old harness only wrote buttons on the
+  frames a tap was asserted, so afterwards they stayed held forever. Each
+  console's whole input state is now recomputed and written every frame.* **`--touchtap` without `--all-players` drove only console 1**, which left the
+  second console sitting on a dialog while the first raced ahead. The symptom was
+  wildly different "frames drawn" between consoles, which reads as a crash until
+  the frames are actually looked at.
+* **A screenshot is not a measurement.** Several coordinates were "read" off the
+  contact sheet by eye and were off by enough to press the neighbouring button.
+  The ruler (`--grid`) exists so positions come off the picture instead.
+
+#### Known gaps — pick up here
+
+* **The race runs; the harness does not watch it play.** The consoles were driven
+  into a race and left there. Nothing yet asserts that player 1's kart and player
+  2's kart stay in sync for the whole three laps, or that items and rankings
+  agree - which is where a genuine desync would show up next.
+* **Only one game has been tried.** New Super Mario Bros. and Super Mario 64 DS
+  are in the local test set and have their own menus and their own wireless
+  quirks. A second title is the real proof the link is general and not a
+  Mario Kart-shaped special case.
+* **Three and four consoles are untested.** Two linked consoles cost about a
+  third of realtime each; four of a 3D game will not hold realtime on the current
+  machine, and the per-frame barrier and the host's 2ms reply window both scale
+  with player count.
+* **The Rust frontend still does not call the bridge**, and instances still run
+  the built-in FreeBIOS. Neither has been in the way of a real game, which is
+  worth noting given how often FreeBIOS was assumed to be a blocker.
+* **No frame-pacing story.** The link's timing is now driven entirely by frame
+  order, which is what makes a lockstep host work, but a console left to run free
+  is not slowed to 60fps and `Platform::Sleep` is unused.
+
 ---
 
 ## Lessons from mgba-splitscreen

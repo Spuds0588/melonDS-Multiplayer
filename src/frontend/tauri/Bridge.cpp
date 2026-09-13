@@ -24,6 +24,7 @@
 #include "LocalMP.h"
 
 using melonDS::u32;
+using melonDS::u64;
 using melonDS::u8;
 
 /* ------------------------------------------------------------ instance state */
@@ -50,6 +51,10 @@ struct MDInstance
     u32 frame_counter = 0;
     u32 link_begin_count = 0;
     u32 link_end_count = 0;
+    u64 link_packets_sent = 0;
+    u64 link_packets_received = 0;
+    u64 link_bytes_sent = 0;
+    u64 link_bytes_received = 0;
 
     /* scratch buffer for md_load_state() so the caller's buffer stays const */
     std::vector<u8> state_scratch;
@@ -217,6 +222,26 @@ void notify_mp_end(void* userdata)
     std::lock_guard<std::mutex> lock(g_link_lock);
     inst->link_end_count++;
     if (inst->slot >= 0) g_link_connected &= ~(1u << inst->slot);
+}
+
+void note_packet_sent(void* userdata, int len)
+{
+    auto* inst = static_cast<MDInstance*>(userdata);
+    if (!inst) return;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    inst->link_packets_sent++;
+    if (len > 0) inst->link_bytes_sent += (u64)len;
+}
+
+void note_packet_received(void* userdata, int len)
+{
+    auto* inst = static_cast<MDInstance*>(userdata);
+    if (!inst) return;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    inst->link_packets_received++;
+    if (len > 0) inst->link_bytes_received += (u64)len;
 }
 
 bool link_enabled()
@@ -630,6 +655,18 @@ int md_link_recv_timeout(void)
     return g_link_bus ? g_link_bus->GetRecvTimeout() : 0;
 }
 
+void md_link_set_reply_timeout(int milliseconds)
+{
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (g_link_bus) g_link_bus->SetReplyTimeout(milliseconds < 0 ? 0 : milliseconds);
+}
+
+int md_link_reply_timeout(void)
+{
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    return g_link_bus ? g_link_bus->GetReplyTimeout() : 0;
+}
+
 melonDS::u32 md_link_begin_count(MDInstance* inst)
 {
     return inst ? inst->link_begin_count : 0;
@@ -647,7 +684,12 @@ int md_link_send_packet(MDInstance* inst, const void* data, size_t len, uint64_t
     std::lock_guard<std::mutex> lock(g_link_lock);
     if (!g_link_bus) return 0;
 
-    return g_link_bus->SendPacket(inst->slot, (u8*)data, (int)len, timestamp);
+    const int queued = g_link_bus->SendPacket(inst->slot, (u8*)data, (int)len, timestamp);
+
+    /* Counted here rather than via note_packet_sent: the lock is already held. */
+    inst->link_packets_sent++;
+    if (queued > 0) inst->link_bytes_sent += (u64)queued;
+    return queued;
 }
 
 int md_link_recv_packet(MDInstance* inst, void* out, size_t cap, uint64_t* timestamp)
@@ -657,10 +699,30 @@ int md_link_recv_packet(MDInstance* inst, void* out, size_t cap, uint64_t* times
     std::lock_guard<std::mutex> lock(g_link_lock);
     if (!g_link_bus) return 0;
 
-    melonDS::u64 ts = 0;
+    u64 ts = 0;
     const int got = g_link_bus->RecvPacket(inst->slot, (u8*)out, &ts);
-    if (got > 0 && timestamp) *timestamp = ts;
+    if (got > 0)
+    {
+        inst->link_packets_received++;
+        inst->link_bytes_received += (u64)got;
+        if (timestamp) *timestamp = ts;
+    }
     return got;
+}
+
+int md_link_stats(MDInstance* inst, MDLinkStats* out)
+{
+    if (!inst || !out) return -1;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    out->connected = g_link_connected;
+    out->begin_count = inst->link_begin_count;
+    out->end_count = inst->link_end_count;
+    out->packets_sent = inst->link_packets_sent;
+    out->packets_received = inst->link_packets_received;
+    out->bytes_sent = inst->link_bytes_sent;
+    out->bytes_received = inst->link_bytes_received;
+    return 0;
 }
 
 int md_link_slot(MDInstance* inst)

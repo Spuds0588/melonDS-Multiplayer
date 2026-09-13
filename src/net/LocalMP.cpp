@@ -310,7 +310,7 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
 
     for (;;)
     {
-        if (!Semaphore_TryWait(SemPool[16+inst], RecvTimeout))
+        if (!Semaphore_TryWait(SemPool[16+inst], ReplyTimeout))
         {
             // no more replies available
             return ret;

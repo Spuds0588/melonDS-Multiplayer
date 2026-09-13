@@ -135,11 +135,40 @@ uint32_t md_link_connected_mask(void);
 void md_link_set_recv_timeout(int milliseconds);
 int  md_link_recv_timeout(void);
 
+/* Host-side reply timeout, separate from the above. A host advances once per
+   command slot and its clients' replies race it, so giving up instantly makes it
+   retry handshakes it could have finished. 1-4ms is enough when the consoles run
+   on their own threads; 0 makes it a pure poll. */
+void md_link_set_reply_timeout(int milliseconds);
+int  md_link_reply_timeout(void);
+
 /* How many times this console has powered its wireless hardware on and off.
    Tells "the game never started wireless" apart from "wireless ran and found
    nobody", which are very different faults to chase. */
 uint32_t md_link_begin_count(MDInstance* inst);
 uint32_t md_link_end_count(MDInstance* inst);
+
+/* Everything a host (or a test) needs to tell whether a link is actually
+   carrying traffic. A game that has powered its wireless on and is exchanging
+   nothing is a very different situation from one that never started wireless. */
+typedef struct MDLinkStats
+{
+    uint32_t connected;        /* slots on the bus right now, as a bitmask */
+    uint32_t begin_count;      /* times this console powered wireless on */
+    uint32_t end_count;        /* times it powered wireless off */
+    uint64_t packets_sent;     /* wireless frames this console transmitted */
+    uint64_t packets_received; /* frames it accepted from other consoles */
+    uint64_t bytes_sent;
+    /* Only counts client-side and broadcast frames. A host collects its
+       clients' replies through LocalMP::RecvReplies, which returns a bitmask of
+       who replied and leaves the payload in the caller's buffer, so the platform
+       layer never learns how many bytes arrived that way. Read this as a lower
+       bound; use the sender's bytes_sent for the true figure. */
+    uint64_t bytes_received;
+} MDLinkStats;
+
+/* Fills in out with this console's link state. Returns 0 on success. */
+int md_link_stats(MDInstance* inst, MDLinkStats* out);
 
 /* ------------------------- link self-test ------------------------------- */
 /* Broadcasts a packet on this console's slot, and pulls the next packet

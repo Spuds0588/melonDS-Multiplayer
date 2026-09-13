@@ -15,7 +15,11 @@ This document tracks the development progress and planned features for melonDS M
 - [ ] Wire the Rust side of the Tauri app to the bridge (bindgen or hand-written FFI)
 - [ ] Implement framebuffer piping from the bridge to the webview (canvas per player)
 - [ ] Target: Render a single NDS screen in the Tauri webview at 60FPS
-- [ ] Decide the emulator-thread model (one thread per instance, pinning, frame pacing)
+- [x] Decide the emulator-thread model: one thread per instance, meeting at a
+      per-frame barrier. This is load-bearing for the link, not just for
+      performance - see history.md v0.1.3
+- [ ] Frame pacing: nothing slows an instance to 60fps yet, and `Platform::Sleep`
+      is unused
 
 ### In Progress
 - [ ] Tauri v2 scaffolding exists but is not yet connected to the bridge
@@ -41,13 +45,30 @@ This document tracks the development progress and planned features for melonDS M
 - [x] Bridge API for the link: connected-slot mask, receive timeout, begin/end
       counters, and a non-blocking packet send/receive used by the tests
 - [x] Document the supported build path in BUILD.md
+- [x] **Two real games linked**: Mario Kart DS on two consoles discovers, joins
+      the same group, both appear on character select, and race each other on the
+      same course with complementary placings
+- [x] Real-game session runner (`md_game_session`) that can drive a game's menus
+      by button and by touch screen, per console, and report stability, link
+      traffic and speed
+- [x] Split the link's receive timeouts: peer frames poll, the host's reply
+      collection waits briefly. Both are needed; either one alone deadlocks or
+      strands a handshake (history.md v0.1.3)
+- [x] `--grid` / `--mark` / `--only` on the contact sheet, so a game's touch
+      targets are measured off a ruled screenshot instead of guessed
 
 ### Not yet done, and known to be missing
 - [ ] The Rust frontend does not call the bridge yet
-- [ ] The link is exercised with synthetic packets and the real wireless power-on
-      path, but no actual DS game has talked to another instance yet. That needs
-      a ROM whose own wireless stack runs, which the diagnostic ROM deliberately
-      does not have
+- [ ] Nothing asserts that two consoles stay *in sync* through a whole race -
+      kart positions, items and rankings. A desync would currently go unnoticed
+- [ ] Only one game has been driven to a linked race. New Super Mario Bros. and
+      Super Mario 64 DS are in the local test set and untried
+- [ ] 3 and 4 consoles are untested. Two linked consoles of a 3D game cost about
+      a third of realtime each, so four will not hold realtime on the current
+      machine; the frame barrier and the host's reply window both scale with
+      player count
+- [ ] Instances still run the built-in FreeBIOS. It has not blocked a commercial
+      game yet, but a real BIOS option should still exist
 
 ---
 
