@@ -48,6 +48,8 @@ struct MDInstance
     int slot = -1;
     int stop_reason = MD_STOP_NONE;
     u32 frame_counter = 0;
+    u32 link_begin_count = 0;
+    u32 link_end_count = 0;
 
     /* scratch buffer for md_load_state() so the caller's buffer stays const */
     std::vector<u8> state_scratch;
@@ -114,6 +116,14 @@ bool file_exists(const std::string& path)
 /* Shared link bus, created lazily by md_link_init(). */
 std::mutex g_link_lock;
 std::unique_ptr<melonDS::LocalMP> g_link_bus;
+
+/* Slots whose console currently has its wireless hardware powered on.
+
+   LocalMP tracks this itself but keeps it private, and it is the bridge that
+   decides which slot an instance maps to, so the bridge mirrors it here. Every
+   transition comes through notify_mp_begin/notify_mp_end, so the two cannot
+   drift apart. */
+u32 g_link_connected = 0;
 
 } // namespace
 
@@ -187,6 +197,26 @@ melonDS::LocalMP* link_bus()
 {
     std::lock_guard<std::mutex> lock(g_link_lock);
     return g_link_bus.get();
+}
+
+void notify_mp_begin(void* userdata)
+{
+    auto* inst = static_cast<MDInstance*>(userdata);
+    if (!inst) return;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    inst->link_begin_count++;
+    if (inst->slot >= 0) g_link_connected |= (1u << inst->slot);
+}
+
+void notify_mp_end(void* userdata)
+{
+    auto* inst = static_cast<MDInstance*>(userdata);
+    if (!inst) return;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    inst->link_end_count++;
+    if (inst->slot >= 0) g_link_connected &= ~(1u << inst->slot);
 }
 
 bool link_enabled()
@@ -537,6 +567,7 @@ void md_link_init(void)
     if (!g_link_bus)
     {
         g_link_bus = std::make_unique<melonDS::LocalMP>();
+        g_link_connected = 0;
         std::fprintf(stderr, "[melonDS bridge] local multiplayer bus ready (16 slots)\n");
     }
 }
@@ -545,6 +576,7 @@ void md_link_shutdown(void)
 {
     std::lock_guard<std::mutex> lock(g_link_lock);
     g_link_bus.reset();
+    g_link_connected = 0;
 }
 
 void md_link_attach(MDInstance* inst, int slot)
@@ -557,13 +589,78 @@ void md_link_attach(MDInstance* inst, int slot)
     }
 
     md_link_init();
+
+    /* Moving an instance between slots has to leave the old one cleanly, or the
+       bus keeps believing a console is present at both. */
+    if (inst->slot >= 0 && inst->slot != slot)
+        md_link_detach(inst);
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
     inst->slot = slot;
 }
 
 void md_link_detach(MDInstance* inst)
 {
     if (!inst) return;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (inst->slot >= 0)
+    {
+        if (g_link_bus) g_link_bus->End(inst->slot);
+        g_link_connected &= ~(1u << inst->slot);
+    }
     inst->slot = -1;
+}
+
+melonDS::u32 md_link_connected_mask(void)
+{
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    return g_link_connected;
+}
+
+void md_link_set_recv_timeout(int milliseconds)
+{
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (g_link_bus) g_link_bus->SetRecvTimeout(milliseconds < 0 ? 0 : milliseconds);
+}
+
+int md_link_recv_timeout(void)
+{
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    return g_link_bus ? g_link_bus->GetRecvTimeout() : 0;
+}
+
+melonDS::u32 md_link_begin_count(MDInstance* inst)
+{
+    return inst ? inst->link_begin_count : 0;
+}
+
+melonDS::u32 md_link_end_count(MDInstance* inst)
+{
+    return inst ? inst->link_end_count : 0;
+}
+
+int md_link_send_packet(MDInstance* inst, const void* data, size_t len, uint64_t timestamp)
+{
+    if (!inst || inst->slot < 0 || !data || len == 0) return 0;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (!g_link_bus) return 0;
+
+    return g_link_bus->SendPacket(inst->slot, (u8*)data, (int)len, timestamp);
+}
+
+int md_link_recv_packet(MDInstance* inst, void* out, size_t cap, uint64_t* timestamp)
+{
+    if (!inst || inst->slot < 0 || !out || cap == 0) return 0;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (!g_link_bus) return 0;
+
+    melonDS::u64 ts = 0;
+    const int got = g_link_bus->RecvPacket(inst->slot, (u8*)out, &ts);
+    if (got > 0 && timestamp) *timestamp = ts;
+    return got;
 }
 
 int md_link_slot(MDInstance* inst)
@@ -612,6 +709,22 @@ melonDS::u16 md_read_io16(MDInstance* inst, int cpu, u32 addr)
 {
     if (!inst || !inst->nds) return 0;
     return (cpu == 7) ? inst->nds->ARM7Read16(addr) : inst->nds->ARM9Read16(addr);
+}
+
+int md_write_io32(MDInstance* inst, int cpu, u32 addr, u32 value)
+{
+    if (!inst || !inst->nds) return -1;
+    if (cpu == 7) inst->nds->ARM7Write32(addr, value);
+    else          inst->nds->ARM9Write32(addr, value);
+    return 0;
+}
+
+int md_write_io16(MDInstance* inst, int cpu, u32 addr, melonDS::u16 value)
+{
+    if (!inst || !inst->nds) return -1;
+    if (cpu == 7) inst->nds->ARM7Write16(addr, value);
+    else          inst->nds->ARM9Write16(addr, value);
+    return 0;
 }
 
 u32 md_get_pc(MDInstance* inst, int cpu)

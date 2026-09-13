@@ -31,6 +31,12 @@ void notify_gba_save_write(void* userdata, const melonDS::u8* savedata, melonDS:
 void notify_firmware_write(void* userdata, const melonDS::Firmware& firmware,
                            melonDS::u32 writeoffset, melonDS::u32 writelen);
 
+/* Called by the platform layer when a console powers its wireless hardware on
+   or off. The bridge tracks this so a host can see which slots are actually
+   live, as opposed to merely assigned. */
+void notify_mp_begin(void* userdata);
+void notify_mp_end(void* userdata);
+
 /* Shared link bus. Both return nullptr while linking is disabled. */
 melonDS::LocalMP* link_bus();
 bool link_enabled();

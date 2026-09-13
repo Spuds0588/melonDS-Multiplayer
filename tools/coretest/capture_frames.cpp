@@ -159,9 +159,6 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    md_link_init();
-    md_link_shutdown();
-
     /* One instance per player, each with its own colour. */
     MDInstance* players[3] = {
         md_create(0, "player1"),
@@ -298,6 +295,70 @@ int main(int argc, char** argv)
     }
 
     rec.manifest.close();
+
+    /* ---- the link, as a table ------------------------------------------- */
+    /* There is nothing to *look* at on screen when a console joins the bus, so
+       this records the bus state at each step instead. Wireless power is an
+       ARM7 register: PowerControl7 (0x04000304) bit 1 enables the hardware and
+       W_PowerUS (0x04800036) releases the modem. */
+    std::ofstream link(outdir + "/link.tsv", std::ios::binary);
+    link << "step\tslot0\tslot1\tslot2\tconnected_mask\tnote\n";
+
+    int step = 0;
+    auto record = [&](const std::string& note)
+    {
+        link << step++ << '\t'
+             << md_link_begin_count(players[0]) << " on /" << md_link_end_count(players[0]) << " off\t"
+             << md_link_begin_count(players[1]) << " on /" << md_link_end_count(players[1]) << " off\t"
+             << md_link_begin_count(players[2]) << " on /" << md_link_end_count(players[2]) << " off\t"
+             << md_link_connected_mask() << '\t' << note << '\n';
+    };
+
+    auto wireless = [](MDInstance* inst, bool on)
+    {
+        md_write_io16(inst, 7, 0x04000304, on ? 0x0002 : 0x0000);
+        md_write_io16(inst, 7, 0x04800036, on ? 0x0000 : 0x0001);
+        for (int i = 0; i < 2; i++) md_run_frame(inst);
+    };
+
+    md_link_init();
+    for (int i = 0; i < 3; i++) md_link_attach(players[i], i);
+    record("all three attached to slots, no wireless powered yet");
+
+    wireless(players[0], true);
+    record("player 1 starts wireless: joins the bus, alone");
+
+    wireless(players[1], true);
+    wireless(players[2], true);
+    record("players 2 and 3 start wireless: all three on the bus");
+
+    const char payload[] = "melon";
+    md_link_send_packet(players[0], payload, sizeof(payload) - 1, 42);
+    char inbox[64] = { 0 };
+    const int got_b = md_link_recv_packet(players[1], inbox, sizeof(inbox), nullptr);
+    const int got_c = md_link_recv_packet(players[2], inbox, sizeof(inbox), nullptr);
+    std::printf("  link: broadcast from slot 0 delivered %d bytes to slot 1 and %d to slot 2\n",
+                got_b, got_c);
+    record("broadcast from player 1 delivered to both other consoles");
+
+    wireless(players[2], false);
+    record("player 3 stops wireless: leaves the bus, receives nothing further");
+
+    md_link_send_packet(players[0], payload, sizeof(payload) - 1, 43);
+    const int after_leave = md_link_recv_packet(players[2], inbox, sizeof(inbox), nullptr);
+    const int still_on = md_link_recv_packet(players[1], inbox, sizeof(inbox), nullptr);
+    std::printf("  link: after slot 2 left, slot 2 got %d bytes and slot 1 got %d\n",
+                after_leave, still_on);
+    if (after_leave != 0 || still_on <= 0)
+    {
+        std::printf("  FAIL leaving the bus did not stop delivery as expected\n");
+        rec.failures++;
+    }
+    record("another broadcast: slot 1 receives, slot 2 does not");
+
+    md_link_detach(players[1]);
+    record("player 2 detached: slot released entirely");
+    link.close();
 
     for (MDInstance* p : players)
         md_destroy(p);

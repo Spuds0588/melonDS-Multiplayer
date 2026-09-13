@@ -57,6 +57,27 @@ what you want when a check fails. Build and run this after any change to the
 bridge or the core integration; it is the fastest signal that the emulator
 still does what the host assumes it does.
 
+### Visual capture
+
+Assertions prove that something changed; they are poor at proving it is *right*.
+`md_capture` drives the same bridge and writes out the real frames, and
+`frames_to_html.py` turns them into a single self-contained contact sheet:
+
+```bash
+./build-tauri/md_capture tools/mkdiagrom/diag.nds captures
+python3 tools/coretest/frames_to_html.py captures
+# then open captures/sheet.html
+```
+
+Each card is one emulated console with the top screen above the bottom screen.
+The sheet also samples the diagnostic ROM's button blocks and reports which
+buttons are lit on which console, so per-instance input routing is visible at a
+glance rather than merely asserted, and it tabulates the link bus state.
+
+This is not decoration: the contact sheet caught a bug the smoke test had been
+passing straight through, where every console rendered the ROM's fallback colour
+and was only distinguishable by its player pips.
+
 ## Building the melonDS Core
 
 * [Linux](#linux)

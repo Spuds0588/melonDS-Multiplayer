@@ -116,10 +116,42 @@ int md_flush_save(MDInstance* inst, const char* path);
 void md_link_init(void);
 void md_link_shutdown(void);
 /* Assigns/releases a slot (0-15) on the shared link bus. All instances taking
-   part in a multiplayer game must be assigned slots before their first frame. */
+   part in a multiplayer game must be assigned slots before their first frame.
+   Slots are the identity the emulated wireless hardware uses, so two consoles
+   sharing a slot cannot see each other. */
 void md_link_attach(MDInstance* inst, int slot);
 void md_link_detach(MDInstance* inst);
 int  md_link_slot(MDInstance* inst);
+
+/* Slots whose console has actually switched its wireless hardware on (bit N =
+   slot N). Attaching a slot is not the same as the game starting wireless: a
+   console sits here only while its emulated WiFi is powered, which is what a
+   lobby UI wants to show. */
+uint32_t md_link_connected_mask(void);
+
+/* How long a console waits for a partner's reply before giving up, in
+   milliseconds. Every console in a session should use the same value, or
+   results become timing dependent. */
+void md_link_set_recv_timeout(int milliseconds);
+int  md_link_recv_timeout(void);
+
+/* How many times this console has powered its wireless hardware on and off.
+   Tells "the game never started wireless" apart from "wireless ran and found
+   nobody", which are very different faults to chase. */
+uint32_t md_link_begin_count(MDInstance* inst);
+uint32_t md_link_end_count(MDInstance* inst);
+
+/* ------------------------- link self-test ------------------------------- */
+/* Broadcasts a packet on this console's slot, and pulls the next packet
+   addressed to it. These are the same calls the emulated wireless hardware
+   makes through the platform layer. They exist so tests can exercise slot
+   routing without a full DS wireless stack in the diagnostic ROM.
+
+   Delivery is broadcast: every other connected slot gets a copy, and a console
+   never receives its own packet. md_link_recv_packet does not block; it returns
+   0 when nothing is queued. */
+int md_link_send_packet(MDInstance* inst, const void* data, size_t len, uint64_t timestamp);
+int md_link_recv_packet(MDInstance* inst, void* out, size_t cap, uint64_t* timestamp);
 
 /* -------------------------------------------------------------- diagnostics */
 
@@ -143,6 +175,14 @@ uint16_t md_read_gpu16(MDInstance* inst, uint32_t addr);
    in registers the ARM9 does not decode at all - so testing keypad handling
    means being able to ask each core separately. */
 uint16_t md_read_io16(MDInstance* inst, int cpu, uint32_t addr);
+
+/* Writes into a CPU's address space (cpu is 9 or 7, value is 32-bit). Unlike
+   md_write_ram this is not limited to RAM, so a host or a test can poke I/O
+   registers. That matters for the wireless hardware, which is ARM7-only and
+   therefore unreachable through the ARM9's view of the machine. */
+int md_write_io32(MDInstance* inst, int cpu, uint32_t addr, uint32_t value);
+/* The same for a halfword, since most wireless registers are 16-bit. */
+int md_write_io16(MDInstance* inst, int cpu, uint32_t addr, uint16_t value);
 
 /* Program counter of the ARM9 (cpu 9) or ARM7 (cpu 7) core. */
 uint32_t md_get_pc(MDInstance* inst, int cpu);

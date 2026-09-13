@@ -246,6 +246,47 @@ def main() -> int:
         </figcaption>
       </figure>""")
 
+    # ---- the link bus, if md_capture recorded a session ---------------------
+    link_panel = ""
+    link_path = outdir / "link.tsv"
+    if link_path.exists():
+        rows = [line.split("\t") for line in link_path.read_text().splitlines() if line.strip()]
+        head, body = rows[0], rows[1:]
+
+        # Address columns by name: the producer decides how many it writes.
+        col = {name: i for i, name in enumerate(head)}
+
+        def mask_cells(raw: str) -> str:
+            value = int(raw, 0)
+            return "".join(
+                f'<span class="{"on" if value & (1 << i) else "off"}">slot {i}</span>'
+                for i in range(3))
+
+        def cells(row: list[str]) -> str:
+            out = []
+            for name in head:
+                idx = col[name]
+                cell = row[idx] if idx < len(row) else ""
+                if name == "connected_mask":
+                    cell = mask_cells(cell)
+                elif name == "note":
+                    cell = f"<span class='note'>{cell}</span>"
+                out.append(f"<td>{cell}</td>")
+            return "<tr>" + "".join(out) + "</tr>"
+
+        trs = "".join(cells(row) for row in body)
+        ths = "".join(f"<th>{name}</th>" for name in head)
+        link_panel = f"""
+  <div class="summary">
+    <h2>Link bus</h2>
+    <table>
+      <tr>{ths}</tr>
+      {trs}
+    </table>
+    <p class="hint">"on / off" counts how often each console powered its wireless hardware up
+      and down; the slots show which consoles the bus currently considers present.</p>
+  </div>"""
+
     passed = sum(1 for ok, _ in checks if ok)
     results = "\n".join(
         f'<li class="{"ok" if ok else "fail"}">{"PASS" if ok else "FAIL"} &mdash; {text}</li>'
@@ -286,6 +327,16 @@ def main() -> int:
   .btn {{ display: inline-block; background: #2d4a7a; color: #cfe3ff; border-radius: 4px;
           padding: 0 5px; margin-right: 3px; font-weight: 600; }}
   .dim {{ color: #6e7681; font-style: italic; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 12.5px; }}
+  th, td {{ text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid #262a32;
+            vertical-align: top; }}
+  th {{ color: #9aa0aa; font-weight: 600; }}
+  td.note {{ color: #c9cdd4; }}
+  .on, .off {{ display: inline-block; border-radius: 4px; padding: 0 5px; margin-right: 4px;
+               font-size: 11px; }}
+  .on {{ background: #12431f; color: #7ee787; font-weight: 600; }}
+  .off {{ background: #23262d; color: #6e7681; }}
+  .hint {{ color: #8b919b; font-size: 11.5px; margin: 10px 0 0; }}
 </style>
 </head>
 <body>
@@ -302,6 +353,7 @@ def main() -> int:
 
   <div class="grid">{''.join(cards)}
   </div>
+{link_panel}
 </body>
 </html>
 """

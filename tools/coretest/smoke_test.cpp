@@ -12,6 +12,7 @@
       * the host-stamped identity shows up on screen
       * input reaches exactly one instance
       * savestates round-trip
+      * the local link: slot routing, isolation, and the wireless power-on path
 
     Run it with: build-tauri/tools/coretest/md_smoke_test <path to diag.nds>
 */
@@ -386,9 +387,102 @@ int main(int argc, char** argv)
     check(restored.top == after.top && restored.bottom == after.bottom,
           "replaying frames from a savestate reproduces the same picture");
 
+    /* ---- link bus ------------------------------------------------------- */
+    check(md_link_slot(a) == 0 && md_link_slot(b) == 1 && md_link_slot(c) == 2,
+          "each console still holds its own link slot");
+
+    /* Being assigned a slot is not the same as being on the bus: a console joins
+       the link when its game powers the wireless hardware on. Every instance is
+       attached, yet nobody has started wireless, so the bus is empty. That is
+       the distinction a lobby UI needs to show, and the distinction that decides
+       whether packets are delivered at all. */
+    check(md_link_connected_mask() == 0, "no console is on the link bus before wireless starts");
+    check(md_link_begin_count(a) == 0, "instance A has not powered wireless on yet");
+
+    const char payload[] = "melon";
+    char inbox_b[64] = { 0 };
+    char inbox_c[64] = { 0 };
+
+    /* Nothing is listening yet, so a broadcast goes nowhere. */
+    md_link_send_packet(a, payload, sizeof(payload) - 1, 1);
+    check(md_link_recv_packet(b, inbox_b, sizeof(inbox_b), nullptr) == 0,
+          "a broadcast reaches nobody while every console is powered down");
+
+    /* ---- wireless power-on reaches the bus ------------------------------ */
+    /* This is the seam between the emulated console and the host. Wireless power
+       is an ARM7 register, not an ARM9 one: PowerControl7 (0x04000304) bit 1
+       enables the hardware, and W_PowerUS (0x04800036) releases the modem. The
+       core then calls back into the bridge, which is what puts the console on
+       the bus under its own slot. */
+    auto wireless = [](MDInstance* inst, bool on)
+    {
+        md_write_io16(inst, 7, 0x04000304, on ? 0x0002 : 0x0000);
+        md_write_io16(inst, 7, 0x04800036, on ? 0x0000 : 0x0001);
+        run_frames(inst, 2);
+    };
+
+    wireless(a, true);
+    std::printf("       link: A wireless on -> begin=%u end=%u mask=%#05x\n",
+                md_link_begin_count(a), md_link_end_count(a), md_link_connected_mask());
+
+    check(md_link_begin_count(a) > 0,
+          "powering the console's wireless on reaches the link bus");
+    check((md_link_connected_mask() & 0x1u) != 0,
+          "instance A appears on the bus in its own slot");
+    check((md_link_connected_mask() & 0x6u) == 0, "the other consoles stay off the bus");
+
+    /* ---- delivery over the shared bus ----------------------------------- */
+    wireless(b, true);
+    wireless(c, true);
+    check(md_link_connected_mask() == 0x7u, "all three consoles are on the bus");
+
+    uint64_t ts_b = 0;
+    const int queued = md_link_send_packet(a, payload, sizeof(payload) - 1, 1234);
+    check(queued == (int)(sizeof(payload) - 1), "a packet queued on the bus");
+
+    const int got_b = md_link_recv_packet(b, inbox_b, sizeof(inbox_b), &ts_b);
+    const int got_c = md_link_recv_packet(c, inbox_c, sizeof(inbox_c), nullptr);
+
+    check(got_b == (int)(sizeof(payload) - 1) &&
+              std::memcmp(inbox_b, payload, sizeof(payload) - 1) == 0,
+          "instance B receives the packet A sent, intact");
+    check(got_c == (int)(sizeof(payload) - 1) &&
+              std::memcmp(inbox_c, payload, sizeof(payload) - 1) == 0,
+          "instance C receives it too (the link is a broadcast bus)");
+    check(ts_b == 1234, "the packet's timestamp survives the trip");
+
+    char inbox_a[64] = { 0 };
+    check(md_link_recv_packet(a, inbox_a, sizeof(inbox_a), nullptr) == 0,
+          "instance A does not receive its own packet back");
+    check(md_link_recv_packet(b, inbox_b, sizeof(inbox_b), nullptr) == 0,
+          "a drained link returns nothing rather than blocking");
+
+    /* ---- leaving the bus stops delivery --------------------------------- */
+    /* Powering wireless down must both clear the connected bit and stop the
+       traffic, or a console that has left the game keeps accumulating packets. */
+    wireless(c, false);
+    std::printf("       link: C wireless off -> end=%u mask=%#05x\n",
+                md_link_end_count(c), md_link_connected_mask());
+
+    check(md_link_end_count(c) > 0, "powering wireless off reaches the link bus too");
+    check((md_link_connected_mask() & 0x4u) == 0, "instance C leaves the bus");
+
+    md_link_send_packet(a, payload, sizeof(payload) - 1, 7);
+    check(md_link_recv_packet(c, inbox_c, sizeof(inbox_c), nullptr) == 0,
+          "a console that left the bus receives nothing further");
+    check(md_link_recv_packet(b, inbox_b, sizeof(inbox_b), nullptr) > 0,
+          "the consoles still on the bus keep receiving");
+
+    /* A detached console must stop seeing traffic too, or a dropped player would
+       keep receiving game state. */
+    md_link_detach(b);
+    check(md_link_slot(b) == -1, "detaching clears the link slot");
+
+    md_link_send_packet(a, payload, sizeof(payload) - 1, 99);
+    check(md_link_recv_packet(b, inbox_b, sizeof(inbox_b), nullptr) == 0,
+          "a detached console no longer receives link traffic");
+
     /* ---- shutdown ------------------------------------------------------- */
-    md_link_detach(a);
-    check(md_link_slot(a) == -1, "detaching clears the link slot");
 
     md_destroy(a);
     md_destroy(b);

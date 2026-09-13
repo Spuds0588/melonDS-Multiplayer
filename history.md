@@ -121,6 +121,62 @@ through a C API. Nothing user-visible yet — the Rust frontend is not connected
    produced misleading failures. The test now keys off the ROM's own end-of-loop
    heartbeat counter.
 
+---
+
+### v0.1.2 - Local Link and Visual Verification (September 2026)
+
+**Status**: Instances can be linked. The bus is wired up, tested and observable.
+
+**Visual verification.** Assertions say "this changed", not "this is right", so
+there is now a second pair of eyes: `md_capture` writes real frames out of the
+renderer and `frames_to_html.py` builds a self-contained contact sheet. It also
+samples the diagnostic ROM's button blocks and reports which buttons are lit on
+which console, turning "the picture is different" into "player 1 holds A and L,
+players 2 and 3 hold nothing".
+
+That paid for itself immediately. Every console had been rendering the ROM's
+*fallback* colour, so all three players had identical stripes and were only
+distinguishable by their player pips - and the smoke test passed the whole time,
+because it checked that the stamp survived in RAM and its pixel comparison was
+satisfied by the pips alone. Two fixes came out of it:
+
+* **A silent assembler trap.** The ROM compared its magic with `cmp(r0, 1)`, but
+  `cmp` takes `(register, immediate)` - so it assembled `CMP r0, #1`, compared
+  the magic against the literal 1, never matched, and quietly used the fallback.
+  `cmp_reg()` now exists for the register form and `cmp()` documents the trap.
+* **A test that proved the wrong thing.** The ROM now publishes the colour it
+  resolved for itself, and the smoke test asserts each instance resolves what the
+  host stamped - the claim we actually care about.
+
+**The link.** melonDS's in-tree `LocalMP` is the virtual link cable, and the core
+reaches it through the `Platform::MP_*` hooks with `NDS.UserData`, not through the
+`MPInterface` singleton. That matters: the singleton design (used by melonDS's own
+Qt frontend) has no room for several consoles on different threads, whereas
+routing on `userdata` lets the bridge map each instance to its own slot. The
+bridge also compiles `LocalMP.cpp` directly instead of going through
+`MPInterface.cpp`, which would drag in `LAN` and therefore enet.
+
+Things worth knowing about the bus itself:
+
+* **Broadcast, not point-to-point.** A packet goes to every other connected slot,
+  and a console never receives its own packet back. That is how local wireless
+  actually behaves, and it is the right default for splitscreen.
+* **Attached is not connected.** A slot assignment only says where a console
+  *would* sit on the bus. A console joins when its game powers the wireless
+  hardware on. Until then it receives nothing at all, because `LocalMP` only
+  signals instances in its connected mask. This is why a broadcast to three
+  attached-but-powered-down consoles delivers to nobody.
+* **Wireless power is an ARM7 register.** `PowerControl7` (0x04000304) bit 1
+  enables the hardware and `W_PowerUS` (0x04800036) releases the modem; both are
+  ARM7-side. The ARM9-side register at the same address is `POWCNT9` and does not
+  touch the wireless at all. Poking the wrong one is a silent no-op.
+
+**New bridge surface**: connected-slot mask, receive timeout, per-instance
+wireless begin/end counters (so "the game never started wireless" is
+distinguishable from "wireless ran and found nobody"), and a non-blocking packet
+send/receive used by the tests to exercise slot routing without needing a full DS
+wireless stack in the diagnostic ROM.
+
 **Known gaps — pick up here**:
 
 * **No multiplayer link yet.** `md_link_attach` / `md_link_slot` exist and assign
@@ -136,6 +192,10 @@ through a C API. Nothing user-visible yet — the Rust frontend is not connected
 * **No BIOS/firmware handling beyond overrides.** Instances currently run the
   built-in FreeBIOS, which is enough for homebrew but will not be enough for
   commercial games.
+* **No real game has linked yet.** The bus is verified with synthetic packets and
+  with the genuine wireless power-on path, but a real multiplayer game needs a
+  ROM whose own wireless stack runs. That is the next real milestone, and it is
+  where the receive timeout and frame pacing will start to matter.
 
 ---
 
@@ -353,3 +413,4 @@ Additional credits from original melonDS:
 |------|---------|--------|---------|
 | 2026-09-11 | 0.1.0 | Project Initiation | Initial documentation created, mgba-splitscreen lessons added |
 | 2026-09-12 | 0.1.1 | Native bridge | C bridge over the headless core, hand-assembled diagnostic ROM, 36-check smoke test; build path documented |
+| 2026-09-12 | 0.1.2 | Local link | LocalMP wired in with per-slot routing and broadcast delivery, visual capture + contact sheet, 58-check smoke test |

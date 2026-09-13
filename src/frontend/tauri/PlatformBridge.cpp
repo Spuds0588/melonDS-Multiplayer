@@ -421,18 +421,28 @@ void SignalStop(StopReason reason, void* userdata)
 
 /* --------------------------------------------------------- local multiplayer */
 
+/* The console powers its wireless hardware on and off as the game enters and
+   leaves wireless play; this is where it joins and leaves the shared bus. The
+   bridge notes the transition so a host can tell which slots are actually live
+   rather than merely assigned. */
 void MP_Begin(void* userdata)
 {
     auto* bus = md::link_bus();
     const int slot = md::slot_for(userdata);
-    if (bus && slot >= 0) bus->Begin(slot);
+    if (!bus || slot < 0) return;
+
+    bus->Begin(slot);
+    md::notify_mp_begin(userdata);
 }
 
 void MP_End(void* userdata)
 {
     auto* bus = md::link_bus();
     const int slot = md::slot_for(userdata);
-    if (bus && slot >= 0) bus->End(slot);
+    if (!bus || slot < 0) return;
+
+    bus->End(slot);
+    md::notify_mp_end(userdata);
 }
 
 int MP_SendPacket(u8* data, int len, u64 timestamp, void* userdata)

@@ -31,14 +31,23 @@ This document tracks the development progress and planned features for melonDS M
 - [x] Link the bridge against the core as a static library
 - [x] Create a diagnostic NDS ROM from scratch (`tools/mkdiagrom`), since no test
       ROM exists and no ARM toolchain is guaranteed
-- [x] Headless smoke test (`tools/coretest`) booting that ROM through the bridge:
-      36 checks covering render, animation, determinism, input routing, savestates
+- [x] Headless smoke test (`tools/coretest`): 58 checks covering render,
+      animation, determinism, input routing, savestates and the link
+- [x] Visual capture + contact sheet (`md_capture`, `frames_to_html.py`) so the
+      rendering can be inspected by eye and not only asserted on
+- [x] Local multiplayer link: melonDS's in-tree LocalMP, with per-instance slot
+      routing, broadcast delivery, and consoles joining/leaving the bus as their
+      emulated wireless hardware powers up and down
+- [x] Bridge API for the link: connected-slot mask, receive timeout, begin/end
+      counters, and a non-blocking packet send/receive used by the tests
 - [x] Document the supported build path in BUILD.md
 
 ### Not yet done, and known to be missing
 - [ ] The Rust frontend does not call the bridge yet
-- [ ] No multiplayer link between instances: `md_link_*` assigns slots, but the
-      local Wi-Fi bus itself is not wired up yet (see history.md)
+- [ ] The link is exercised with synthetic packets and the real wireless power-on
+      path, but no actual DS game has talked to another instance yet. That needs
+      a ROM whose own wireless stack runs, which the diagnostic ROM deliberately
+      does not have
 
 ---
 
