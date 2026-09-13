@@ -4,6 +4,59 @@ This project is based on melonDS. See the original [BUILD.md](https://github.com
 
 The build process below applies to the melonDS core. For the Tauri frontend, see the Tauri documentation.
 
+## Building the multiplayer bridge
+
+The Tauri host does not use the Qt/SDL frontend. It talks to the emulator core
+through a small C API (`src/frontend/tauri/melonds_bridge.h`), one emulator
+instance per player. That path needs no Qt and no SDL:
+
+```bash
+cmake -S . -B build-tauri \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_QT_SDL=OFF \
+  -DBUILD_TAURI_BRIDGE=ON \
+  -DENABLE_OGLRENDERER=OFF
+cmake --build build-tauri -j$(nproc)
+```
+
+Three of those flags are not optional:
+
+* `-DENABLE_OGLRENDERER=OFF` — the OpenGL renderer compiles against the glad
+  headers that ship inside the Qt/SDL frontend, so it cannot build without it.
+  Configure stops with an explicit message if you leave it on. The bridge uses
+  the software renderer anyway, because the host reads every instance's
+  framebuffers back on the CPU each frame.
+* `-DBUILD_QT_SDL=OFF` — leaves out the desktop frontend we do not ship.
+* `-DBUILD_TAURI_BRIDGE=ON` — builds the bridge and the headless core tests.
+
+### Diagnostic ROM
+
+No test ROM ships with the repository and no ARM toolchain is assumed, so
+`tools/mkdiagrom` hand-assembles a small NDS program covering both screens,
+per-instance input, frame pacing and per-instance identity:
+
+```bash
+python3 tools/mkdiagrom/mkdiagrom.py -o tools/mkdiagrom/diag.nds
+python3 tools/mkdiagrom/mkdiagrom.py --verify tools/mkdiagrom/diag.nds
+```
+
+### Core smoke test
+
+`tools/coretest` boots that ROM through the same bridge the Tauri host uses and
+checks the parts of the splitscreen pipeline that can be verified without a
+window — both screens render, frames advance, two identically-configured
+instances stay pixel-identical, input reaches exactly one instance, savestates
+round-trip:
+
+```bash
+./build-tauri/md_smoke_test tools/mkdiagrom/diag.nds
+```
+
+Set `MD_TRACE=1` for a per-frame trace of the ROM's progress markers, which is
+what you want when a check fails. Build and run this after any change to the
+bridge or the core integration; it is the fastest signal that the emulator
+still does what the host assumes it does.
+
 ## Building the melonDS Core
 
 * [Linux](#linux)

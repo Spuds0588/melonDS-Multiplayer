@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "melonDS Multiplayer",
+  "version": "0.1.0",
+  "identifier": "com.melonds.multiplayer",
+  "build": {
+    "beforeDevCommand": "echo 'No dev command needed'",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../src",
+    "beforeBuildCommand": "echo 'No build command needed'"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "melonDS Multiplayer",
+        "width": 1280,
+        "height": 720,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [],
+    "copyright": "Copyright 2026 melonDS-Multiplayer Team",
+    "category": "Game",
+    "shortDescription": "DS emulator with splitscreen multiplayer",
+    "longDescription": "A Tauri-based desktop application that runs multiple linked melonDS emulator instances side by side for local splitscreen multiplayer on a single machine.",
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
+    }
+  },
+  "plugins": {}
+}

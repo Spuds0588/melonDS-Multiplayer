@@ -105,8 +105,29 @@ endif()
 
 option(BUILD_QT_SDL "Build Qt/SDL frontend" ON)
 
+# melonDS Multiplayer: the Tauri host drives the core through this bridge
+# instead of the Qt/SDL frontend. Turn BUILD_QT_SDL off when building for
+# the multiplayer app.
+option(BUILD_TAURI_BRIDGE "Build the Tauri multiplayer native bridge" OFF)
+
+# The OpenGL renderer compiles against the glad headers that ship inside the
+# Qt/SDL frontend, so it cannot be built without it. Without this check the
+# failure surfaces much later as a missing "frontend/glad/glad.h".
+if (ENABLE_OGLRENDERER AND NOT BUILD_QT_SDL)
+    message(FATAL_ERROR
+        "ENABLE_OGLRENDERER requires the glad headers that come with the Qt/SDL frontend. "
+        "Either configure with -DBUILD_QT_SDL=ON, or use -DENABLE_OGLRENDERER=OFF "
+        "(which is what the Tauri multiplayer bridge wants, since it reads each "
+        "instance's framebuffers back on the CPU).")
+endif()
+
 add_subdirectory(src)
 
 if (BUILD_QT_SDL)
     add_subdirectory(src/frontend/qt_sdl)
+endif()
+
+if (BUILD_TAURI_BRIDGE)
+    add_subdirectory(src/frontend/tauri)
+    add_subdirectory(tools/coretest)
 endif()

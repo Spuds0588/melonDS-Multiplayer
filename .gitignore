@@ -25,3 +25,11 @@ CMakeCache.txt
 freebios/FreeBIOS_Data.h
 freebios/bios*
 freebios/build/
+
+# Generated diagnostic ROM (rebuild with tools/mkdiagrom/mkdiagrom.py)
+tools/mkdiagrom/*.nds
+__pycache__/
+
+# Rust / Tauri build output
+src-tauri/target/
+src-tauri/gen/schemas/

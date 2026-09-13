@@ -12,19 +12,33 @@ This document tracks the development progress and planned features for melonDS M
 ## Phase 1: Native Bridge (Host Infrastructure)
 
 ### Todo
-- [ ] Set up Tauri v2 + Rust project structure
-- [ ] Integrate melonDS as a C++ library (static build for the core)
-- [ ] Implement framebuffer piping from melonDS to frontend (WebSocket or shared memory)
-- [ ] Target: Render single NDS screen in Tauri webview at 60FPS
+- [ ] Wire the Rust side of the Tauri app to the bridge (bindgen or hand-written FFI)
+- [ ] Implement framebuffer piping from the bridge to the webview (canvas per player)
+- [ ] Target: Render a single NDS screen in the Tauri webview at 60FPS
+- [ ] Decide the emulator-thread model (one thread per instance, pinning, frame pacing)
 
 ### In Progress
-- [ ] 
+- [ ] Tauri v2 scaffolding exists but is not yet connected to the bridge
 
 ### Done
 - [x] Fork melonDS repository
 - [x] Update project documentation (README, AGENTS.md, etc.)
 - [x] Configure git remotes (origin: this repo, upstream: melonDS)
 - [x] Review mgba-splitscreen for lessons learned
+- [x] Build the melonDS core with the Qt/SDL frontend switched off (`-DBUILD_QT_SDL=OFF`)
+- [x] Write the C bridge (`src/frontend/tauri/melonds_bridge.h`): lifecycle, ROM
+      loading, per-instance input, per-frame stepping, savestates, screen readback
+- [x] Link the bridge against the core as a static library
+- [x] Create a diagnostic NDS ROM from scratch (`tools/mkdiagrom`), since no test
+      ROM exists and no ARM toolchain is guaranteed
+- [x] Headless smoke test (`tools/coretest`) booting that ROM through the bridge:
+      36 checks covering render, animation, determinism, input routing, savestates
+- [x] Document the supported build path in BUILD.md
+
+### Not yet done, and known to be missing
+- [ ] The Rust frontend does not call the bridge yet
+- [ ] No multiplayer link between instances: `md_link_*` assigns slots, but the
+      local Wi-Fi bus itself is not wired up yet (see history.md)
 
 ---
 

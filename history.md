@@ -56,6 +56,89 @@ Key takeaways from mgba-splitscreen:
 
 ---
 
+### v0.1.1 - Native Bridge and Headless Core Tests (September 2026)
+
+**Status**: The emulator core runs headless, one instance per player, driven
+through a C API. Nothing user-visible yet — the Rust frontend is not connected.
+
+**What was built**:
+
+* `src/frontend/tauri/melonds_bridge.h` / `Bridge.cpp` / `PlatformBridge.cpp` — a
+  plain-C API over the melonDS core, deliberately free of Qt and SDL. Instances
+  are independent objects, so one emulator per player is a matter of creating
+  several. Covers: create/destroy, ROM loading with `NDS::SetupDirectBoot` for
+  homebrew, BIOS/firmware overrides, reset, main-RAM peek/poke, button and touch
+  input, lid, per-frame stepping, screen readback, savestates, battery saves,
+  and an error/title/frame-counter diagnostic surface.
+* `src/frontend/tauri/CMakeLists.txt` — builds the bridge against the core as a
+  static library, reachable via `-DBUILD_TAURI_BRIDGE=ON`.
+* `tools/mkdiagrom/mkdiagrom.py` — generates a diagnostic NDS ROM. No test ROM
+  ships with the repo and no ARM toolchain is guaranteed to be installed, so the
+  script hand-assembles an ARM9 and ARM7 program and writes valid DS headers
+  around them (including the logo and header CRC16s). It also self-validates.
+* `tools/coretest/smoke_test.cpp` — boots that ROM through the same bridge the
+  host will use. 36 checks: both screens render, the picture advances, two
+  identically-configured instances stay pixel-identical, a different player
+  identity renders differently, input reaches exactly one instance, and
+  savestates round-trip to the same picture when replayed.
+
+**Decisions worth keeping**:
+
+* **Software renderer, not OpenGL.** The host reads each instance's framebuffers
+  back on the CPU every frame, so the OpenGL renderer buys nothing and costs a
+  dependency. It also cannot link without the Qt frontend's glad headers, which
+  is why BUILD.md pins `-DENABLE_OGLRENDERER=OFF`.
+* **A diagnostic ROM instead of a borrowed one.** A hand-assembled ROM gives us
+  a known pixel pattern, a known identity block the host stamps into RAM, and
+  progress markers in RAM, so a failing check names the exact stage that broke.
+  It also keeps us clear of ROM legality questions.
+* **Assert on emulated state, not just pixels.** The test reads the button mask
+  the emulated console actually saw out of its own RAM. Inferring input from
+  pixels produced false passes; reading the console's owed view did not.
+
+**Bugs this caught (all in our own code, none upstream)**:
+
+1. **Keypad polarity.** melonDS's `NDS::SetKeyMask` takes an *active-low* mask —
+   its own frontend holds `inputMask = 0xFFF` for "nothing pressed" and clears
+   bits on press. The bridge was feeding it an active-high mask, so every button
+   was inverted. The conversion now lives in one commented place in the bridge.
+2. **The keypad's inversion mask is 10 bits, not 12.** `~raw & 0xFFF` over a
+   10-bit register yields `0xC00` for "nothing pressed". That phantom value was
+   read as X and Y being held, which produced a *false pass* on the X/Y check
+   and sent the investigation after a non-existent emulator bug.
+3. **X/Y are ARM7-only.** EXKEY (`0x04000136`) is not decoded on the ARM9 —
+   melonDS matches the hardware and GBATEK here. A game that wants X/Y has to
+   get them from its ARM7. The ROM does exactly that, via a mailbox in main RAM.
+4. **A 32-bit load at `0x04000136` reads the wrong register.** ARM word loads are
+   aligned down, so `LDR` at `0x04000136` reads `0x04000134` — the RTC counter,
+   not the keypad. It has to be `LDRH`. (`rawEXKEY` was `0x7F`: bits 0-1 are the
+   real X/Y bits, the high bits are melonDS's reset value for `KeyInput`.)
+5. **Bitmap layers need their DISPCNT bit.** The first build rendered a blank top
+   screen because the ROM enabled the wrong layer bit; on the DS, bit 8 is OBJ,
+   and BG2 is bit 10. Worth remembering when debugging blank screens later.
+6. **Sample the ROM at its own boundaries.** The ROM redraws its screens many
+   times per second, so assertions that sampled mid-iteration were flaky and
+   produced misleading failures. The test now keys off the ROM's own end-of-loop
+   heartbeat counter.
+
+**Known gaps — pick up here**:
+
+* **No multiplayer link yet.** `md_link_attach` / `md_link_slot` exist and assign
+  slots, but the actual local Wi-Fi bus between instances is not implemented.
+  This is the single most important missing piece for the product.
+* **The Rust side does not call the bridge.** The Tauri scaffolding is not wired
+  to any of the C API yet.
+* **The bridge has no threading story beyond a comment.** Each instance is meant
+  to be driven by one thread at a time, but nothing enforces it. With the JIT
+  enabled, melonDS routes memory accesses through a `thread_local NDS::Current`
+  that `RunFrame` sets, so instances on *different* threads are fine, but
+  interleaving two instances on one thread mid-frame is not.
+* **No BIOS/firmware handling beyond overrides.** Instances currently run the
+  built-in FreeBIOS, which is enough for homebrew but will not be enough for
+  commercial games.
+
+---
+
 ## Lessons from mgba-splitscreen
 
 Detailed implementation guidance based on the mgba-splitscreen project:
@@ -241,12 +324,12 @@ Additional credits from original melonDS:
 ## Future Milestones
 
 ### Near-term Goals (Phase 1-2)
-1. Complete Tauri v2 project setup
-2. Integrate melonDS as a static library in the Tauri app
-3. Implement framebuffer capture and WebSocket piping
-4. Render single NDS screen in webview
-5. Extend to multiple screens side by side
-6. Implement view modes (grid, speaker, focus, overlay)
+1. Implement the local link between instances — the core of the product
+2. Wire the Rust side of the Tauri app to the C bridge
+3. Pipe framebuffers to the webview and draw one screen per player
+4. Extend to multiple screens side by side
+5. Implement view modes (grid, speaker, focus, overlay)
+6. Decide and enforce the emulator threading model
 
 ### Medium-term Goals (Phase 3-4)
 1. Per-player keyboard controls with remapping
@@ -269,3 +352,4 @@ Additional credits from original melonDS:
 | Date | Version | Author | Changes |
 |------|---------|--------|---------|
 | 2026-09-11 | 0.1.0 | Project Initiation | Initial documentation created, mgba-splitscreen lessons added |
+| 2026-09-12 | 0.1.1 | Native bridge | C bridge over the headless core, hand-assembled diagnostic ROM, 36-check smoke test; build path documented |
