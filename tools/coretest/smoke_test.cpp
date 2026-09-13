@@ -112,12 +112,13 @@ struct Diag
     uint32_t stage = 0;       /* how far through the current iteration */
     uint32_t boot = 0;        /* written by the ROM's first instruction */
     uint32_t keys = 0;        /* buttons the emulated console really sees */
+    uint32_t resolved = 0;    /* colour the ROM resolved for itself, if published */
 };
 
 Diag sample_diag(MDInstance* inst)
 {
     Diag d;
-    uint32_t words[8] = { 0 };
+    uint32_t words[9] = { 0 };
     if (md_read_ram(inst, 0x02FFF000, words, sizeof(words)) != 0)
         return d;
 
@@ -129,6 +130,7 @@ Diag sample_diag(MDInstance* inst)
     d.stage = words[5];
     d.boot = words[6];
     d.keys = words[7];
+    d.resolved = words[8];
     return d;
 }
 
@@ -247,6 +249,21 @@ int main(int argc, char** argv)
 
     check(diag.magic == 0x4D44474D, "host-stamped identity survived into the ROM's RAM");
     check(diag.boot == 0xB0070000, "the ROM's first instruction executed");
+
+    /* How the console resolved its own identity, as opposed to whether the
+       stamp merely survived in RAM. These are different claims: the stamp can
+       sit in memory untouched while the ROM quietly uses its fallback colour,
+       which is exactly what a broken compare did for a while. */
+    for (int i = 0; i < 3; i++)
+    {
+        MDInstance* inst = (i == 0) ? a : (i == 1) ? b : c;
+        const uint32_t want = (i == 1 ? 0x7C00u : COLOUR_RED) | 0x8000u;
+        const Diag d = sample_diag(inst);
+        std::printf("       instance %c resolved colour %#06x (stamped %#06x)\n",
+                    'A' + i, d.resolved, want);
+        check(d.resolved == want, std::string("instance ") + char('A' + i) +
+                                  " resolves the colour the host stamped");
+    }
     /* heartbeat only ticks after the bottom screen has been drawn, so at least
        one tick proves the ROM got all the way around its loop. */
     check(diag.heartbeat > watch_start.heartbeat,

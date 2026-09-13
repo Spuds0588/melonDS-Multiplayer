@@ -37,6 +37,7 @@ reading it:
     0x02FFF014  u32  progress marker for this iteration  (out)
     0x02FFF018  u32  ARM9's first instruction marker     (out)
     0x02FFF01C  u32  pressed-button mask this console sees (out)
+    0x02FFF020  u32  colour the ROM actually resolved to     (out)
 
 The last word is how a test can check input routing directly instead of
 guessing from pixels: it holds exactly the twelve bits the ARM9 read back from
@@ -185,6 +186,7 @@ def _i_sub(cond, rd, rn, imm):  return _dp_imm(OP_SUB, 0, cond, rd, rn, imm)
 def _i_sub_pc(cond, rd, imm):   return _dp_imm(OP_SUB, 0, cond, rd, PC, imm)
 def _i_cmp(cond, rn, imm):      return _dp_imm(OP_CMP, 1, cond, 0, rn, imm)
 def _i_tst(cond, rn, imm):      return _dp_imm(OP_TST, 1, cond, 0, rn, imm)
+def _i_cmp_reg(cond, rn, rm):   return _dp_reg(OP_CMP, 1, cond, 0, rn, rm)
 def _i_and(cond, rd, rn, imm):  return _dp_imm(OP_AND, 0, cond, rd, rn, imm)
 def _i_eor(cond, rd, rn, imm):  return _dp_imm(OP_EOR, 0, cond, rd, rn, imm)
 def _i_and_reg(cond, rd, rn, rm): return _dp_reg(OP_AND, 0, cond, rd, rn, rm)
@@ -262,7 +264,17 @@ class Assembler:
         self._emit(_i_and_reg(COND["al"], rd, rn, rm))
 
     def cmp(self, rn: int, imm: int) -> None:
+        """Compare a register against an *immediate*.
+
+        Beware: cmp(r0, r1) does not compare two registers, it compares r0 with
+        the literal 1. Use cmp_reg for that. Getting this wrong is silent - the
+        code assembles and simply never takes the branch.
+        """
         self._emit(_i_cmp(COND["al"], rn, imm))
+
+    def cmp_reg(self, rn: int, rm: int) -> None:
+        """Compare two registers."""
+        self._emit(_i_cmp_reg(COND["al"], rn, rm))
 
     def tst(self, rn: int, imm: int) -> None:
         self._emit(_i_tst(COND["al"], rn, imm))
@@ -434,14 +446,17 @@ def build_arm9() -> bytes:
 
     # Resolve our colour: use the host-stamped identity when present.
     a.ldr_const(11, COL_DEFAULT_PLAYER)
-    a.ldr(0, 9, 0)
-    a.ldr_const(1, DIAG_MAGIC)
-    a.cmp(0, 1)
+    a.ldr(0, 9, 0)                            # r0 = magic
+    a.ldr_const(1, DIAG_MAGIC)                # DIAG_MAGIC has no rotated form
+    a.cmp_reg(0, 1)                           # NB: cmp() would compare r0 with 1
     a.b_cond("ne", "identity_default")
     a.ldr(11, 9, 8)
     a.label("identity_default")
     # The host stamps a plain BGR555 colour; make it opaque for the bitmap.
     a.add(11, 11, COL_OPAQUE)
+    # Publish the colour we ended up with, so the host can tell "the identity
+    # never arrived" apart from "the ROM read it but rendered something else".
+    a.str(11, 9, 0x20)
 
     # Progress marker: the host and the smoke test can watch these to tell how
     # far the boot got (DIAG_BASE+0x14) and that frames are still advancing

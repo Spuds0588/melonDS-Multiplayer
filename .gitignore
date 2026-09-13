@@ -30,6 +30,9 @@ freebios/build/
 tools/mkdiagrom/*.nds
 __pycache__/
 
+# Visual capture output (rebuild with md_capture + frames_to_html.py)
+captures/
+
 # Rust / Tauri build output
 src-tauri/target/
 src-tauri/gen/schemas/
