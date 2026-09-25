@@ -173,6 +173,14 @@ public:
     const u8* GetMAC() const;
     const u8* GetBSSID() const;
 
+    /* The RF channel this console's radio is currently tuned to (0 = not
+       tuned). The local-multiplayer bridge reads it to restamp received
+       frames: the virtual bus is channel-blind, but the games are channel-
+       aware (CheckRX drops frames whose channel byte differs from CurChannel,
+       which is how a host that picked channel 6 becomes invisible to a client
+       still scanning on channel 1). */
+    int GetCurChannel() const { return CurChannel; }
+
 private:
     melonDS::NDS& NDS;
     u8 RAM[0x2000];
@@ -237,6 +245,23 @@ private:
     int MPReplyTimer;
     u16 MPClientMask, MPClientFail;
 
+    /* Reply-in-the-same-round state (see Wifi::SendMPEarlyReply in Wifi.cpp):
+       0 = no command in flight, 1 = a command is arriving and the guest may
+       still arm its answer, 2 = this round's answer already went out early. */
+    int MPEarlyReplyState;
+    u16 MPEarlyCmdSeq;
+
+    /* The arm the last early answer was sent from, so the hardware's TX status
+       word can be written back into that buffer and the "did the guest refresh
+       its answer" trace can name it (see mp_early_reply_ack in Wifi.cpp). */
+    u16 MPEarlySentSlot;
+
+    /* Which piece of code is starting a reception, so the delivery trace can
+       name it: 0 none, 1 the MP reply handoff, 2 an association response,
+       3 a deauth, 4 a frame the regular path took, 5 a held MP frame whose
+       timestamp has come. See StartRX in Wifi.cpp. */
+    int MPRXSite;
+
     u8 MPClientReplies[15*1024];
 
     u16 MPLastSeqno;
@@ -275,6 +300,7 @@ private:
     void StartTX_Beacon();
     void FireTX();
     void SendMPDefaultReply();
+    void SendMPEarlyReply();
     void SendMPReply(u16 clienttime, u16 clientmask);
     void SendMPAck(u16 cmdcount, u16 clientfail);
     bool ProcessTX(TXSlot* slot, int num);

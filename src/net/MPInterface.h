@@ -19,6 +19,7 @@
 #ifndef MPINTERFACE_H
 #define MPINTERFACE_H
 
+#include <chrono>
 #include <memory>
 #include "types.h"
 
@@ -67,6 +68,45 @@ public:
     [[nodiscard]] int GetReplyTimeout() const noexcept { return ReplyTimeout; }
     void SetReplyTimeout(int timeout) noexcept { ReplyTimeout = timeout; }
 
+    /* How much of the *current frame's* budget this console may spend inside
+       reply waits, published by the host once per frame (negative = no limit,
+       i.e. stock melonDS). ReplyTimeout above bounds a single wait; this bounds
+       their sum, and it exists because the waits are the only link timing
+       measured in wall-clock time while the frame they sit inside is measured
+       in emulated time.
+
+       Why it matters, measured 2026-09-25: during an MKDS join the host asked
+       for replies 1436 times in 15s and 363 of those windows were empty; at the
+       then-current 34ms ceiling that is 12.3s of a 15s window spent blocked
+       *inside the emulator*, so the session ran at 9fps instead of 60 and every
+       peer console waited for it at the lockstep barrier. The host's own reply
+       latency grows with the wall-clock cost of an emulated frame, so an
+       unbounded wait feeds itself. Charging the waits to the frame's budget
+       keeps the frame rate and lets a console wait exactly as long as it was
+       going to be idle anyway. */
+    void SetReplyBudget(int inst, long long ns) noexcept
+    {
+        if (inst < 0 || inst >= (int)(sizeof(ReplyBudgetNs) / sizeof(ReplyBudgetNs[0])))
+            return;
+        ReplyBudgetNs[inst] = ns;
+        ReplyBudgetStart[inst] = std::chrono::steady_clock::now();
+    }
+
+    /* Nanoseconds of the current frame's reply budget that are still unspent,
+       or -1 when no budget was published. */
+    [[nodiscard]] long long GetReplyBudgetLeft(int inst) const noexcept
+    {
+        if (inst < 0 || inst >= (int)(sizeof(ReplyBudgetNs) / sizeof(ReplyBudgetNs[0])))
+            return -1;
+        const long long budget = ReplyBudgetNs[inst];
+        if (budget < 0) return -1;
+
+        const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - ReplyBudgetStart[inst]).count();
+        const long long left = budget - (long long)spent;
+        return left > 0 ? left : 0;
+    }
+
     // function called every video frame
     virtual void Process() = 0;
 
@@ -85,9 +125,24 @@ protected:
     int RecvTimeout = 25;
     int ReplyTimeout = 25;
 
+    // per-instance reply-wait budget, see SetReplyBudget above
+    static constexpr int kMaxMPInstances = 16;
+    long long ReplyBudgetNs[kMaxMPInstances];
+    std::chrono::steady_clock::time_point ReplyBudgetStart[kMaxMPInstances];
+
 private:
     static MPInterfaceType CurrentType;
     static std::unique_ptr<MPInterface> Current;
+
+public:
+    MPInterface()
+    {
+        for (int i = 0; i < kMaxMPInstances; i++)
+        {
+            ReplyBudgetNs[i] = -1;
+            ReplyBudgetStart[i] = std::chrono::steady_clock::now();
+        }
+    }
 };
 
 }

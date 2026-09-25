@@ -70,6 +70,14 @@ int md_set_firmware(MDInstance* inst, const char* firmware_path);
 
 void md_reset(MDInstance* inst);
 
+/* Enables or disables the ARM JIT at runtime. The JIT is on by default because
+   four consoles on one machine need it, but a title that misbehaves under it can
+   be checked from the same host by turning it off - melonDS's own frontend
+   exposes the same toggle. */
+int md_set_jit(MDInstance* inst, int enabled);
+/* Non-zero while the JIT is active. */
+int md_jit_enabled(MDInstance* inst);
+
 /* Writes into the emulated console's main RAM. addr and len must both be
    multiples of 4. Used to stamp the diagnostic identity block (see
    tools/mkdiagrom) before the first frame. */
@@ -85,6 +93,24 @@ void md_set_buttons(MDInstance* inst, uint32_t mask);
 void md_touch(MDInstance* inst, int x, int y);
 void md_release_touch(MDInstance* inst);
 void md_set_lid(MDInstance* inst, int closed);
+
+/* What the emulated console can actually observe about a touch.
+
+   A game never sees "a touch happened at (x,y)"; it sees two ADC readings out
+   of the touchscreen controller and a pen-down bit in its key register. Those
+   are the whole interface, so a test that wants to prove input reached the
+   guest has to read them back rather than infer it from pixels. */
+typedef struct MDTouchProbe
+{
+    uint32_t pen_down;  /* 1 while the key register reports the pen against the screen */
+    uint32_t adc_x;     /* the touchscreen's X channel, as the guest reads it */
+    uint32_t adc_y;
+} MDTouchProbe;
+
+/* Touches (or releases) the screen and reports back what the guest would read.
+   Values are the raw 12-bit conversions, which melonDS drives as screen pixel
+   times 16 - see melonDS::TSC::SetTouchCoords. */
+int md_touch_probe(MDInstance* inst, int touching, int x, int y, MDTouchProbe* out);
 
 /* ---------------------------------------------------------------- execution */
 
@@ -142,6 +168,19 @@ int  md_link_recv_timeout(void);
 void md_link_set_reply_timeout(int milliseconds);
 int  md_link_reply_timeout(void);
 
+/* How long, in total, this console may spend inside reply waits during the
+   frame it is about to run (negative = no limit, stock melonDS). The host
+   publishes this immediately before each frame: the per-window timeout above is
+   wall-clock time spent inside an emulated frame, and an unbounded wait there
+   drags the whole lockstep session down with it - 363 empty windows at 34ms
+   cost 12.3s of a 15s window during a real MKDS join, which ran the session at
+   9fps. Budgeted, a console waits only as long as the frame was going to be
+   idle anyway; a reply the peer cannot produce inside that slack is a reply
+   this frame does not get, and the game hears about it the usual way
+   (clientfail in the host's ack). Reach for MD_REPLY_TIMEOUT_MS, not this, when
+   tuning how generous a single window is. */
+void md_link_set_reply_budget(MDInstance* inst, int64_t budget_ns);
+
 /* How many times this console has powered its wireless hardware on and off.
    Tells "the game never started wireless" apart from "wireless ran and found
    nobody", which are very different faults to chase. */
@@ -150,7 +189,11 @@ uint32_t md_link_end_count(MDInstance* inst);
 
 /* Everything a host (or a test) needs to tell whether a link is actually
    carrying traffic. A game that has powered its wireless on and is exchanging
-   nothing is a very different situation from one that never started wireless. */
+   nothing is a very different situation from one that never started wireless.
+   v2 splits the packet counters by LocalMP packet kind so a stall can be
+   pinned to a layer: a game stuck after discovery shows broadcasts flowing
+   but no cmds; a host whose replies never arrive shows tx_cmd with rx_reply
+   frozen, etc. */
 typedef struct MDLinkStats
 {
     uint32_t connected;        /* slots on the bus right now, as a bitmask */
@@ -165,10 +208,40 @@ typedef struct MDLinkStats
        layer never learns how many bytes arrived that way. Read this as a lower
        bound; use the sender's bytes_sent for the true figure. */
     uint64_t bytes_received;
+    /* --- v2: per-kind split (LocalMP packet types 0-3) --- */
+    uint64_t rx_broadcast;     /* type 0: MP frames pulled off the packet FIFO */
+    uint64_t rx_cmd;           /* type 1: host command frames */
+    uint64_t rx_reply;         /* type 2: client reply frames */
+    uint64_t rx_ack;           /* type 3: ack frames */
+    uint64_t rx_polls;         /* all MP host-frame + broadcast receive calls */
+    uint64_t tx_cmd;           /* host commands this console sent */
+    uint64_t tx_reply;         /* replies this console sent */
+    uint64_t tx_ack;           /* acks this console sent */
+    uint64_t rx_empty_polls;   /* polls that returned nothing */
+    /* Steady-clock microseconds of the last accepted-from-a-peer packet, and
+       of the bus epoch (md_link_init), so hostside code can compute seconds
+       since the last traffic and log relative timestamps consistently. */
+    uint64_t last_rx_us;
+    uint64_t epoch_us;
 } MDLinkStats;
 
 /* Fills in out with this console's link state. Returns 0 on success. */
 int md_link_stats(MDInstance* inst, MDLinkStats* out);
+
+/* Re-anchor this console onto the bus: LocalMP::Begin resets its packet-FIFO
+   read offset to the bus's write head and clears its receive semaphores. The
+   host calls this when the watchdog detects a stalled console whose peers are
+   still on the bus - the automated form of "clicking Link test unfroze it"
+   (the selftest's wireless power cycle lands here via the core's MP_Begin).
+   Harmless on a healthy console: it only discards packets queued for a
+   console that demonstrably stopped reading them. */
+void md_link_resync(MDInstance* inst);
+
+/* Set the core-log tag used by the CURRENT thread: all melonDS log lines
+   emitted from this thread will be prefixed [melonDS:<tag>]. The host calls
+   this at the top of each console's run thread so interleaved per-console
+   logs can be told apart. */
+void md_tag_current_thread(const char* tag);
 
 /* ------------------------- link self-test ------------------------------- */
 /* Broadcasts a packet on this console's slot, and pulls the next packet

@@ -53,6 +53,14 @@ public:
     void Begin(int inst);
     void End(int inst);
 
+    /* Return the bus to its just-constructed state: no consoles attached, every
+       FIFO read offset and semaphore back to zero. Used by the Tauri bridge
+       when a session ends. Kept separate from the destructor on purpose: the
+       host holds a raw pointer to this bus from several threads, so the bus
+       object outlives every session and is reset rather than destroyed (see
+       md_link_shutdown in Bridge.cpp). */
+    void Reset();
+
     int SendPacket(int inst, u8* data, int len, u64 timestamp);
     int RecvPacket(int inst, u8* data, u64* timestamp);
     int SendCmd(int inst, u8* data, int len, u64 timestamp);

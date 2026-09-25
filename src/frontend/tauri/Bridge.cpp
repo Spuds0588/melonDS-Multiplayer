@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -20,6 +21,9 @@
 #include "NDSCart.h"
 #include "Savestate.h"
 #include "GPU.h"
+#include "SPI.h"
+
+#include <optional>
 
 #include "LocalMP.h"
 
@@ -55,6 +59,34 @@ struct MDInstance
     u64 link_packets_received = 0;
     u64 link_bytes_sent = 0;
     u64 link_bytes_received = 0;
+
+    /* Per-kind packet counters (LinkStats v2). 'broadcast' = MP frames and
+       acks a console pulled off its own receive slot; 'cmd'/'reply' = the
+       host's command/reply handshake; 'host_polls' = MP host-frame polls,
+       counted separately because Wifi::CheckRX hammers them and the game's
+       own per-packet count would drown in polls that returned nothing. */
+    u64 link_rx_broadcast = 0;
+    u64 link_rx_cmd = 0;
+    u64 link_rx_reply = 0;
+    u64 link_rx_ack = 0;
+    u64 link_rx_polls = 0;
+    u64 link_tx_cmd = 0;
+    u64 link_tx_reply = 0;
+    u64 link_tx_ack = 0;
+    u64 link_rx_empty_polls = 0;
+
+    /* Monotonic microsecond timestamp of the last accepted-from-a-peer packet
+       (total-packet counter only; a clock of polls is meaningless). Drives
+       LINK STALL detection in the host's health log. */
+    u64 link_last_rx_us = 0;
+
+    /* Identity on the virtual air. Every instance boots the same firmware, so
+       the per-console offset has to be applied by the host; MELN keeps the
+       firmware MAC as loaded so the offset can be re-derived on every boot
+       instead of compounding (see apply_console_mac). */
+    melonDS::MacAddress console_mac = {};
+    melonDS::MacAddress firmware_mac = {};
+    bool firmware_mac_valid = false;
 
     /* scratch buffer for md_load_state() so the caller's buffer stays const */
     std::vector<u8> state_scratch;
@@ -121,6 +153,23 @@ bool file_exists(const std::string& path)
 /* Shared link bus, created lazily by md_link_init(). */
 std::mutex g_link_lock;
 std::unique_ptr<melonDS::LocalMP> g_link_bus;
+
+/* Monotonic wall clock for link event timestamps and session-relative log
+   prefixes, taken once at md_link_init(). */
+std::chrono::steady_clock::time_point g_link_epoch;
+u64 now_us()
+{
+    return (u64)std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+/* Seconds since the bus was created; the log's shared time axis. */
+double session_secs()
+{
+    return std::chrono::duration_cast<std::chrono::duration<double>>(
+               std::chrono::steady_clock::now() - g_link_epoch)
+        .count();
+}
 
 /* Slots whose console currently has its wireless hardware powered on.
 
@@ -212,6 +261,10 @@ void notify_mp_begin(void* userdata)
     std::lock_guard<std::mutex> lock(g_link_lock);
     inst->link_begin_count++;
     if (inst->slot >= 0) g_link_connected |= (1u << inst->slot);
+    std::fprintf(stderr,
+        "[link-event] +%.3fs p%d (%s): wireless ON (begin #%u, slots now 0x%x)\n",
+        session_secs(), inst->slot, inst->name.c_str(), inst->link_begin_count,
+        g_link_connected);
 }
 
 void notify_mp_end(void* userdata)
@@ -222,6 +275,10 @@ void notify_mp_end(void* userdata)
     std::lock_guard<std::mutex> lock(g_link_lock);
     inst->link_end_count++;
     if (inst->slot >= 0) g_link_connected &= ~(1u << inst->slot);
+    std::fprintf(stderr,
+        "[link-event] +%.3fs p%d (%s): wireless off (end #%u, slots now 0x%x)\n",
+        session_secs(), inst->slot, inst->name.c_str(), inst->link_end_count,
+        g_link_connected);
 }
 
 void note_packet_sent(void* userdata, int len)
@@ -231,6 +288,23 @@ void note_packet_sent(void* userdata, int len)
 
     std::lock_guard<std::mutex> lock(g_link_lock);
     inst->link_packets_sent++;
+    if (len > 0) inst->link_bytes_sent += (u64)len;
+}
+
+void note_packet_sent_kind(void* userdata, int kind, int len)
+{
+    auto* inst = static_cast<MDInstance*>(userdata);
+    if (!inst) return;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    inst->link_packets_sent++;
+    switch (kind)
+    {
+    case 1: inst->link_tx_cmd++; break;
+    case 2: inst->link_tx_reply++; break;
+    case 3: inst->link_tx_ack++; break;
+    default: break; /* kind 0 = MP frame, no dedicated tx counter */
+    }
     if (len > 0) inst->link_bytes_sent += (u64)len;
 }
 
@@ -244,6 +318,35 @@ void note_packet_received(void* userdata, int len)
     if (len > 0) inst->link_bytes_received += (u64)len;
 }
 
+void note_packet_received_kind(void* userdata, int kind, int len)
+{
+    auto* inst = static_cast<MDInstance*>(userdata);
+    if (!inst) return;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    inst->link_packets_received++;
+    switch (kind)
+    {
+    case 0: inst->link_rx_broadcast++; break;
+    case 1: inst->link_rx_cmd++; break;
+    case 2: inst->link_rx_reply++; break;
+    case 3: inst->link_rx_ack++; break;
+    default: break;
+    }
+    if (len > 0) inst->link_bytes_received += (u64)len;
+    inst->link_last_rx_us = now_us();
+}
+
+void note_poll(void* userdata, bool got_packet)
+{
+    auto* inst = static_cast<MDInstance*>(userdata);
+    if (!inst) return;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    inst->link_rx_polls++;
+    if (!got_packet) inst->link_rx_empty_polls++;
+}
+
 bool link_enabled()
 {
     return link_bus() != nullptr;
@@ -252,6 +355,52 @@ bool link_enabled()
 } // namespace md
 
 /* ------------------------------------------------------------------ lifecycle */
+
+/* Gives this console its own MAC address.
+
+   All the instances in a session load the same firmware, so out of the box they
+   all present the same MAC - and a DS game identifies the consoles it talks to
+   by MAC. MKDS, for one, builds the room list out of the host's MAC, so a
+   joiner that shares the host's MAC cannot tell the host's group apart from its
+   own console and the group never shows up. melonDS's own frontend offsets the
+   MAC of every instance past the first for the same reason
+   (EmuInstance::customizeFirmware); slot 0 keeps the firmware MAC and the rest
+   get distinct low bytes, which is exactly the scheme used here.
+
+   Called before the console boots: the guest reads its MAC out of the firmware
+   over SPI while booting, then programs it into the wireless hardware. */
+void apply_console_mac(MDInstance* inst)
+{
+    if (!inst || !inst->nds) return;
+
+    melonDS::Firmware& firmware = inst->nds->GetFirmware();
+
+    if (!inst->firmware_mac_valid)
+    {
+        inst->firmware_mac = firmware.GetHeader().MacAddr;
+        inst->firmware_mac_valid = true;
+    }
+
+    inst->console_mac = inst->firmware_mac;
+
+    const int id = (inst->slot > 0) ? inst->slot : 0;
+    if (id > 0)
+    {
+        inst->console_mac[3] += (u8)id;
+        inst->console_mac[4] += (u8)(id * 0x44);
+        inst->console_mac[5] += (u8)(id * 0x10);
+        inst->console_mac[0] &= 0xFC; /* never present a broadcast MAC */
+    }
+
+    firmware.GetHeader().MacAddr = inst->console_mac;
+    firmware.UpdateChecksums();
+
+    const melonDS::MacAddress& m = inst->console_mac;
+    std::fprintf(stderr,
+                 "[melonDS bridge] %s: wireless MAC %02X:%02X:%02X:%02X:%02X:%02X (%s)\n",
+                 inst->name.c_str(), m[0], m[1], m[2], m[3], m[4], m[5],
+                 (id > 0) ? "offset from the shared firmware MAC" : "firmware MAC");
+}
 
 MDInstance* md_create(int console_type, const char* name)
 {
@@ -327,6 +476,11 @@ int md_load_rom(MDInstance* inst, const char* rom_path)
         inst->nds->EjectCart();
 
     inst->nds->SetNDSCart(std::move(cart));
+
+    /* Before Reset: the console reads its MAC out of the firmware over SPI as
+       it boots, so the per-console identity has to be in the image by then. */
+    apply_console_mac(inst);
+
     inst->nds->Reset();
 
     if (inst->nds->NeedsDirectBoot())
@@ -398,6 +552,10 @@ int md_set_firmware(MDInstance* inst, const char* firmware_path)
     /* Firmware copies and pads the buffer, so a short/garbage image is caught
        by the size check above rather than here. */
     inst->nds->SetFirmware(melonDS::Firmware(fw.data(), (u32)fw.size()));
+
+    /* A new image means a new base MAC: the per-console offset has to be
+       re-derived from this one at the next boot. */
+    inst->firmware_mac_valid = false;
     return 0;
 }
 
@@ -454,6 +612,20 @@ void md_reset(MDInstance* inst)
     inst->stop_reason = MD_STOP_NONE;
 }
 
+int md_set_jit(MDInstance* inst, int enabled)
+{
+    if (!inst || !inst->nds) return -1;
+    inst->nds->SetJITArgs(enabled ? std::optional<melonDS::JITArgs>(melonDS::JITArgs())
+                                  : std::nullopt);
+    return 0;
+}
+
+int md_jit_enabled(MDInstance* inst)
+{
+    if (!inst || !inst->nds) return 0;
+    return inst->nds->IsJITEnabled() ? 1 : 0;
+}
+
 /* ---------------------------------------------------------------------- input */
 
 void md_set_buttons(MDInstance* inst, u32 mask)
@@ -465,6 +637,7 @@ void md_set_buttons(MDInstance* inst, u32 mask)
 void md_touch(MDInstance* inst, int x, int y)
 {
     if (!inst) return;
+    std::fprintf(stderr, "[input] player %d touch -> %d,%d\n", inst->slot + 1, x, y);
     inst->touch_active = true;
     inst->touch_x = x;
     inst->touch_y = y;
@@ -473,6 +646,11 @@ void md_touch(MDInstance* inst, int x, int y)
 void md_release_touch(MDInstance* inst)
 {
     if (!inst) return;
+    /* The host re-asserts the whole input state every frame, so this fires
+       60x/second with no press in progress; log only the actual down->up
+       transition or the run log drowns (102385 lines in one MKDS run). */
+    if (inst->touch_active)
+        std::fprintf(stderr, "[input] player %d touch released\n", inst->slot + 1);
     inst->touch_active = false;
 }
 
@@ -482,10 +660,91 @@ void md_set_lid(MDInstance* inst, int closed)
     inst->lid_closed = closed != 0;
 }
 
+/* Reads one touchscreen channel the way the guest's ARM7 does: write the
+   control byte to start a conversion, then clock out the two result bytes.
+
+   The first dummy transfer is load-bearing. TSC::Write() refreshes Data from the
+   *current* DataPos and only then acts on the control byte, so the byte sitting
+   in the shift register right after starting a conversion is still the previous
+   channel's - reading it there yields a mix of two conversions. The result bytes
+   arrive on the two transfers after that. */
+static u32 read_tsc_channel(melonDS::TSC* tsc, u8 control)
+{
+    tsc->Write(control);
+
+    tsc->Write(0x00);
+    const u8 high = tsc->Read(); /* (ConvResult >> 5) & 0x7F */
+    tsc->Write(0x00);
+    const u8 low = tsc->Read();  /* (ConvResult << 3) & 0xFF */
+
+    return ((u32)high << 5) | ((u32)low >> 3);
+}
+
+int md_touch_probe(MDInstance* inst, int touching, int x, int y, MDTouchProbe* out)
+{
+    if (!inst || !inst->nds || !out) return -1;
+
+    inst->touch_active = touching != 0;
+    inst->touch_x = x;
+    inst->touch_y = y;
+
+    /* Push it through the same call RunFrame makes, so the probe reports the
+       machine's real state rather than merely what we asked for. */
+    if (inst->touch_active)
+        inst->nds->TouchScreen((melonDS::u16)x, (melonDS::u16)y);
+    else
+        inst->nds->ReleaseScreen();
+
+    melonDS::TSC* tsc = inst->nds->SPI.GetTSC();
+    if (!tsc) return -1;
+
+    out->pen_down = (inst->nds->KeyInput & (1u << 22)) ? 0 : 1;
+    out->adc_y = read_tsc_channel(tsc, 0x90); /* 0x10 = Y channel */
+    out->adc_x = read_tsc_channel(tsc, 0xD0); /* 0x50 = X channel */
+
+    /* Leave the controller where the guest expects to find it, so probing a
+       running console cannot corrupt the game's own next transfer. */
+    tsc->Release();
+    return 0;
+}
+
 /* ------------------------------------------------------------------ execution */
 
 static void push_buttons(MDInstance* inst)
 {
+    /* What the player is driving the emulated game with, once per change: the
+       v0.1.8r MKDS investigation ended at "the host's game polls and never
+       advances", which is consistent with the player's press never arriving
+       here. `buttons` is the MD_BTN_* active-high layout from
+       melonds_bridge.h (bit 0 = A, 1 = B, 2 = SELECT, 3 = START, 4 = RIGHT,
+       5 = LEFT, 6 = UP, 7 = DOWN, 8 = R, 9 = L, 10 = X, 11 = Y); touch is
+       logged at the md_touch/md_release_touch transitions, not here. */
+    static u32 last_logged[8] = {0};
+    const int slot = inst->slot;
+    if (slot >= 0 && slot < 8 && inst->buttons != last_logged[slot])
+    {
+        last_logged[slot] = inst->buttons;
+        char keys[80] = "none";
+        {
+            const char* names[12] = {"A", "B", "SELECT", "START", "RIGHT", "LEFT",
+                                     "UP", "DOWN", "R", "L", "X", "Y"};
+            int n = 0;
+            for (int i = 0; i < 12; i++)
+            {
+                if (inst->buttons & (1u << i))
+                {
+                    if (n) keys[n++] = '+';
+                    for (const char* c = names[i]; *c && n < 70; c++) keys[n++] = *c;
+                }
+            }
+            keys[n] = 0;
+            if (!n) strcpy(keys, "none");
+        }
+        std::fprintf(stderr,
+            "[input] player %d buttons -> %s (mask %08X)\n",
+            slot + 1, keys, inst->buttons);
+    }
+
     inst->nds->SetKeyMask(~inst->buttons & 0xFFF);
 }
 
@@ -593,15 +852,26 @@ void md_link_init(void)
     {
         g_link_bus = std::make_unique<melonDS::LocalMP>();
         g_link_connected = 0;
-        std::fprintf(stderr, "[melonDS bridge] local multiplayer bus ready (16 slots)\n");
+        g_link_epoch = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[link-event] +0.000s bus: init (16 slots)\n");
     }
 }
 
 void md_link_shutdown(void)
 {
     std::lock_guard<std::mutex> lock(g_link_lock);
-    g_link_bus.reset();
+    /* The bus object is deliberately never destroyed. Platform's MP_* hooks
+       fetch it through md::link_bus(), which returns the raw pointer after
+       releasing g_link_lock, and the core calls those hooks from each
+       console's driver thread. Freeing the bus here could therefore free it
+       under a thread that is inside LocalMP right now - a use-after-free the
+       host cannot defend against from the outside. Resetting it to its
+       just-constructed state gives the next session the same clean slate
+       without ever invalidating a pointer. */
+    if (g_link_bus) g_link_bus->Reset();
     g_link_connected = 0;
+    std::fprintf(stderr, "[link-event] +%.3fs bus: shutdown (state reset, bus kept alive)\n",
+        session_secs());
 }
 
 void md_link_attach(MDInstance* inst, int slot)
@@ -637,6 +907,26 @@ void md_link_detach(MDInstance* inst)
     inst->slot = -1;
 }
 
+void md_link_resync(MDInstance* inst)
+{
+    if (!inst || inst->slot < 0) return;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (!g_link_bus) return;
+
+    /* LocalMP::Begin re-anchors this console's packet-FIFO read offset to the
+       bus's current write offset and resets its receive semaphores. A console
+       whose read pointer drifted into stale bytes - or whose semaphore went
+       unsignaled while packets piled up - starts clean. This is the automated
+       form of the discovery that clicking "Link test" unstuck a frozen lobby:
+       the selftest's wireless power cycle reaches here through the core's real
+       MP_Begin path, and the kick is what fixed it, not the test packets. */
+    g_link_bus->Begin(inst->slot);
+    std::fprintf(stderr,
+        "[link-event] +%.3fs p%d (%s): resync (FIFO read offset re-anchored, receive semaphores cleared)\n",
+        session_secs(), inst->slot, inst->name.c_str());
+}
+
 melonDS::u32 md_link_connected_mask(void)
 {
     std::lock_guard<std::mutex> lock(g_link_lock);
@@ -647,6 +937,8 @@ void md_link_set_recv_timeout(int milliseconds)
 {
     std::lock_guard<std::mutex> lock(g_link_lock);
     if (g_link_bus) g_link_bus->SetRecvTimeout(milliseconds < 0 ? 0 : milliseconds);
+    std::fprintf(stderr, "[link-event] +%.3fs bus: recv_timeout=%dms\n",
+        session_secs(), g_link_bus ? g_link_bus->GetRecvTimeout() : 0);
 }
 
 int md_link_recv_timeout(void)
@@ -659,12 +951,28 @@ void md_link_set_reply_timeout(int milliseconds)
 {
     std::lock_guard<std::mutex> lock(g_link_lock);
     if (g_link_bus) g_link_bus->SetReplyTimeout(milliseconds < 0 ? 0 : milliseconds);
+    std::fprintf(stderr, "[link-event] +%.3fs bus: recv_timeout=%dms reply_timeout=%dms\n",
+        session_secs(), g_link_bus ? g_link_bus->GetRecvTimeout() : 0,
+        g_link_bus ? g_link_bus->GetReplyTimeout() : 0);
 }
 
 int md_link_reply_timeout(void)
 {
     std::lock_guard<std::mutex> lock(g_link_lock);
     return g_link_bus ? g_link_bus->GetReplyTimeout() : 0;
+}
+
+void md_link_set_reply_budget(MDInstance* inst, int64_t budget_ns)
+{
+    if (!inst || inst->slot < 0) return;
+
+    /* Published by the host immediately before the frame that may spend it,
+       negative to leave the waits unbounded (stock melonDS). Both halves of the
+       number matter: the ceiling above bounds one reply window, this bounds all
+       of them put together within a single frame. See
+       MPInterface::SetReplyBudget for the measurement behind it. */
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (g_link_bus) g_link_bus->SetReplyBudget(inst->slot, (long long)budget_ns);
 }
 
 melonDS::u32 md_link_begin_count(MDInstance* inst)
@@ -722,6 +1030,19 @@ int md_link_stats(MDInstance* inst, MDLinkStats* out)
     out->packets_received = inst->link_packets_received;
     out->bytes_sent = inst->link_bytes_sent;
     out->bytes_received = inst->link_bytes_received;
+    out->rx_broadcast = inst->link_rx_broadcast;
+    out->rx_cmd = inst->link_rx_cmd;
+    out->rx_reply = inst->link_rx_reply;
+    out->rx_ack = inst->link_rx_ack;
+    out->rx_polls = inst->link_rx_polls;
+    out->tx_cmd = inst->link_tx_cmd;
+    out->tx_reply = inst->link_tx_reply;
+    out->tx_ack = inst->link_tx_ack;
+    out->rx_empty_polls = inst->link_rx_empty_polls;
+    out->last_rx_us = inst->link_last_rx_us;
+    out->epoch_us = (u64)std::chrono::duration_cast<std::chrono::microseconds>(
+                        g_link_epoch.time_since_epoch())
+                        .count();
     return 0;
 }
 

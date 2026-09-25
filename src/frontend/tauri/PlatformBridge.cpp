@@ -41,6 +41,18 @@ namespace Platform
 
 /* -------------------------------------------------------------------- logging */
 
+/* Tag for core log lines emitted by the current thread. Each console runs on
+   its own thread ("playerN" from the Rust host, "consoleN" from the C++
+   harness), so this disambiguates interleaved wifi logs: which console was
+   on the wrong channel, which one powered its radio on, etc. */
+static thread_local std::string t_log_tag = "main";
+
+/* namespace-visible setter used by the extern "C" md_tag_current_thread. */
+void set_thread_log_tag(const char* tag)
+{
+    t_log_tag = tag ? tag : "?";
+}
+
 void Log(LogLevel level, const char* fmt, ...)
 {
     static const char* prefixes[] = { "Debug", "Info", "Warn", "Error" };
@@ -48,7 +60,7 @@ void Log(LogLevel level, const char* fmt, ...)
     const char* prefix = "Log";
     if ((int)level >= 0 && (int)level < 4) prefix = prefixes[(int)level];
 
-    std::fprintf(stderr, "[melonDS %s] ", prefix);
+    std::fprintf(stderr, "[melonDS %s:%s] ", t_log_tag.c_str(), prefix);
 
     va_list args;
     va_start(args, fmt);
@@ -419,6 +431,119 @@ void SignalStop(StopReason reason, void* userdata)
     md::notify_stop(userdata, (int)reason + MD_STOP_EXTERNAL);
 }
 
+/* ------------------------------------------------------------ frame tracing */
+
+/* MD_LINK_VERBOSE=1 makes the virtual air narrate every frame it carries, from
+   both ends: what a console put on the wire and what each peer pulled off it.
+   The counters in MDLinkStats only say *that* traffic stalled; these lines say
+   why - a joiner that answers nothing, a room beacon whose host MAC is also the
+   receiver's own, a reply that never reaches the host. Two consoles' worth of
+   discovery is a few dozen frames, so the noise is affordable exactly when a
+   lobby refuses to fill. */
+static bool link_trace_enabled()
+{
+    static const bool enabled = []() {
+        const char* v = std::getenv("MD_LINK_VERBOSE");
+        return v && *v && (*v != '0');
+    }();
+    return enabled;
+}
+
+static void format_mac(const u8* p, char* out) /* out must hold 13 bytes */
+{
+    std::snprintf(out, 13, "%02X%02X%02X%02X%02X%02X", p[0], p[1], p[2], p[3], p[4], p[5]);
+}
+
+/* data is the DS-style 12 byte TX header + the 802.11 frame, i.e. exactly what
+   the wireless hardware hands the platform layer. The header fields printed are
+   the ones discovery and the MP handshake turn on: the frame control word, the
+   three address fields (received-from, transmitted-by, BSSID), the sequence
+   control word and, for MP frames, the sync / client-mask block at the start of
+   the payload.
+
+   `seq` earns its place because the DS firmware throws away a CMD frame whose
+   sequence number repeats the previous one (see Wifi::FinishRX's cmd_dupe), so
+   a host stuck on one sequence number looks like a host that never speaks.
+
+   `t` is the emulated US-timer timestamp the frame carries. The two consoles
+   are only locked to the same *frame*, so their US clocks sit at whatever phase
+   within the frame they each reached; printing both ends' timestamps is what
+   turns "the reply came too late" into a number instead of a guess. */
+static void trace_frame(const char* dir, int slot, const char* kind, u64 timestamp,
+                        const u8* data, int len)
+{
+    if (!link_trace_enabled()) return;
+
+    if (!data || len < 12)
+    {
+        /* The blank MP reply ("nothing to send", see Wifi::FinishRX) is a zero
+           length frame, invisible to a trace that only prints whole frames.
+           The host reads it as a packet but, having no payload, not as a reply -
+           so it reports the client as failed while the wire shows no gap. */
+        std::fprintf(stderr, "[link-trace] p%d %s %-5s len=%3d t=%llu (empty frame)\n",
+                     slot + 1, dir, kind, len, (unsigned long long)timestamp);
+        return;
+    }
+
+    const u8* frame = data + 12;
+    const int framelen = len - 12;
+
+    const u16 framectl = (framelen >= 2) ? *(const u16*)&frame[0] : 0;
+    const u16 seq = (framelen >= 24) ? *(const u16*)&frame[22] : 0;
+
+    /* The body of every *new* command a game sends, one line per sequence
+       number: retries repeat the same seqno, so this stays small while showing
+       exactly what one game asks of the other. This is the missing half of the
+       2026-09-25 MKDS investigation - the transport is at reference quality
+       (v0.1.8q), the guest's game answers every poll from one frozen template
+       and then leaves after ~4.3s, and whether the commands' *content* is what
+       its game expects is the open question. MP commands only (`fc=0228`); a
+       new seqno during multiplayer is one line, everything else stays off the
+       log. */
+    if (framelen >= 30 && (framectl & 0x00FF) == 0x28 && (framectl & 0x0300) == 0x0200)
+    {
+        static u16 lastcmdseq = 0xFFFF;
+        static int lastcmdslot = -1;
+        if (seq != lastcmdseq || slot != lastcmdslot)
+        {
+            lastcmdseq = seq;
+            lastcmdslot = slot;
+            const int bodylen = framelen - 28;
+            char body[3 * 18 + 1] = "-";
+            if (bodylen > 0)
+            {
+                const int n = (bodylen > 18) ? 18 : bodylen;
+                for (int i = 0; i < n; i++)
+                    snprintf(&body[i * 3], 4, "%02X ", frame[28 + i]);
+                body[n * 3 - 1] = 0;
+            }
+            std::fprintf(stderr, "[link-trace] cmd body seq=%04X slot=%d body[%d]=%s\n",
+                         seq, slot + 1, bodylen, body);
+        }
+    }
+    char rxmac[13] = "------------";
+    char txmac[13] = "------------";
+    char bssid[13] = "------------";
+    if (framelen >= 10) format_mac(&frame[4], rxmac);
+    if (framelen >= 16) format_mac(&frame[10], txmac);
+    if (framelen >= 22) format_mac(&frame[16], bssid);
+
+    std::fprintf(stderr,
+                 "[link-trace] p%d %s %-5s len=%3d chan=%2d fc=%04X seq=%04X rx=%s tx=%s bssid=%s t=%llu",
+                 slot + 1, dir, kind, len, data[9], framectl, seq, rxmac, txmac, bssid,
+                 (unsigned long long)timestamp);
+
+    if (framelen >= 32)
+    {
+        const u64 sync = *(const u64*)&frame[24];
+        const u16 mask = *(const u16*)&frame[26];
+        std::fprintf(stderr, " sync=%016llX mask=%04X",
+                     (unsigned long long)sync, (unsigned)mask);
+    }
+
+    std::fprintf(stderr, "\n");
+}
+
 /* --------------------------------------------------------- local multiplayer */
 
 /* The console powers its wireless hardware on and off as the game enters and
@@ -452,7 +577,8 @@ int MP_SendPacket(u8* data, int len, u64 timestamp, void* userdata)
     if (!bus || slot < 0) return 0;
 
     const int queued = bus->SendPacket(slot, data, len, timestamp);
-    md::note_packet_sent(userdata, queued);
+    md::note_packet_sent_kind(userdata, 0, queued);
+    trace_frame("tx", slot, "bcast", timestamp, data, len);
     return queued;
 }
 
@@ -463,7 +589,12 @@ int MP_RecvPacket(u8* data, u64* timestamp, void* userdata)
     if (!bus || slot < 0) return 0;
 
     const int got = bus->RecvPacket(slot, data, timestamp);
-    md::note_packet_received(userdata, got);
+    md::note_poll(userdata, got > 0);
+    if (got > 0)
+    {
+        md::note_packet_received_kind(userdata, 0, got);
+        trace_frame("rx", slot, "bcast", timestamp ? *timestamp : 0, data, got);
+    }
     return got;
 }
 
@@ -474,7 +605,8 @@ int MP_SendCmd(u8* data, int len, u64 timestamp, void* userdata)
     if (!bus || slot < 0) return 0;
 
     const int queued = bus->SendCmd(slot, data, len, timestamp);
-    md::note_packet_sent(userdata, queued);
+    md::note_packet_sent_kind(userdata, 1, queued);
+    trace_frame("tx", slot, "cmd", timestamp, data, len);
     return queued;
 }
 
@@ -485,7 +617,8 @@ int MP_SendReply(u8* data, int len, u64 timestamp, u16 aid, void* userdata)
     if (!bus || slot < 0) return 0;
 
     const int queued = bus->SendReply(slot, data, len, timestamp, aid);
-    md::note_packet_sent(userdata, queued);
+    md::note_packet_sent_kind(userdata, 2, queued);
+    trace_frame("tx", slot, "reply", timestamp, data, len);
     return queued;
 }
 
@@ -496,7 +629,8 @@ int MP_SendAck(u8* data, int len, u64 timestamp, void* userdata)
     if (!bus || slot < 0) return 0;
 
     const int queued = bus->SendAck(slot, data, len, timestamp);
-    md::note_packet_sent(userdata, queued);
+    md::note_packet_sent_kind(userdata, 3, queued);
+    trace_frame("tx", slot, "ack", timestamp, data, len);
     return queued;
 }
 
@@ -507,7 +641,12 @@ int MP_RecvHostPacket(u8* data, u64* timestamp, void* userdata)
     if (!bus || slot < 0) return 0;
 
     const int got = bus->RecvHostPacket(slot, data, timestamp);
-    md::note_packet_received(userdata, got);
+    md::note_poll(userdata, got > 0);
+    if (got > 0)
+    {
+        md::note_packet_received_kind(userdata, 1, got);
+        trace_frame("rx", slot, "cmd", timestamp ? *timestamp : 0, data, got);
+    }
     return got;
 }
 
@@ -520,8 +659,20 @@ u16 MP_RecvReplies(u8* data, u64 timestamp, u16 aidmask, void* userdata)
     const u16 replied = bus->RecvReplies(slot, data, timestamp, aidmask);
 
     /* Counted as a packet but not as bytes: this one reports which clients
-       replied rather than how much was read, so a byte total would be a guess. */
-    if (replied) md::note_packet_received(userdata, 0);
+       replied rather than how much was read, so a byte total would be a guess.
+       Classed as reply traffic (type 2) in the per-kind split. */
+    md::note_poll(userdata, replied > 0);
+    if (replied)
+    {
+        md::note_packet_received_kind(userdata, 2, 0);
+
+        /* Only the mask is printed: this call reports which clients replied
+           rather than how much was read, so the reply bodies live in the
+           caller's per-AID blocks and are not ours to size. */
+        if (link_trace_enabled())
+            std::fprintf(stderr, "[link-trace] p%d rx replies mask=%04X\n",
+                         slot + 1, (unsigned)replied);
+    }
     return replied;
 }
 
@@ -666,3 +817,12 @@ void* DynamicLibrary_LoadFunction(DynamicLibrary* lib, const char* name)
 
 } // namespace Platform
 } // namespace melonDS
+
+/* ------------------------------------------------------------------ C API */
+
+/* Tag for core log lines emitted by the current thread (see t_log_tag above).
+   extern "C" so the Rust host links it by name like the rest of md_*. */
+void md_tag_current_thread(const char* tag)
+{
+    melonDS::Platform::set_thread_log_tag(tag);
+}

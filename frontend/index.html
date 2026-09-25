@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- ipc / http://ipc.localhost are Tauri v2's IPC transports (webkitgtk / WebView2). -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost" />
+  <title>melonDS Multiplayer</title>
+  <style>
+    /* melonDS Multiplayer shell styles. Dark theme; each player's console is a
+       card showing ONE screen at a time (top by default, big). Kept inline so
+       the page is one self-contained file (see history.md v0.1.5). */
+    :root {
+      color-scheme: dark;
+      --bg: #14161c;
+      --panel: #1d2029;
+      --ink: #e8eaf0;
+      --dim: #8b90a0;
+      --accent: #d40000; /* melon red */
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.7rem 1.1rem;
+      background: var(--panel);
+      border-bottom: 1px solid #2a2e3a;
+      flex-wrap: wrap;
+    }
+    header h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+    header h1::before {
+      content: "";
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      margin-right: 0.6rem;
+      border-radius: 3px;
+      background: var(--accent);
+    }
+    header .status { margin-left: auto; font-size: 0.8rem; color: var(--dim); }
+    header .status.error { color: #ff7a7a; }
+    .toolbar { display: flex; gap: 0.5rem; align-items: center; }
+    .toolbar input[type="text"] {
+      width: 22rem;
+      background: #101218;
+      border: 1px solid #2a2e3a;
+      border-radius: 6px;
+      color: var(--ink);
+      font: 0.78rem ui-monospace, monospace;
+      padding: 0.35rem 0.5rem;
+    }
+    button {
+      background: #2a2e3a;
+      border: 1px solid #3a3f4f;
+      border-radius: 6px;
+      color: var(--ink);
+      font: 0.8rem system-ui, sans-serif;
+      padding: 0.35rem 0.8rem;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #353b4c; }
+    button:disabled { opacity: 0.45; cursor: default; }
+    button.primary { background: var(--accent); border-color: #8f0000; }
+    button.primary:hover:not(:disabled) { background: #ef1111; }
+    select {
+      background: #101218;
+      border: 1px solid #2a2e3a;
+      border-radius: 6px;
+      color: var(--ink);
+      font: 0.8rem system-ui, sans-serif;
+      padding: 0.35rem;
+    }
+    main {
+      flex: 1;
+      display: flex;
+      gap: 1rem;
+      padding: 1rem;
+      align-items: flex-start; /* hug content: flip cards are shorter than stacked ones */
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .console {
+      background: var(--panel);
+      border: 1px solid #2a2e3a;
+      border-radius: 10px;
+      padding: 0.75rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      min-width: 280px;
+      max-width: 360px;
+      flex: 1;
+    }
+    .console h2 {
+      font-size: 0.85rem;
+      margin: 0;
+      color: var(--dim);
+      font-weight: 500;
+      display: flex;
+      justify-content: space-between;
+    }
+    .console h2 .fps { color: var(--ink); font-variant-numeric: tabular-nums; }
+    /* One screen wrapper per card. The bottom canvas is display:none while the
+       top is shown (flip mode) — touch still works on the hidden screen, it
+       just is not painted. */
+    .console .screen-wrap {
+      position: relative;
+      width: 100%;
+      cursor: crosshair; /* the whole card is the pen surface, shown or not */
+    }
+    .console canvas {
+      width: 100%;
+      image-rendering: pixelated;
+      background: #000;
+      border-radius: 4px;
+      aspect-ratio: 4 / 3; /* a DS screen: 256x192 */
+      display: block;
+    }
+    .console canvas.screen-bottom { display: none; }
+    .console.peeking canvas.screen-bottom { display: block; }
+    .console.peeking canvas.screen-top { display: none; }
+    /* Side view (View menu): both screens stacked per card. */
+    body.mode-side .console canvas.screen-bottom { display: block; }
+    body.mode-side .console canvas.screen-top { display: block; }
+    /* Virtual pen cursor: drawn over the visible screen whenever the bottom
+       screen is hidden (there is no real cursor to follow there), plus a pen
+       dot stroked onto the hidden canvas itself when the pen is down. */
+    .console .pen-cursor {
+      position: absolute;
+      width: 16px;
+      height: 16px;
+      /* Nib at 20% from the left, 80% from the top of the image. */
+      background: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><path d='M3 13 L6 5 L11 2 L14 5 L8 11 Z' fill='%23e8eaf0' stroke='%2314161c' stroke-width='1.5' stroke-linejoin='round'/></svg>") no-repeat;
+      background-size: 16px 16px;
+      pointer-events: none;
+      display: none;
+    }
+    .console .pen-cursor.on { display: block; }
+    .console .hint { font-size: 0.72rem; color: var(--dim); line-height: 1.5; }
+    .console .hint b { color: var(--ink); font-weight: 500; }
+    /* The card the keyboard currently drives (digits 1-4 switch it). */
+    .console.active { border-color: var(--accent); }
+    .console.active h2 span:first-child { color: var(--accent); font-weight: 600; }
+    footer {
+      padding: 0.6rem 1.1rem;
+      font-size: 0.75rem;
+      color: var(--dim);
+      border-top: 1px solid #2a2e3a;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>melonDS Multiplayer</h1>
+    <div class="toolbar">
+      <select id="players" title="How many consoles to emulate">
+        <option value="1">1 player</option>
+        <option value="2" selected>2 players</option>
+        <option value="3">3 players</option>
+        <option value="4">4 players</option>
+      </select>
+      <input type="text" id="rom" spellcheck="false"
+             placeholder="path to .nds ROM" />
+      <button id="browse" title="Choose a ROM file">Browse…</button>
+      <button id="start" class="primary">Start</button>
+      <button id="stop" disabled>Stop</button>
+      <button id="selftest" disabled title="Check the link between consoles: a test packet each way when no game has wireless on, otherwise a safe bus resync kick (injecting frames into a live lobby disturbs the game)">Link test</button>
+      <select id="view" title="Screen layout">
+        <option value="flip" selected>View: top (Tab peeks)</option>
+        <option value="side">View: both screens</option>
+      </select>
+    </div>
+    <span class="status" id="status">bridge: not connected</span>
+  </header>
+  <main id="consoles"></main>
+  <footer>
+    Local splitscreen host — one emulated console per player on the native
+    bridge (src/frontend/tauri/melonds_bridge.h), linked over melonDS virtual
+    Wi-Fi. Keys 1-4 switch which console the keyboard drives; hold Shift-Right
+    (or press Tab) to peek at that console's touch screen; the mouse is the
+    pen on it at all times, shown or not.
+  </footer>
+  <script>
+    "use strict";
+    // Tauri injects window.__TAURI__ (withGlobalTauri). Outside the app — e.g.
+    // a plain browser preview of this file — everything degrades to the
+    // placeholder animation instead of crashing.
+    const Tauri = window.__TAURI__ ?? null;
+    const invoke = Tauri ? Tauri.core.invoke : null;
+    const hasDialog = !!(Tauri && Tauri.dialog && Tauri.dialog.open);
+
+    const W = 256, H = 192, PX = W * H, BPS = PX * 4;
+
+    const el = (id) => document.getElementById(id);
+    const statusEl = el("status");
+    const consolesEl = el("consoles");
+
+    let session = null;          // SessionInfo from the backend
+    let canvases = [];           // [{wrap, top, bottom, ctxTop, ctxBottom, imgTop, imgBot, seq, frames, cursor, peeking, pen}]
+    let running = false;
+    let pumping = false;
+    let statusError = false;
+
+    // Which console the keyboard + mouse drive. One set of controls (player
+    // 1's keymap) drives whichever session is selected; Digit1..Digit4 (and
+    // the numpad digits) switch it. Switching releases everything held so a
+    // half-pressed direction never carries across consoles.
+    let active = 0;
+
+    // Layout modes: "flip" = one screen per card, top by default, hold-to-
+    // peek the touch screen (the default; classic splitscreen). "side" =
+    // both screens stacked per card, nothing hidden. The View menu picks it;
+    // Tab is a shortcut: peek-toggle in flip mode, switch in side mode. The
+    // choice persists in localStorage.
+    let layoutMode = "flip";
+    // Tab-as-peek is a toggle (press once to peek, press again to un-peek),
+    // while the dedicated flip key is hold-to-peek. Distinguishing them needs
+    // a flag: when Tab initiated the peek, releasing Tab must not clear it.
+    let peekViaTab = false;
+
+    function setStatus(text, isError = false) {
+      statusEl.textContent = text;
+      statusEl.classList.toggle("error", isError);
+      statusError = isError;
+    }
+
+    // ------------------------------------------------------------------
+    // Console cards
+    // ------------------------------------------------------------------
+
+    const KEY_LABELS = {
+      KeyW: "W", KeyA: "A", KeyS: "S", KeyD: "D",
+      KeyJ: "J", KeyK: "K", KeyU: "U", KeyI: "I", KeyQ: "Q", KeyE: "E",
+      Space: "Space", ShiftLeft: "LShift", ShiftRight: "RShift",
+      ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→",
+      Numpad1: "Num1", Numpad2: "Num2", Numpad3: "Num3", Numpad4: "Num4",
+      Numpad5: "Num5",
+      Numpad0: "Num0", NumpadEnter: "NumEnter", PageUp: "PgUp", PageDown: "PgDn",
+    };
+
+    function buildCards(n) {
+      consolesEl.innerHTML = "";
+      canvases = [];
+      for (let p = 0; p < n; p++) {
+        const card = document.createElement("section");
+        card.className = "console";
+        const title = document.createElement("h2");
+        const name = document.createElement("span");
+        name.textContent = `Player ${p + 1}`;
+        const fps = document.createElement("span");
+        fps.className = "fps";
+        fps.textContent = "—";
+        title.append(name, fps);
+
+        const wrap = document.createElement("div");
+        wrap.className = "screen-wrap";
+        const top = document.createElement("canvas");
+        const bottom = document.createElement("canvas");
+        top.width = W; top.height = H;
+        bottom.width = W; bottom.height = H;
+        top.className = "screen-top";
+        bottom.className = "screen-bottom";
+        // The bottom (touch) screen is always live under the mouse — even
+        // hidden — so the wrapper carries the title, not just the canvas.
+        wrap.title = "touch screen: click / drag to use, shown or not";
+
+        // Virtual pen cursor over the visible screen while the touch screen
+        // is hidden (the real cursor can't show a pen on a screen that isn't
+        // displayed).
+        const cursor = document.createElement("div");
+        cursor.className = "pen-cursor";
+
+        const hint = document.createElement("span");
+        hint.className = "hint";
+        hint.textContent = "no session";
+
+        wrap.append(top, bottom, cursor);
+        card.append(title, wrap, hint);
+        consolesEl.append(card);
+
+        const ctxTop = top.getContext("2d");
+        const ctxBottom = bottom.getContext("2d");
+        canvases.push({
+          card, wrap, top, bottom, ctxTop, ctxBottom, fps, hint, cursor,
+          imgTop: ctxTop.createImageData(W, H),
+          imgBot: ctxBottom.createImageData(W, H),
+          seq: -1n, frames: 0, buttons: 0,
+          peeking: false,          // hold-to-peek state (flip mode)
+          pen: { x: 0, y: 0, down: false }, // logical pen position on the 256x192 pad
+        });
+
+        wireTouch(wrap, p);
+      }
+      applyLayout();
+    }
+
+    // Placeholder bars so the shell is never a dead black page (v0.1.5).
+    let phT = 0;
+    function drawPlaceholder() {
+      phT += 1;
+      canvases.forEach((c, i) => {
+        c.ctxTop.fillStyle = "#000";
+        c.ctxTop.fillRect(0, 0, W, H);
+        c.ctxTop.fillStyle = i % 2 ? "#3d5afe" : "#d40000";
+        const x = (phT * (2 + i * 3)) % (W + 40) - 20;
+        c.ctxTop.fillRect(x, H / 2 - 8, 40, 16);
+        c.ctxTop.fillStyle = "#e8eaf0";
+        c.ctxTop.font = "10px monospace";
+        c.ctxTop.fillText(`${i + 1}: no signal`, 6, 12);
+        c.ctxBottom.clearRect(0, 0, W, H);
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // Frame pump: raw bytes from get_frames → putImageData
+    // ------------------------------------------------------------------
+
+    async function pump() {
+      if (running && session && invoke && !pumping) {
+        pumping = true;
+        try {
+          const buf = await invoke("get_frames");
+          if (buf instanceof ArrayBuffer) consumeFrames(buf);
+          else console.warn("unexpected get_frames payload", buf);
+        } catch (err) {
+          console.error("get_frames failed:", err);
+          setStatus(`frame pump error: ${err}`, true);
+          running = false;
+          syncButtons();
+        }
+        pumping = false;
+      }
+      requestAnimationFrame(pump);
+    }
+
+    function consumeFrames(buf) {
+      const dv = new DataView(buf);
+      const bytes = new Uint8Array(buf);
+      let off = 0;
+      for (let p = 0; p < canvases.length && off + 8 + BPS * 2 <= buf.byteLength; p++) {
+        const c = canvases[p];
+        const seq = dv.getBigUint64(off, true);
+        off += 8;
+        if (seq !== c.seq) {
+          c.seq = seq;
+          c.frames++;
+          c.imgTop.data.set(bytes.subarray(off, off + BPS));
+          off += BPS;
+          const bottomHidden = layoutMode === "flip" && !c.peeking;
+          if (!bottomHidden) {
+            c.imgBot.data.set(bytes.subarray(off, off + BPS));
+            c.ctxBottom.putImageData(c.imgBot, 0, 0);
+            // putImageData wipes the canvas: the pen dot rides on top of the
+            // fresh frame (only needed while the screen is hidden — shown
+            // screens have the real cursor).
+            if (c.pen.down) drawPenDot(c);
+          }
+          off += BPS; // hidden bottom screens skip the copy, not the offset
+          c.ctxTop.putImageData(c.imgTop, 0, 0);
+        } else {
+          off += BPS * 2;
+        }
+      }
+    }
+
+    // Pen dot on the (hidden) bottom canvas: light square + dark core, drawn
+    // over game pixels so it reads on any background.
+    function drawPenDot(c) {
+      const x = c.pen.x, y = c.pen.y;
+      c.ctxBottom.fillStyle = "#ffffff";
+      c.ctxBottom.fillRect(x - 1.5, y - 1.5, 3, 3);
+      c.ctxBottom.fillStyle = "#000000";
+      c.ctxBottom.fillRect(x - 0.5, y - 0.5, 1, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Input: one keyboard, the selected console (digits 1-4 switch it)
+    // ------------------------------------------------------------------
+
+    const held = new Map(); // code -> bitmask contribution (active sessions only)
+
+    function maskFor(player, code) {
+      if (!session) return 0;
+      const km = session.keymaps[player];
+      if (!km) return 0;
+      for (const [c, bit] of km) if (c === code) return bit;
+      return 0;
+    }
+
+    function flipKeyFor(_player) {
+      // Peek always targets the selected console, so one key serves all.
+      return session?.flip_keys?.[0] ?? "ShiftRight";
+    }
+
+    async function sendButtons(p) {
+      const c = canvases[p];
+      if (!c) return;
+      let mask = 0;
+      for (const [code, bit] of held.entries()) {
+        if ((bit >>> 0) && maskFor(p, code)) mask |= bit;
+      }
+      mask &= playerMask(p);
+      c.buttons = mask;
+      try { await invoke("set_input", { input: { player: p, buttons: mask, touch: null } }); }
+      catch (err) { console.error("set_input failed:", err); }
+    }
+
+    function playerMask(p) {
+      if (!session) return 0;
+      return session.keymaps[p].reduce((m, [, bit]) => m | bit, 0);
+    }
+
+    // Which console a digit key selects: Digit1..4 / Numpad1..4 -> 0..3, else -1.
+    function digitIndex(code) {
+      const m = /^(?:Digit|Numpad)([1-4])$/.exec(code);
+      return m ? Number(m[1]) - 1 : -1;
+    }
+
+    function setActive(i) {
+      if (i === active || !canvases[i]) return;
+      // Release everything held on the old console: a direction held while
+      // switching must not stay latched there (the keyup will land on the
+      // new console, which never had it down).
+      held.clear();
+      sendButtons(active);
+      active = i;
+      for (let p = 0; p < canvases.length; p++) {
+        canvases[p].card.classList.toggle("active", p === active);
+      }
+      applyLayout();
+    }
+
+    // Peek targets the selected console. HOLD the flip key to peek, RELEASE
+    // to snap back; Tab toggles the same state. The release must clear even
+    // in side mode (where the press was a no-op) or a peek held across a
+    // view switch sticks forever - except when Tab initiated it: Tab is a
+    // toggle, so its own keyup must not undo what it did.
+    function updatePeek(code, down) {
+      if (code !== flipKeyFor(active) && code !== "Tab") return;
+      const c = canvases[active];
+      if (!c) return;
+      if (code === "Tab") {
+        if (down) {
+          if (layoutMode === "side") {
+            setLayoutMode("flip");
+            peekViaTab = false;
+          } else {
+            peekViaTab = !c.peeking;
+            c.peeking = peekViaTab;
+            applyLayout();
+          }
+        }
+        return;
+      }
+      const next = down && layoutMode === "flip";
+      if (c.peeking !== next) {
+        c.peeking = next;
+        if (!next) peekViaTab = false;
+        applyLayout();
+      }
+    }
+
+    window.addEventListener("keydown", (e) => {
+      if (e.repeat) return;
+      const digit = digitIndex(e.code);
+      if (digit >= 0 && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) {
+        setActive(digit);
+        return; // digits are selector keys, not game buttons
+      }
+      if (e.code === "Tab" && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) {
+        e.preventDefault();
+        updatePeek("Tab", true);
+        return;
+      }
+      const bit = maskFor(active, e.code);
+      if (bit) {
+        held.set(e.code, bit);
+        sendButtons(active);
+        e.preventDefault();
+        return;
+      }
+      updatePeek(e.code, true);
+    });
+
+    window.addEventListener("keyup", (e) => {
+      // Delete BEFORE sending: the reverse order left a direction latched ON
+      // after every tap (the d-pad kept walking - v0.1.8b regression).
+      const wasHeld = held.delete(e.code);
+      const bit = maskFor(active, e.code);
+      if (bit) {
+        sendButtons(active);
+        e.preventDefault();
+      } else if (wasHeld) {
+        sendButtons(active);
+      }
+      updatePeek(e.code, false);
+    });
+
+    // Focus lost mid-hold would leave buttons stuck and cards peeking forever.
+    window.addEventListener("blur", () => {
+      held.clear();
+      if (canvases[active]) {
+        canvases[active].peeking = false;
+        sendButtons(active);
+      }
+      peekViaTab = false;
+      applyLayout();
+    });
+
+    // Touch: the mouse is the pen on the SELECTED console's bottom screen at
+    // all times, shown or hidden — DS games navigate by touch gestures, so
+    // visibility (a display choice) must never gate touch.
+    //
+    // Coordinate mapping is per-VISIBLE-canvas, not per-card: in side view
+    // the card is two screens tall and mapping against the card squashed the
+    // bottom screen's coordinates into the top half (the "clicks land in the
+    // wrong place" bug). In flip view the one visible screen IS the bottom
+    // surface, so hidden-screen clicks map straight off it too.
+    function wireTouch(wrap, p) {
+      const c = () => canvases[p];
+      // The canvas the pen should act on right now: the bottom screen when
+      // visible, else whichever screen is displayed (flip mode shows one
+      // screen at a time and both stand in for the hidden pad).
+      const penCanvas = () => {
+        const cv = c();
+        if (layoutMode === "side") return cv.bottom;
+        return cv.peeking ? cv.bottom : cv.top;
+      };
+      const toDs = (e) => {
+        const r = penCanvas().getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) return null;
+        return [
+          Math.max(0, Math.min(W - 1, Math.round((e.clientX - r.left) / r.width * W))),
+          Math.max(0, Math.min(H - 1, Math.round((e.clientY - r.top) / r.height * H))),
+        ];
+      };
+      const send = async (touch) => {
+        const cv = c();
+        try {
+          await invoke("set_input", { input: { player: p, buttons: cv.buttons, touch } });
+        } catch (err) { console.error("set_input(touch) failed:", err); }
+      };
+      const setPen = (x, y, down) => {
+        const cv = c();
+        cv.pen.x = x; cv.pen.y = y; cv.pen.down = down;
+        const hidden = layoutMode === "flip" && !cv.peeking;
+        if (hidden) {
+          // Aim aid over the visible screen; the pen dot lands on the hidden
+          // canvas in consumeFrames' next repaint (real cursor when shown).
+          cv.cursor.style.left = `${(x / W) * 100}%`;
+          cv.cursor.style.top = `${(y / H) * 100}%`;
+          cv.cursor.classList.add("on");
+          if (down) drawPenDot(cv);
+        } else {
+          cv.cursor.classList.remove("on");
+        }
+      };
+      const clearPen = () => {
+        const cv = c();
+        cv.pen.down = false;
+        cv.cursor.classList.remove("on");
+        if (layoutMode === "flip" && !cv.peeking) {
+          cv.ctxBottom.clearRect(0, 0, W, H);
+        }
+      };
+      wrap.addEventListener("pointerdown", (e) => {
+        if (p !== active) return; // pen belongs to the selected console
+        if (layoutMode === "side" && e.target === c().top) return;
+        e.preventDefault();
+        try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
+        const xy = toDs(e);
+        if (!xy) return;
+        setPen(xy[0], xy[1], true);
+        send(xy);
+      });
+      wrap.addEventListener("pointermove", (e) => {
+        if (p !== active) return;
+        if (layoutMode === "side" && e.target === c().top && !c().pen.down) return;
+        const xy = toDs(e);
+        if (!xy) return;
+        // Hovering moves the cursor/pen position too; only a pressed pointer
+        // reaches the emulated touch screen as pen-down.
+        const down = c().pen.down || (e.buttons & 1) !== 0;
+        setPen(xy[0], xy[1], down);
+        if (down) send(xy);
+      });
+      const up = (e) => {
+        if (p !== active) return;
+        if (e) { try { wrap.releasePointerCapture(e.pointerId); } catch (_) {} }
+        clearPen();
+        send(null);
+      };
+      wrap.addEventListener("pointerup", up);
+      wrap.addEventListener("pointercancel", up);
+      wrap.addEventListener("lostpointercapture", up);
+    }
+
+    // ------------------------------------------------------------------
+    // Layout: flip (top + hold-to-peek) vs side (both screens)
+    // ------------------------------------------------------------------
+
+    function setLayoutMode(mode) {
+      if (layoutMode === mode) return;
+      layoutMode = mode;
+      try { localStorage.setItem("layoutMode", mode); } catch (_) {}
+      el("view").value = mode;
+      // A peek only exists in flip mode; leaving flip clears it.
+      if (mode === "side") {
+        peekViaTab = false;
+        for (const c of canvases) c.peeking = false;
+      }
+      applyLayout();
+    }
+
+    function applyLayout() {
+      document.body.classList.toggle("mode-side", layoutMode === "side");
+      el("view").value = layoutMode;
+      for (let p = 0; p < canvases.length; p++) {
+        const c = canvases[p];
+        const peek = layoutMode === "flip" && c.peeking;
+        c.card.classList.toggle("peeking", peek);
+        c.card.classList.toggle("active", p === active);
+        // First reveal repaints immediately so the screen is never stale-black.
+        if (layoutMode === "side" && c.seq >= 0n) {
+          c.ctxBottom.putImageData(c.imgBot, 0, 0);
+        }
+        // Pen cursor only makes sense over the visible screen while the touch
+        // screen is hidden; shown screens have the real cursor.
+        const hidden = layoutMode === "flip" && !c.peeking;
+        c.cursor.classList.toggle("on", hidden && c.pen.down);
+        if (hidden && c.pen.down) {
+          c.cursor.style.left = `${(c.pen.x / W) * 100}%`;
+          c.cursor.style.top = `${(c.pen.y / H) * 100}%`;
+        }
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Session lifecycle + status
+    // ------------------------------------------------------------------
+
+    function syncButtons() {
+      el("start").disabled = running;
+      el("stop").disabled = !running;
+      el("selftest").disabled = !running || !session || session.players < 2;
+      el("players").disabled = running;
+      el("rom").disabled = running;
+      el("browse").disabled = running || !hasDialog;
+    }
+
+    async function start() {
+      if (!invoke) { setStatus("not running inside the Tauri app", true); return; }
+      const romPath = el("rom").value.trim();
+      if (!romPath) { setStatus("choose a ROM first", true); return; }
+      setStatus("starting consoles…");
+      try {
+        session = await invoke("start_session", {
+          players: Number(el("players").value),
+          romPath,
+        });
+        buildCards(session.players);
+        applyKeymapHints();
+        running = true;
+        active = 0;
+        applyLayout();
+        syncButtons();
+        setStatus(`running: ${session.title || session.rom.split("/").pop()} · ${session.players} player(s) · keys drive console 1 (1-4 to switch) · JIT ${session.jit ? "on" : "off"}`);
+        pollStatus();
+      } catch (err) {
+        setStatus(String(err), true);
+      }
+    }
+
+    async function stop() {
+      if (!invoke) return;
+      try { await invoke("stop_session"); } catch (err) { console.error(err); }
+      session = null;
+      running = false;
+      held.clear();
+      buildCards(2);
+      drawPlaceholder();
+      syncButtons();
+      setStatus("session stopped");
+    }
+
+    function applyKeymapHints() {
+      if (!session) return;
+      // One keyboard, one keymap: every card shows the same controls plus
+      // its own selector digit.
+      session.keymaps.forEach((km, p) => {
+        const c = canvases[p];
+        if (!c) return;
+        if (p === 0) {
+          const groups = [];
+          for (const [code, bit] of km) {
+            const label = KEY_LABELS[code] ?? code;
+            const name =
+              bit === (1 << 4) || bit === (1 << 5) || bit === (1 << 6) || bit === (1 << 7) ? "dpad" :
+              bit === (1 << 0) ? "A" : bit === (1 << 1) ? "B" :
+              bit === (1 << 10) ? "X" : bit === (1 << 11) ? "Y" :
+              bit === (1 << 8) ? "L" : bit === (1 << 9) ? "R" :
+              bit === (1 << 3) ? "Start" : "Select";
+            const g = groups.find((x) => x.name === name);
+            if (g) g.keys.push(label); else groups.push({ name, keys: [label] });
+          }
+          const peekLabel = KEY_LABELS[flipKeyFor(0)] ?? flipKeyFor(0) ?? "—";
+          const controls = groups.map((g) => `<b>${g.name}</b> ${g.keys.join(" ")}`).join(" · ");
+          session._controlsHint = controls;
+        }
+        c.hint.innerHTML =
+          `<b>keys 1-${session.players}</b> switch console · ` +
+          (session._controlsHint ?? "") +
+          ` · mouse = touch · <b>peek</b> (hold) / Tab`;
+      });
+    }
+
+    let fpsTimer = 0;
+    async function pollStatus() {
+      if (!running || !invoke) return;
+      try {
+        const st = await invoke("link_status");
+        const up = st.active ? `link up ${st.upSeconds}s` : "link down";
+        const connected = st.active ? `slots 0b${st.connectedSlots.toString(2).padStart(session.players, "0")}` : "";
+        // The always-on link check reports itself here: how many 10s windows
+        // were proven good by real traffic crossing the bus, how many consoles
+        // had to be resynced, and how long ago the last good window was.
+        const mon = st.monitor;
+        const linkCheck = mon
+          ? ` · link check ok ${mon.verifiedWindows}` +
+            (mon.resyncs ? ` · resyncs ${mon.resyncs}` : "") +
+            ` (last ${mon.lastOkMsAgo < 0 ? "never" : Math.round(mon.lastOkMsAgo / 1000) + "s ago"})`
+          : "";
+        // A console that stopped dissolves the lockstep: say so loudly instead
+        // of leaving the window showing a frozen last frame.
+        if (st.active && st.consolesRunning < (session?.players ?? 1)) {
+          setStatus(
+            `console stopped (${st.consolesRunning}/${session.players} still running) — the emulation is frozen; press Stop then Start to restart`,
+            true,
+          );
+          canvases.forEach((c) => (c.hint.style.color = "#ff6b6b"));
+        } else if (!statusError) {
+          setStatus(`${running ? "running" : "idle"} · ${up} · ${connected}${linkCheck}`);
+        }
+        canvases.forEach((c, i) => {
+          const p = st.players?.[i];
+          if (!p) return;
+          const now = performance.now();
+          const dt = (now - (c.fpsTimer ?? now)) / 1000;
+          const fps = dt > 0.5 ? Math.round(c.frames / dt) : null;
+          if (fps !== null) { c.fps.textContent = `${fps} fps`; c.frames = 0; c.fpsTimer = now; }
+          c.hint.title = `frames ${p.frames} · sent ${p.packetsSent} · recv ${p.packetsReceived}`;
+        });
+      } catch (err) {
+        console.error("link_status failed:", err);
+      }
+      setTimeout(pollStatus, 1000);
+    }
+
+    // ------------------------------------------------------------------
+    // Toolbar wiring
+    // ------------------------------------------------------------------
+
+    el("start").addEventListener("click", start);
+    el("stop").addEventListener("click", stop);
+    el("selftest").addEventListener("click", async () => {
+      try {
+        const res = await invoke("link_selftest");
+        // Two shapes come back. While a game has its wireless on the backend
+        // deliberately does NOT inject: it kicks each console's bus state
+        // instead, which is the part that unsticks a hung lobby without
+        // dropping foreign frames into the game's receive stream.
+        if (res.mode === "resync") {
+          const detail = res.results
+            .map((r) => `p${r.player} ${r.resynced ? "resynced" : "no answer"}`)
+            .join(", ");
+          const busy = res.results.some((r) => r.wirelessOn);
+          setStatus(`link resync (${detail})${busy ? " - inject skipped, a game has its wireless on" : ""}`, false);
+          return;
+        }
+        const ok = res.results.every((r) => r.sent && r.received && r.payloadOk);
+        const detail = res.results.map((r) => `${r.from}→${r.to} ${r.received ? (r.payloadOk ? "ok" : "corrupt") : "no reply"}`).join(", ");
+        setStatus(`link selftest ${ok ? "PASSED" : "FAILED"} (${detail})`, !ok);
+      } catch (err) {
+        setStatus(`link selftest error: ${err}`, true);
+      }
+    });
+    el("view").addEventListener("change", () => setLayoutMode(el("view").value));
+    el("browse").addEventListener("click", async () => {
+      if (!hasDialog) return;
+      const path = await Tauri.dialog.open({
+        multiple: false,
+        filters: [{ name: "Nintendo DS ROM", extensions: ["nds", "dsi", "ids", "srl", "bin"] }],
+      });
+      if (typeof path === "string" && path) el("rom").value = path;
+    });
+
+    // ------------------------------------------------------------------
+    // Boot
+    // ------------------------------------------------------------------
+
+    // Placeholder canvases exist before any session so the window is never blank.
+    buildCards(2);
+    drawPlaceholder();
+    requestAnimationFrame(function loop() {
+      if (!running) drawPlaceholder();
+      requestAnimationFrame(loop);
+    });
+
+    if (!invoke) {
+      setStatus("browser preview — start the desktop app to emulate");
+    } else {
+      setStatus("ready — pick a ROM and press Start");
+      // Layout default: the user's persisted choice, else MD_SHOW_BOTTOM (which
+      // selects the side view for a first run), else flip. Old "side-by-side"
+      // values migrate to "side".
+      let saved = null;
+      try { saved = localStorage.getItem("layoutMode"); } catch (_) {}
+      if (saved === "side-by-side") saved = "side";
+      if (saved !== "flip" && saved !== "side") {
+        let legacy = null;
+        try { legacy = localStorage.getItem("showBottom"); } catch (_) {}
+        if (legacy === "1") saved = "side";
+      }
+      invoke("ui_config").then((cfg) => {
+        if (saved !== "flip" && saved !== "side") {
+          setLayoutMode(cfg && cfg.showBottom ? "side" : "flip");
+        }
+      });
+      if (saved === "flip" || saved === "side") setLayoutMode(saved);
+      // Adopt an already-running session (e.g. MD_AUTOSTART_* started one
+      // before this page loaded) instead of starting a second one - calling
+      // start_session here would tear down and reboot the emulators.
+      invoke("session_info").then((info) => {
+        if (!info) return;
+        session = info;
+        el("rom").value = info.rom;
+        el("players").value = String(info.players);
+        buildCards(session.players);
+        applyKeymapHints();
+        running = true;
+        active = 0;
+        applyLayout();
+        syncButtons();
+        setStatus(`running: ${session.title || session.rom.split("/").pop()} · ${session.players} player(s) · keys drive console 1 (1-4 to switch) · JIT ${session.jit ? "on" : "off"}`);
+        pollStatus();
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // Host-side visibility: tell the backend the window is alive, and push any
+    // UI error into the host log so it sits next to the emulation logs. Without
+    // this, a window that dies silently leaves no trace anywhere.
+    // ------------------------------------------------------------------
+    let beat = 0;
+    function report(level, message) {
+      try {
+        if (invoke) invoke("frontend_log", { level, message: String(message) });
+      } catch (_) {}
+    }
+    window.addEventListener("error", (e) => {
+      const where = `${e.filename ?? "?"}:${e.lineno ?? 0}`;
+      report("error", `uncaught ${e.message} @ ${where}`);
+      setStatus(`ui error: ${e.message} (${where})`, true);
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      const reason = e.reason && e.reason.message ? e.reason.message : String(e.reason);
+      report("error", `unhandled rejection: ${reason}`);
+    });
+    if (invoke) {
+      setInterval(() => {
+        beat += 1;
+        invoke("ui_heartbeat", { seq: beat }).catch(() => {});
+      }, 5000);
+    }
+
+    pump();
+  </script>
+</body>
+</html>

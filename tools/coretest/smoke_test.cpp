@@ -362,6 +362,39 @@ int main(int argc, char** argv)
     check(held_xy.keys == (MD_BTN_X | MD_BTN_Y),
           "X and Y reach the ARM9 through the ARM7's keypad mailbox");
 
+    /* ---- touch screen ---------------------------------------------------- */
+    /* The pen is the same kind of problem as X/Y: the guest cannot see "a touch
+       at (x,y)". All it ever reads is two ADC conversions and a pen-down key
+       bit, so read those back and check they say what we asked for. melonDS
+       converts screen pixels to ADC by shifting left 4 (see
+       TSC::SetTouchCoords), and forces the firmware calibration to identity on
+       reset, so the round trip should be exact. */
+    MDTouchProbe pen {};
+    const int px = 128, py = 135;
+    check(md_touch_probe(a, 1, px, py, &pen) == 0, "touch probe runs");
+
+    std::printf("       pen at (%d,%d): pen_down=%u adc=(%u,%u) expected=(%u,%u)\n",
+                px, py, pen.pen_down, pen.adc_x, pen.adc_y,
+                (unsigned)(px * 16), (unsigned)(py * 16));
+
+    check(pen.pen_down == 1, "the guest's key register reports the pen down");
+    check(pen.adc_x == (uint32_t)(px * 16) && pen.adc_y == (uint32_t)(py * 16),
+          "the guest reads back the touched pixel (ADC = pixel x 16)");
+
+    MDTouchProbe lifted {};
+    check(md_touch_probe(a, 0, 0, 0, &lifted) == 0, "touch release probe runs");
+    check(lifted.pen_down == 0, "releasing the pen clears the pen-down bit");
+
+    /* Touch must be per-instance for the same reason buttons are. */
+    MDTouchProbe other {};
+    check(md_touch_probe(b, 1, 10, 20, &other) == 0, "second instance touch probe runs");
+    check(other.pen_down == 1 && other.adc_x == 10 * 16 && other.adc_y == 20 * 16,
+          "a touch lands on the instance it was sent to");
+    check(md_touch_probe(a, 1, px, py, &pen) == 0 && pen.adc_x == (uint32_t)(px * 16),
+          "the first instance's own pen is unaffected by the second's");
+    md_touch_probe(a, 0, 0, 0, &lifted);
+    md_touch_probe(b, 0, 0, 0, &other);
+
     /* ---- savestates ----------------------------------------------------- */
     const size_t state_size = md_max_state_size();
     std::vector<uint8_t> state(state_size, 0);

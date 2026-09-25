@@ -34,6 +34,13 @@
                                  (default 0: poll; see the note below)
         --reply-timeout MS       how long the host waits to collect clients'
                                  replies (default 2ms; see the note below)
+        --no-jit                 run the ARM interpreter instead (the JIT is on
+                                 by default; a title that misbehaves under it can
+                                 be checked without a rebuild)
+        --pc-every N             print both cores' program counters every N
+                                 frames; a game that has stopped responding is
+                                 usually a core spinning in one place, and which
+                                 core it is says where to look
         --quiet                  only the summary
 
     With more than one console every instance gets its own thread and the
@@ -90,6 +97,23 @@
 namespace
 {
 
+/* The app charges a frame's reply waits to that frame's own budget
+   (MPInterface::SetReplyBudget): a wait is wall-clock time spent inside an
+   emulated frame, and an unbounded one took a real MKDS join to 9fps. This
+   harness has no pace timer to take that slack from - it runs as fast as the
+   machine allows - so it publishes the app's default, two DS frames at DS
+   speed (33ms), and can be overridden to anything: MD_REPLY_BUDGET_NS=-1
+   restores the unbounded behaviour this replaced. */
+int64_t reply_budget_ns()
+{
+    static const int64_t budget = []() {
+        const char* v = std::getenv("MD_REPLY_BUDGET_NS");
+        if (v && *v) return (int64_t)strtoll(v, nullptr, 10);
+        return (int64_t)(2 * 1000000000LL * 889 / 53150);
+    }();
+    return budget;
+}
+
 const std::map<std::string, uint32_t> BUTTONS = {
     { "A", MD_BTN_A }, { "B", MD_BTN_B }, { "X", MD_BTN_X }, { "Y", MD_BTN_Y },
     { "L", MD_BTN_L }, { "R", MD_BTN_R },
@@ -134,20 +158,22 @@ using PlayerMask = uint32_t;
 struct Tap
 {
     int first_frame;
-    int last_frame;    /* exclusive */
+    int last_frame;    /* exclusive; 0 means "runs to the end" */
     uint32_t buttons;
     PlayerMask players;
     int period = 0;    /* 0 = one-shot */
+    bool hold = false;
 };
 
 struct Touch
 {
     int first_frame;
-    int last_frame;    /* exclusive */
+    int last_frame;    /* exclusive; 0 means "runs to the end" */
     int x;
     int y;
     PlayerMask players;
     int period = 0;    /* 0 = one-shot */
+    bool hold = false;
 };
 
 /* Sense-reversing barrier: every participant must arrive before any of them
@@ -192,13 +218,16 @@ std::string split_players(const std::string& value, std::string& out)
     return value.substr(0, at);
 }
 
-/* Parses "1,2" (1-based) into a bitmask. An empty selector means "the default
-   set", which is player 1, or every console under --all-players. */
-bool parse_players(const std::string& text, bool every_player, PlayerMask& out)
+/* Parses "1,2" (1-based) into a bitmask. An empty selector is left as 0 and
+   resolved after every argument has been read, because the default depends on
+   --all-players and the flag may appear anywhere on the command line. Resolving
+   it here instead made the meaning of an input depend on argument ORDER: a
+   "--touch F:X:Y --all-players" run quietly drove player 1 only. */
+bool parse_players(const std::string& text, PlayerMask& out)
 {
     if (text.empty())
     {
-        out = every_player ? 0xFFFFFFFFu : 1u;
+        out = 0;
         return true;
     }
 
@@ -235,6 +264,8 @@ struct Options
     bool every_player = false;
     bool quiet = false;
     bool serial = false;
+    bool no_jit = false;
+    int pc_every = 0;
     int recv_timeout = 0;
     int reply_timeout = 2;
     std::vector<Tap> taps;
@@ -310,11 +341,11 @@ int main(int argc, char** argv)
             if (colon == std::string::npos) { std::printf("malformed %s\n", arg.c_str()); return 1; }
 
             Tap tap;
-            if (!parse_players(players_text, opt.every_player, tap.players)) return 1;
+            if (!parse_players(players_text, tap.players)) return 1;
             if (!parse_int(body.substr(0, colon), tap.first_frame)) return 1;
             tap.buttons = parse_buttons(body.substr(colon + 1), ok);
             if (!ok) return 1;
-            tap.last_frame = (arg == "--hold") ? opt.frames + 1 : tap.first_frame + 6;
+            tap.last_frame = tap.first_frame + 6;
             opt.taps.push_back(tap);
         }
         else if (arg == "--autotap")
@@ -331,13 +362,13 @@ int main(int argc, char** argv)
             }
 
             Tap tap;
-            if (!parse_players(players_text, opt.every_player, tap.players)) return 1;
+            if (!parse_players(players_text, tap.players)) return 1;
             tap.buttons = parse_buttons(body.substr(0, c1), ok);
             if (!ok) return 1;
             if (!parse_int(body.substr(c1 + 1, c2 - c1 - 1), tap.first_frame)) return 1;
             if (!parse_int(body.substr(c2 + 1), tap.period)) return 1;
 
-            tap.last_frame = opt.frames + 1;
+            tap.hold = true;
             opt.taps.push_back(tap);
         }
         else if (arg == "--touch" || arg == "--holdtouch")
@@ -347,9 +378,10 @@ int main(int argc, char** argv)
             /* FRAME:X:Y */
             Touch touch;
             if (!parse_coords(body, touch.first_frame, touch.x, touch.y)) return 1;
-            if (!parse_players(players_text, opt.every_player, touch.players)) return 1;
+            if (!parse_players(players_text, touch.players)) return 1;
 
-            touch.last_frame = (arg == "--holdtouch") ? opt.frames + 1 : touch.first_frame + 6;
+            if (arg == "--holdtouch") touch.hold = true;
+            else                      touch.last_frame = touch.first_frame + 6;
             opt.touches.push_back(touch);
         }
         else if (arg == "--touchtap")
@@ -371,11 +403,13 @@ int main(int argc, char** argv)
                 !parse_int(body.substr(c1 + 1, c2 - c1 - 1), touch.y) ||
                 !parse_int(body.substr(c2 + 1, c3 - c2 - 1), touch.first_frame) ||
                 !parse_int(body.substr(c3 + 1), touch.period)) return 1;
-            if (!parse_players(players_text, opt.every_player, touch.players)) return 1;
+            if (!parse_players(players_text, touch.players)) return 1;
 
             touch.last_frame = opt.frames + 1;
             opt.touches.push_back(touch);
         }
+        else if (arg == "--no-jit") opt.no_jit = true;
+        else if (arg == "--pc-every") { if (!next(value) || !parse_int(value, opt.pc_every)) return 1; }
         else { std::printf("unknown option %s\n", arg.c_str()); usage(); return 1; }
     }
 
@@ -383,6 +417,21 @@ int main(int argc, char** argv)
     {
         std::printf("players must be 1..%d\n", MD_MAX_INSTANCES);
         return 1;
+    }
+
+    /* Now that every argument has been read, resolve the inputs that named no
+       console: player 1, or every console under --all-players whatever order
+       the flag appeared in. */
+    const PlayerMask default_players = opt.every_player ? 0xFFFFFFFFu : 1u;
+    for (Tap& tap : opt.taps)
+    {
+        if (!tap.players) tap.players = default_players;
+        if (tap.hold) tap.last_frame = opt.frames + 1;
+    }
+    for (Touch& touch : opt.touches)
+    {
+        if (!touch.players) touch.players = default_players;
+        if (touch.hold) touch.last_frame = opt.frames + 1;
     }
 
     const bool threaded = (opt.players > 1) && !opt.serial;
@@ -394,6 +443,8 @@ int main(int argc, char** argv)
     std::printf("threads : %s\n",
                 opt.players == 1 ? "1 (single console)"
                                  : (threaded ? "one per console" : "SERIAL (link will crawl)"));
+    std::printf("jit     : %s\n",
+                opt.no_jit ? "disabled (interpreter)" : "enabled");
     std::printf("link    : %dms receive timeout, %dms host reply timeout\n\n",
                 opt.recv_timeout, opt.reply_timeout);
 
@@ -418,6 +469,7 @@ int main(int argc, char** argv)
             return 1;
         }
         md_link_attach(players[i], i);
+        if (opt.no_jit) md_set_jit(players[i], 0);
     }
 
     /* Every console runs the same game. Whether it needs a BIOS is a question
@@ -550,10 +602,12 @@ int main(int argc, char** argv)
         {
             workers.emplace_back([&, p]
             {
+                md_tag_current_thread((std::string("p") + std::to_string(p + 1)).c_str());
                 for (int frame = 0; frame < opt.frames; frame++)
                 {
                     start_line.wait();
                     apply_input(frame, p);
+                    md_link_set_reply_budget(players[p], reply_budget_ns());
                     md_run_frame(players[p]);
                     finish_line.wait();
                 }
@@ -561,12 +615,14 @@ int main(int argc, char** argv)
         }
     }
 
+    md_tag_current_thread("p1");
     for (int frame = 0; frame < opt.frames; frame++)
     {
         if (threaded)
         {
             start_line.wait();
             apply_input(frame, 0);
+            md_link_set_reply_budget(players[0], reply_budget_ns());
             md_run_frame(players[0]);
             finish_line.wait();
         }
@@ -575,6 +631,7 @@ int main(int argc, char** argv)
             for (int p = 0; p < opt.players; p++)
             {
                 apply_input(frame, p);
+                md_link_set_reply_budget(players[p], reply_budget_ns());
                 md_run_frame(players[p]);
             }
         }
@@ -584,6 +641,18 @@ int main(int argc, char** argv)
         {
             note_progress(p);
             take_shot(frame, p);
+        }
+
+        /* A core that has stopped responding shows up as a PC that does not
+           move. Printing both cores is what distinguishes "the game is waiting
+           for input" from "the game is waiting for the ARM7". */
+        if (opt.pc_every > 0 && (frame % opt.pc_every) == 0)
+        {
+            std::printf("pc    frame=%6d", frame);
+            for (int p = 0; p < opt.players; p++)
+                std::printf("  p%d arm9=%#010x arm7=%#010x", p + 1,
+                            md_get_pc(players[p], 9), md_get_pc(players[p], 7));
+            std::printf("\n");
         }
     }
 

@@ -39,9 +39,16 @@ void notify_mp_end(void* userdata);
 
 /* Called on every wireless frame the emulated console sends and accepts, so the
    host can report whether a link is actually carrying traffic. Note that a send
-   with no listener still counts: the console transmitted regardless. */
+   with no listener still counts: the console transmitted regardless. The _kind
+   variants split the counters by LocalMP packet type (0=broadcast MP frame,
+   1=host cmd, 2=client reply, 3=ack) so stalls can be pinned to a layer.
+   note_poll counts receive *attempts*, including ones that returned nothing -
+   Wifi::CheckRX polls far more often than packets arrive. */
 void note_packet_sent(void* userdata, int len);
+void note_packet_sent_kind(void* userdata, int kind, int len);
 void note_packet_received(void* userdata, int len);
+void note_packet_received_kind(void* userdata, int kind, int len);
+void note_poll(void* userdata, bool got_packet);
 
 /* Shared link bus. Both return nullptr while linking is disabled. */
 melonDS::LocalMP* link_bus();
