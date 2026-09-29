@@ -69,6 +69,27 @@ public:
     int RecvHostPacket(int inst, u8* data, u64* timestamp);
     u16 RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask);
 
+    /* ---- reply-queue flight recorder (see Wifi::MPDiag for the other half) ----
+
+       The host's side of the conversation, per instance: how many answers the
+       guest actually handed to the bus, how many the host read back, and - this
+       is the part that has cost live runs - how many were thrown away and by
+       which mechanism. "The client answered every round" and "the host's game
+       was told the client failed" are both true at once when answers are being
+       discarded; these counters say so in one line. */
+    struct MPReplyDiag
+    {
+        u64 replies_written;   // answers written by this console's own game
+        u64 collected;         // answers read back with a payload
+        u64 collected_blank;   // zero length credits (a reply the host cannot use)
+        u64 windows_empty;     // collection attempts that came back with nothing
+        u64 stale_dropped;     // answers skipped for being older than the window
+        u64 reanchor_dropped;  // unread answers discarded when a command re-anchored
+        u64 not_looking;       // windows that never looked: no peer on the bus
+    };
+
+    void GetReplyDiag(int inst, MPReplyDiag* out) const noexcept;
+
 private:
     void FIFORead(int inst, int fifo, void* buf, int len) noexcept;
     void FIFOWrite(int inst, int fifo, void* buf, int len) noexcept;
@@ -77,6 +98,7 @@ private:
 
     Platform::Mutex* MPQueueLock;
     MPStatusData MPStatus {};
+    MPReplyDiag ReplyDiag[16] {};
     u8 MPPacketQueue[kPacketQueueSize] {};
     u8 MPReplyQueue[kReplyQueueSize] {};
     u32 PacketReadOffset[16] {};

@@ -27,6 +27,11 @@
         --holdtouch FRAME:X:Y[@P]  press and keep pressing from FRAME onwards
         --touchtap X:Y:START:PERIOD[@P]
                                  press X,Y repeatedly, starting at START
+        --stop-input FRAME       end every input scheduled to begin at or
+                                 before FRAME at FRAME. The menu route that
+                                 walks a game into multiplayer is a repeating
+                                 tap, and a repeating tap never stops; this is
+                                 how one run gets "the route, then nothing"
         --all-players            apply input to every console, not just 1
         --serial                 run the consoles one after another instead of
                                  one thread each (see the note below)
@@ -250,8 +255,13 @@ bool parse_players(const std::string& text, PlayerMask& out)
 bool asserted(const int frame, const int first, const int last, const int period)
 {
     if (frame < first) return false;
+    /* One rule for both kinds of input. A repeating input's last_frame is the
+       session end, so this changes nothing for it - but it is what --stop-input
+       needs to be able to end a repeating tap. (Used to be checked only on the
+       non-repeating branch, which made a periodic input unstoppable.) */
+    if (frame >= last) return false;
     if (period > 0) return ((frame - first) % period) < 6;
-    return frame < last;
+    return true;
 }
 
 struct Options
@@ -268,6 +278,7 @@ struct Options
     int pc_every = 0;
     int recv_timeout = 0;
     int reply_timeout = 2;
+    int stop_input = -1;   /* <0 = off; see --stop-input */
     std::vector<Tap> taps;
     std::vector<Touch> touches;
 };
@@ -408,6 +419,7 @@ int main(int argc, char** argv)
             touch.last_frame = opt.frames + 1;
             opt.touches.push_back(touch);
         }
+        else if (arg == "--stop-input") { if (!next(value) || !parse_int(value, opt.stop_input)) return 1; }
         else if (arg == "--no-jit") opt.no_jit = true;
         else if (arg == "--pc-every") { if (!next(value) || !parse_int(value, opt.pc_every)) return 1; }
         else { std::printf("unknown option %s\n", arg.c_str()); usage(); return 1; }
@@ -434,6 +446,19 @@ int main(int argc, char** argv)
         if (touch.hold) touch.last_frame = opt.frames + 1;
     }
 
+    /* --stop-input: an input that was running when the cutoff arrives stops
+       there. One that begins after it is not touched, so a run can end its
+       menu route and then inject the input it is actually measuring. */
+    if (opt.stop_input >= 0)
+    {
+        for (Tap& tap : opt.taps)
+            if ((tap.first_frame <= opt.stop_input) && (tap.last_frame > opt.stop_input))
+                tap.last_frame = opt.stop_input;
+        for (Touch& touch : opt.touches)
+            if ((touch.first_frame <= opt.stop_input) && (touch.last_frame > opt.stop_input))
+                touch.last_frame = opt.stop_input;
+    }
+
     const bool threaded = (opt.players > 1) && !opt.serial;
 
     std::printf("melonDS Multiplayer - real game session\n");
@@ -445,8 +470,11 @@ int main(int argc, char** argv)
                                  : (threaded ? "one per console" : "SERIAL (link will crawl)"));
     std::printf("jit     : %s\n",
                 opt.no_jit ? "disabled (interpreter)" : "enabled");
-    std::printf("link    : %dms receive timeout, %dms host reply timeout\n\n",
+    std::printf("link    : %dms receive timeout, %dms host reply timeout\n",
                 opt.recv_timeout, opt.reply_timeout);
+    if (opt.stop_input >= 0)
+        std::printf("input   : scheduled input ends at frame %d\n", opt.stop_input);
+    std::printf("\n");
 
     if (!opt.shot_dir.empty())
     {
@@ -494,6 +522,9 @@ int main(int argc, char** argv)
     std::vector<std::vector<uint32_t>> last_top(opt.players);
     std::vector<uint32_t> changes(opt.players, 0);
     std::vector<uint32_t> blink(opt.players, 0);
+    /* The frame at which each console's picture last changed, so a game parked
+       on a static screen (or wedged) is a failure and not "running frames". */
+    std::vector<int> last_beat_frame(opt.players, -1);
 
     std::ofstream manifest;
     if (!opt.shot_dir.empty())
@@ -542,7 +573,7 @@ int main(int argc, char** argv)
        games often animate one sprite, and "did anything change" is what says the
        console is alive. Only ever called with every console stopped, so the
        framebuffers cannot move underneath it. */
-    auto note_progress = [&](int p)
+    auto note_progress = [&](int frame, int p)
     {
         const uint32_t* top = nullptr;
         const uint32_t* bottom = nullptr;
@@ -558,7 +589,7 @@ int main(int argc, char** argv)
         for (size_t i = 0; i < MD_SCREEN_PIXELS; i++)
             if (top[i] != last_top[p][i]) diff++;
 
-        if (diff > 0) { changes[p]++; blink[p] += diff; }
+        if (diff > 0) { changes[p]++; blink[p] += diff; last_beat_frame[p] = frame; }
         std::memcpy(last_top[p].data(), top, MD_SCREEN_PIXELS * 4);
     };
 
@@ -639,7 +670,7 @@ int main(int argc, char** argv)
         /* Every console is stopped here, so reading their framebuffers is safe. */
         for (int p = 0; p < opt.players; p++)
         {
-            note_progress(p);
+            note_progress(frame, p);
             take_shot(frame, p);
         }
 
@@ -672,12 +703,23 @@ int main(int argc, char** argv)
     {
         const int stop = md_stop_reason(players[p]);
         const uint32_t beats = changes[p];
-        const bool alive = beats > 0 && stop == MD_STOP_NONE;
+        /* A console that produced frames but whose picture has not moved for the
+           last quarter of the run is frozen: the frame counter cannot tell that
+           apart from a healthy game, which is how the early-reply regression
+           (NSMB's screens byte-identical from frame 3200 to 12000 while every
+           link counter read green) survived thirteen reviews. */
+        const int since_beat = (opt.frames - 1) - last_beat_frame[p];
+        const bool frozen = (opt.frames >= 600) && (last_beat_frame[p] >= 0) &&
+                            (since_beat > opt.frames / 4);
+        const bool alive = beats > 0 && stop == MD_STOP_NONE && !frozen;
         if (!alive) problems++;
 
         std::printf("  player %d: %s  frames drawn=%u  stop=%d  asleep=%d\n",
-                    p + 1, alive ? "running" : "PROBLEM",
+                    p + 1, alive ? "running" : (frozen ? "FROZEN PICTURE" : "PROBLEM"),
                     beats, stop, md_console_asleep(players[p]));
+        std::printf("            picture: %u beats, %u pixels moved, last change %d frames ago%s\n",
+                    beats, blink[p], since_beat,
+                    frozen ? " - this game is not progressing; link counters above it are not health" : "");
         std::printf("            host frames=%u  arm9 pc=%#010x  arm7 pc=%#010x\n",
                     md_frame_counter(players[p]),
                     md_get_pc(players[p], 9), md_get_pc(players[p], 7));
@@ -689,14 +731,91 @@ int main(int argc, char** argv)
         MDLinkStats stats {};
         md_link_stats(players[p], &stats);
 
+        /* A host's replies arrive through LocalMP::RecvReplies, which counts
+           the packet and cannot size the payload, so its byte total is a lower
+           bound (see MDLinkStats): print the note with the number rather than
+           leave "received=4454 (136 bytes)" reading as a session that lost
+           4452 frames. A host is the console that sends commands. */
+        const char* bnote = stats.tx_cmd ? " + replies, counted as packets only" : "";
         std::printf("  player %d: wireless on/off=%u/%u  sent=%llu (%llu bytes)"
-                    "  received=%llu (%llu bytes)\n",
+                    "  received=%llu (%llu bytes%s)\n",
                     p + 1, stats.begin_count, stats.end_count,
                     (unsigned long long)stats.packets_sent, (unsigned long long)stats.bytes_sent,
                     (unsigned long long)stats.packets_received,
-                    (unsigned long long)stats.bytes_received);
+                    (unsigned long long)stats.bytes_received, bnote);
     }
     std::printf("  slots on the bus: %#05x\n", md_link_connected_mask());
+
+    /* ---- multiplayer digest ------------------------------------------------
+       The same counters the app prints every five seconds and at every state
+       change (md_link_mp_digest), dumped once at the end. On the NSMB script
+       this is the known-good reference every live MKDS run gets compared
+       against, so a counter that disagrees with the wire here is a counter that
+       would have misled the next read-back. */
+    std::printf("\n=== multiplayer digest ===\n");
+    for (int p = 0; p < opt.players; p++)
+    {
+        MDMPDigest d {};
+        if (md_link_mp_digest(players[p], &d) != 0)
+        {
+            std::printf("  player %d: digest unavailable\n", p + 1);
+            continue;
+        }
+
+        const auto hexbody = [](const uint8_t* body, uint16_t len, char* out, size_t cap) {
+            const unsigned n = (len > 16) ? 16u : (unsigned)len;
+            if (n == 0) { std::snprintf(out, cap, "-"); return; }
+            size_t off = 0;
+            for (unsigned i = 0; i < n; i++)
+            {
+                const int wrote = std::snprintf(&out[off], cap - off, (i == 0) ? "%02X" : " %02X", body[i]);
+                if (wrote <= 0) break;
+                off += (size_t)wrote;
+            }
+            if (len > n && off + 4 < cap) std::snprintf(&out[off], cap - off, " ..");
+        };
+
+        /* When the last command and answer of the session went out, on the
+           shared emulated clock. The app prints this every five seconds as the
+           "at +NNN.NNs" of `mp pN last:`; the same number here is what makes a
+           long run comparable across arms - the offset the link stopped at is
+           the reading, not the frame it was noticed on. */
+        const auto at_us = [](uint64_t us) -> std::string {
+            if (!us) return std::string("-");
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "+%.2fs", (double)us / 1000000.0);
+            return std::string(buf);
+        };
+
+        char cmdbody[64], ansbody[64];
+        hexbody(d.last_cmd_body, d.last_cmd_len, cmdbody, sizeof(cmdbody));
+        hexbody(d.last_answer_body, d.last_answer_len, ansbody, sizeof(ansbody));
+
+        std::printf("  player %d [%s]: cmds rx=%llu (dup %llu)  answers=%llu (blank %llu, canned %llu)\n"
+                    "            arms=%llu  aids=%llu  window reads=%llu  deauth out/in=%llu/%llu\n"
+                    "            host side: cmds tx=%llu (dup %llu)  acks=%llu (clientfail %llu)\n"
+                    "            replies sent=%llu  collected=%llu  empty=%llu  blank=%llu  stale=%llu"
+                    "  reanchor-drop=%llu  notlooking=%llu\n"
+                    "            last cmd: seq=%04X len=%u body[%s] at %s  last answer: len=%u body[%s] at %s\n"
+                    "            last deauth reason=%04X  last ack clientfail=%04X\n",
+                    p + 1,
+                    (d.role == 1) ? "host" : ((d.role == 2) ? "guest" : "not in MP"),
+                    (unsigned long long)d.cmds_rx, (unsigned long long)d.cmds_rx_dup,
+                    (unsigned long long)d.answers_sent,
+                    (unsigned long long)d.answers_blank, (unsigned long long)d.answers_canned,
+                    (unsigned long long)d.arms, (unsigned long long)d.aids_set,
+                    (unsigned long long)d.window_reads,
+                    (unsigned long long)d.deauth_sent, (unsigned long long)d.deauth_recv,
+                    (unsigned long long)d.cmds_tx, (unsigned long long)d.cmds_tx_dup,
+                    (unsigned long long)d.acks_sent, (unsigned long long)d.acks_client_fail,
+                    (unsigned long long)d.replies_written, (unsigned long long)d.replies_collected,
+                    (unsigned long long)d.windows_empty, (unsigned long long)d.replies_blank,
+                    (unsigned long long)d.stale_dropped, (unsigned long long)d.reanchor_dropped,
+                    (unsigned long long)d.not_looking,
+                    d.last_cmd_seq, (unsigned)d.last_cmd_len, cmdbody, at_us(d.last_cmd_us).c_str(),
+                    (unsigned)d.last_answer_len, ansbody, at_us(d.last_answer_us).c_str(),
+                    d.last_deauth_reason, d.last_ack_clientfail);
+    }
 
     std::printf("\n=== performance ===\n");
     std::printf("  %d frames x %d console(s) in %.1fs  ->  %.1f emulated seconds, %.2fx realtime\n",

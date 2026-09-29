@@ -22,6 +22,7 @@
 #include "Savestate.h"
 #include "GPU.h"
 #include "SPI.h"
+#include "Wifi.h"
 
 #include <optional>
 
@@ -261,10 +262,16 @@ void notify_mp_begin(void* userdata)
     std::lock_guard<std::mutex> lock(g_link_lock);
     inst->link_begin_count++;
     if (inst->slot >= 0) g_link_connected |= (1u << inst->slot);
+    /* The seconds are *wall* clock since the bus was initialized, which is a
+       different unit from the digest's "at +NNN.NNs" emulated offsets - the two
+       were read as one clock on 2026-09-29, which put the guest's join 130
+       emulated seconds after the frame it was visible on in the captures. The
+       console's own frame counter is printed beside it so an event can be
+       placed on the timeline a route is written against. */
     std::fprintf(stderr,
-        "[link-event] +%.3fs p%d (%s): wireless ON (begin #%u, slots now 0x%x)\n",
-        session_secs(), inst->slot, inst->name.c_str(), inst->link_begin_count,
-        g_link_connected);
+        "[link-event] +%.3fs wall frame %u p%d (%s): wireless ON (begin #%u, slots now 0x%x)\n",
+        session_secs(), inst->frame_counter, inst->slot, inst->name.c_str(),
+        inst->link_begin_count, g_link_connected);
 }
 
 void notify_mp_end(void* userdata)
@@ -276,9 +283,9 @@ void notify_mp_end(void* userdata)
     inst->link_end_count++;
     if (inst->slot >= 0) g_link_connected &= ~(1u << inst->slot);
     std::fprintf(stderr,
-        "[link-event] +%.3fs p%d (%s): wireless off (end #%u, slots now 0x%x)\n",
-        session_secs(), inst->slot, inst->name.c_str(), inst->link_end_count,
-        g_link_connected);
+        "[link-event] +%.3fs wall frame %u p%d (%s): wireless off (end #%u, slots now 0x%x)\n",
+        session_secs(), inst->frame_counter, inst->slot, inst->name.c_str(),
+        inst->link_end_count, g_link_connected);
 }
 
 void note_packet_sent(void* userdata, int len)
@@ -637,7 +644,13 @@ void md_set_buttons(MDInstance* inst, u32 mask)
 void md_touch(MDInstance* inst, int x, int y)
 {
     if (!inst) return;
-    std::fprintf(stderr, "[input] player %d touch -> %d,%d\n", inst->slot + 1, x, y);
+    /* The frame matters as much as the coordinate: a menu route is a list of
+       one-shot taps at the exact frame a given boot reaches a given screen, and
+       a route that landed cannot be read back off its own log without it -
+       re-deriving a working MP-Hunters join cost three runs on 2026-09-29
+       because these lines named the point and not the frame. */
+    std::fprintf(stderr, "[input] frame %u player %d touch -> %d,%d\n",
+                 inst->frame_counter, inst->slot + 1, x, y);
     inst->touch_active = true;
     inst->touch_x = x;
     inst->touch_y = y;
@@ -650,7 +663,8 @@ void md_release_touch(MDInstance* inst)
        60x/second with no press in progress; log only the actual down->up
        transition or the run log drowns (102385 lines in one MKDS run). */
     if (inst->touch_active)
-        std::fprintf(stderr, "[input] player %d touch released\n", inst->slot + 1);
+        std::fprintf(stderr, "[input] frame %u player %d touch released\n",
+                     inst->frame_counter, inst->slot + 1);
     inst->touch_active = false;
 }
 
@@ -741,8 +755,8 @@ static void push_buttons(MDInstance* inst)
             if (!n) strcpy(keys, "none");
         }
         std::fprintf(stderr,
-            "[input] player %d buttons -> %s (mask %08X)\n",
-            slot + 1, keys, inst->buttons);
+            "[input] frame %u player %d buttons -> %s (mask %08X)\n",
+            inst->frame_counter, slot + 1, keys, inst->buttons);
     }
 
     inst->nds->SetKeyMask(~inst->buttons & 0xFFF);
@@ -853,7 +867,7 @@ void md_link_init(void)
         g_link_bus = std::make_unique<melonDS::LocalMP>();
         g_link_connected = 0;
         g_link_epoch = std::chrono::steady_clock::now();
-        std::fprintf(stderr, "[link-event] +0.000s bus: init (16 slots)\n");
+        std::fprintf(stderr, "[link-event] +0.000s wall bus: init (16 slots)\n");
     }
 }
 
@@ -870,7 +884,7 @@ void md_link_shutdown(void)
        without ever invalidating a pointer. */
     if (g_link_bus) g_link_bus->Reset();
     g_link_connected = 0;
-    std::fprintf(stderr, "[link-event] +%.3fs bus: shutdown (state reset, bus kept alive)\n",
+    std::fprintf(stderr, "[link-event] +%.3fs wall bus: shutdown (state reset, bus kept alive)\n",
         session_secs());
 }
 
@@ -923,8 +937,8 @@ void md_link_resync(MDInstance* inst)
        MP_Begin path, and the kick is what fixed it, not the test packets. */
     g_link_bus->Begin(inst->slot);
     std::fprintf(stderr,
-        "[link-event] +%.3fs p%d (%s): resync (FIFO read offset re-anchored, receive semaphores cleared)\n",
-        session_secs(), inst->slot, inst->name.c_str());
+        "[link-event] +%.3fs wall frame %u p%d (%s): resync (FIFO read offset re-anchored, receive semaphores cleared)\n",
+        session_secs(), inst->frame_counter, inst->slot, inst->name.c_str());
 }
 
 melonDS::u32 md_link_connected_mask(void)
@@ -937,7 +951,7 @@ void md_link_set_recv_timeout(int milliseconds)
 {
     std::lock_guard<std::mutex> lock(g_link_lock);
     if (g_link_bus) g_link_bus->SetRecvTimeout(milliseconds < 0 ? 0 : milliseconds);
-    std::fprintf(stderr, "[link-event] +%.3fs bus: recv_timeout=%dms\n",
+    std::fprintf(stderr, "[link-event] +%.3fs wall bus: recv_timeout=%dms\n",
         session_secs(), g_link_bus ? g_link_bus->GetRecvTimeout() : 0);
 }
 
@@ -951,7 +965,7 @@ void md_link_set_reply_timeout(int milliseconds)
 {
     std::lock_guard<std::mutex> lock(g_link_lock);
     if (g_link_bus) g_link_bus->SetReplyTimeout(milliseconds < 0 ? 0 : milliseconds);
-    std::fprintf(stderr, "[link-event] +%.3fs bus: recv_timeout=%dms reply_timeout=%dms\n",
+    std::fprintf(stderr, "[link-event] +%.3fs wall bus: recv_timeout=%dms reply_timeout=%dms\n",
         session_secs(), g_link_bus ? g_link_bus->GetRecvTimeout() : 0,
         g_link_bus ? g_link_bus->GetReplyTimeout() : 0);
 }
@@ -1043,6 +1057,123 @@ int md_link_stats(MDInstance* inst, MDLinkStats* out)
     out->epoch_us = (u64)std::chrono::duration_cast<std::chrono::microseconds>(
                         g_link_epoch.time_since_epoch())
                         .count();
+    return 0;
+}
+
+int md_link_mp_digest(MDInstance* inst, MDMPDigest* out)
+{
+    if (!inst || !out) return -1;
+    memset(out, 0, sizeof(*out));
+
+    if (inst->nds)
+    {
+        /* Refresh the interrupt snapshot first: the counters below read as
+           "since reset" and the register values only as "now", so they have to
+           be sampled together with the export that carries them. */
+        inst->nds->Wifi.SampleMPIrqSnapshot();
+        const melonDS::Wifi::MPDiag& d = inst->nds->Wifi.GetMPDiag();
+
+        out->role = (uint32_t)d.role;
+        out->cmds_rx = d.cmds_rx;
+        out->cmds_rx_dup = d.cmds_rx_dup;
+        out->answers_sent = d.answers_sent;
+        out->answers_blank = d.answers_blank;
+        out->answers_canned = d.answers_canned;
+        out->arms = d.arms;
+        out->aids_set = d.aids_set;
+        out->window_reads = d.window_reads;
+        out->deauth_sent = d.deauth_sent;
+        out->deauth_recv = d.deauth_recv;
+        out->cmds_tx = d.cmds_tx;
+        out->cmds_tx_dup = d.cmds_tx_dup;
+        out->acks_sent = d.acks_sent;
+        out->acks_client_fail = d.acks_client_fail;
+        out->last_cmd_seq = d.last_cmd_seq;
+        out->last_cmd_len = d.last_cmd_len;
+        memcpy(out->last_cmd_body, d.last_cmd_body, sizeof(out->last_cmd_body));
+        out->last_answer_len = d.last_answer_len;
+        memcpy(out->last_answer_body, d.last_answer_body, sizeof(out->last_answer_body));
+        out->last_deauth_reason = d.last_deauth_reason;
+        out->last_ack_clientfail = d.last_ack_clientfail;
+        out->last_cmd_us = d.last_cmd_us;
+        out->last_answer_us = d.last_answer_us;
+
+        for (int i = 0; i < 16; i++)
+        {
+            out->irq_raised[i] = d.irq_raised[i];
+            out->irq_acked[i] = d.irq_acked[i];
+        }
+        out->irq_cpu_line = d.irq_cpu_line;
+        out->block_beacon_irq14 = d.block_beacon_irq14_now;
+        out->w_if = d.if_now;
+        out->w_ie = d.ie_now;
+        out->w_uscntcnt = d.uscntcnt_now;
+        out->w_uscmpcnt = d.uscmpcnt_now;
+        out->w_bcncount1 = d.bcncount1_now;
+        out->w_bcncount2 = d.bcncount2_now;
+        out->w_txslot_beacon = d.txslot_beacon_now;
+        out->w_txslot_reply1 = d.txslot_reply1_now;
+        out->w_txslot_reply2 = d.txslot_reply2_now;
+        out->w_txbusy = d.txbusy_now;
+        out->w_txreqread = d.txreqread_now;
+        out->w_powerstate = d.powerstate_now;
+        out->w_powertx = d.powertx_now;
+        out->comstatus = d.comstatus_now;
+        out->uscounter = d.uscounter_now;
+        out->uscompare = d.uscompare_now;
+    }
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (g_link_bus && inst->slot >= 0)
+    {
+        melonDS::LocalMP::MPReplyDiag rd {};
+        g_link_bus->GetReplyDiag(inst->slot, &rd);
+
+        out->replies_written = rd.replies_written;
+        out->replies_collected = rd.collected;
+        out->replies_blank = rd.collected_blank;
+        out->windows_empty = rd.windows_empty;
+        out->stale_dropped = rd.stale_dropped;
+        out->reanchor_dropped = rd.reanchor_dropped;
+        out->not_looking = rd.not_looking;
+    }
+
+    return 0;
+}
+
+uint64_t md_link_mp_digest_size(void)
+{
+    return (uint64_t)sizeof(MDMPDigest);
+}
+
+int md_wifi_io_report(MDInstance* inst, char* out, int cap)
+{
+    if (!inst || !inst->nds || !out || cap <= 0) return -1;
+    return inst->nds->Wifi.FormatMPIoReport(out, (size_t)cap);
+}
+
+int md_link_mp_vary(MDInstance* inst, int kind, int value, const uint8_t* body,
+                    int bodylen, int* armed, int* left, uint64_t* applied)
+{
+    if (!inst || !inst->nds) return -1;
+    /* 1 = the body override, 0 = clear. Both spelling lists - this one and the
+       Rust control channel's - are kept in step deliberately: a kind the control
+       channel accepts and this function refuses is an experiment that silently
+       never runs (measured 2026-09-28: a matrix stopped after its first cell on
+       `md_link_mp_vary failed (1)`). */
+    if (kind < 0 || kind > 1) return set_error(inst, "md_link_mp_vary kind must be 0 or 1");
+    if (bodylen < 0) bodylen = 0;
+
+    inst->nds->Wifi.SetMPProbe(kind, value, body, bodylen);
+
+    /* What it armed *as*, which is 0 for a body probe with no body: the caller
+       is told what is really armed rather than what it asked for. */
+    int k = 0, l = 0;
+    u64 a = 0;
+    inst->nds->Wifi.GetMPProbe(&k, &l, &a);
+    if (armed) *armed = k;
+    if (left) *left = l;
+    if (applied) *applied = a;
     return 0;
 }
 

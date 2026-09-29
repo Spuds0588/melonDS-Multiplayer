@@ -185,9 +185,17 @@ See [history.md](./history.md) for more detailed lessons learned and implementat
 
 ---
 
+## Game Compatibility
+
+Which titles actually link up, and how far each one gets, is tracked in [compatibility.md](./compatibility.md) — per-game results with the evidence behind them, plus what "working" means here (a real in-game match, not just a live link).
+
+**Short version:** New Super Mario Bros. plays 2-player multiplayer today. Mario Kart DS and Metroid Prime - Hunters both join but stop on the game's own screen. **3 and 4-player sessions are not working yet.**
+
+---
+
 ## Project Status
 
-This project is currently in development. See [to-do.md](./to-do.md) for the development roadmap.
+This project is currently in development. See [to-do.md](./to-do.md) for the development roadmap, including [the road to a working 2, 3 and 4-player link](./to-do.md#the-road-to-a-working-2-3-and-4-player-link).
 
 ---
 

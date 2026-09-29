@@ -272,6 +272,27 @@ public: // TODO: Encapsulate the rest of these members
     u32 NumLagFrames;
     bool LagFrameFlag;
 
+    /* Emulated time in microseconds, on a base that every console in a
+       lockstep session agrees on: a whole number of DS frames (each console
+       advances exactly one frame per session step, so this part is identical
+       on all of them) plus this console's own progress through the frame it is
+       in.
+
+       The wifi module's own clock (`Wifi::USTimestamp`) is derived from this,
+       which is what makes the local-MP protocol's timestamps - a frame's
+       timestamp is the sender's clock, and the receiver can only compare it
+       with its own - meaningful across two consoles. Before that, each console
+       stamped frames with a clock that advanced with its *own* emulated
+       cycles, and the games are free to change how long a frame of theirs is
+       (MKDS writes VCOUNT every 61 frames, its client more often during a
+       join, and a VCOUNT write delays the frame), so the two clocks parted by
+       254ms of emulated time over a single MKDS join and never came back. */
+    [[nodiscard]] u64 GetSharedUSClock() const noexcept
+    {
+        const u64 cycles = ((u64)NumFrames * 560190) + (SysTimestamp - FrameStartTimestamp);
+        return (cycles * 1000000) / 33513982;
+    }
+
     // no need to worry about those overflowing, they can keep going for atleast 4350 years
     u64 ARM9Timestamp, ARM9Target;
     u64 ARM7Timestamp, ARM7Target;

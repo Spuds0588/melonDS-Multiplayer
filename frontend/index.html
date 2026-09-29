@@ -210,6 +210,7 @@
     let running = false;
     let pumping = false;
     let statusError = false;
+    let statusErrorAt = 0;
 
     // Which console the keyboard + mouse drive. One set of controls (player
     // 1's keymap) drives whichever session is selected; Digit1..Digit4 (and
@@ -228,10 +229,15 @@
     // a flag: when Tab initiated the peek, releasing Tab must not clear it.
     let peekViaTab = false;
 
+    // An error status expires; it used to latch for the rest of the run over one
+    // uncaught UI error. A condition that is still true re-asserts itself every
+    // poll, so it stays up regardless (history.md v0.1.9t).
+    const STATUS_ERROR_MS = 6000;
     function setStatus(text, isError = false) {
       statusEl.textContent = text;
       statusEl.classList.toggle("error", isError);
       statusError = isError;
+      statusErrorAt = isError ? performance.now() : 0;
     }
 
     // ------------------------------------------------------------------
@@ -402,6 +408,28 @@
       return session?.flip_keys?.[0] ?? "ShiftRight";
     }
 
+    // The page's whole input state for one console, written from one place. A
+    // key event and a pointer event are two ways of changing the same two
+    // halves, and each used to hard-code the other half to "nothing":
+    // sendButtons() sent `touch: null`, so a keypress lifted a pen that was
+    // down - and so did a window blur in the middle of a stylus drag (focus is
+    // not something the emulated console can see). The player keeps holding,
+    // the console stops seeing it, and the pen dot stays drawn. Reproduced
+    // through the app's own channel on 2026-09-29: pen held for 2.5s, `key
+    // KeyJ` 1s in, the guest's pen up after 1s. Both halves travel together
+    // now, from whatever state this console actually has.
+    async function pushInput(p) {
+      const c = canvases[p];
+      if (!c) return;
+      try {
+        await invoke("set_input", { input: {
+          player: p,
+          buttons: c.buttons,
+          touch: c.pen.down ? [c.pen.x, c.pen.y] : null,
+        } });
+      } catch (err) { console.error("set_input failed:", err); }
+    }
+
     async function sendButtons(p) {
       const c = canvases[p];
       if (!c) return;
@@ -411,8 +439,7 @@
       }
       mask &= playerMask(p);
       c.buttons = mask;
-      try { await invoke("set_input", { input: { player: p, buttons: mask, touch: null } }); }
-      catch (err) { console.error("set_input failed:", err); }
+      await pushInput(p);
     }
 
     function playerMask(p) {
@@ -430,8 +457,17 @@
       if (i === active || !canvases[i]) return;
       // Release everything held on the old console: a direction held while
       // switching must not stay latched there (the keyup will land on the
-      // new console, which never had it down).
+      // new console, which never had it down). The pen goes with it: the
+      // pointer handlers ignore every console but the selected one, so a
+      // console left holding its pen across a switch would never see the
+      // lift that releases it (the old code cleared the guest's pen here by
+      // accident, by sending `touch: null` from a button update).
       held.clear();
+      const prev = canvases[active];
+      if (prev && prev.pen.down) {
+        prev.pen.down = false;
+        prev.cursor.classList.remove("on");
+      }
       sendButtons(active);
       active = i;
       for (let p = 0; p < canvases.length; p++) {
@@ -517,6 +553,49 @@
       applyLayout();
     });
 
+    // What the control channel's `key` and `index` commands ask the page,
+    // instead of deciding for themselves what a key name means. The
+    // vocabulary is exactly what the two handlers above dispatch on, in that
+    // order: a digit selects a console, Tab and the peek key drive the peek,
+    // and anything else has to be in the selected console's keymap (which is
+    // per-session data from the backend). Keeping it here is what stops the
+    // two from drifting - the channel used to dispatch any string and report
+    // success, so `key Bogus` was silently accepted (history.md v0.1.9ab).
+    window.__mdkey = (code) =>
+      digitIndex(code) >= 0 ||
+      code === "Tab" ||
+      code === flipKeyFor(active) ||
+      maskFor(active, code) !== 0;
+
+    window.__mdselect = (p) => {
+      if (!canvases[p]) return `player ${p + 1} has no console`;
+      if (p === active) return `already active player ${p + 1}`;
+      setActive(p);
+      return `selected player ${p + 1}`;
+    };
+
+    // The one way into a console's input state, for the control channel's
+    // `input`/`press`/`touch` commands exactly as for the keyboard above them.
+    // The page is the owner: it holds one buttons mask and one pen per console
+    // and sends both together, so two writers cannot erase each other's half.
+    // They could before - the channel wrote the Rust side's copy directly,
+    // while a key event pushed the page's copy with `touch: null` - which is
+    // why a driver's pen came up at the first keypress (measured 2026-09-29:
+    // `touch 128 96 --player 1 --ms 2500` with `key KeyJ` 1s in, pen released
+    // on the key's own frame) and why sixteen taps once produced no screen
+    // change at all. Everything a test drives now lands in the same state the
+    // player's own input does. Throws for a console that is not running, like
+    // __mdkey: a channel command that cannot act must fail, not report success.
+    window.__mdinput = async (p, buttons, touch) => {
+      const c = canvases[p];
+      if (!c) throw new Error(`player ${p + 1} has no console`);
+      c.buttons = buttons >>> 0;
+      if (touch) { c.pen.x = touch[0]; c.pen.y = touch[1]; c.pen.down = true; }
+      else { c.pen.down = false; c.cursor.classList.remove("on"); }
+      await pushInput(p);
+      return `input player ${p + 1} buttons ${c.buttons}` + (touch ? ` touch ${touch[0]},${touch[1]}` : "");
+    };
+
     // Touch: the mouse is the pen on the SELECTED console's bottom screen at
     // all times, shown or hidden — DS games navigate by touch gestures, so
     // visibility (a display choice) must never gate touch.
@@ -544,12 +623,8 @@
           Math.max(0, Math.min(H - 1, Math.round((e.clientY - r.top) / r.height * H))),
         ];
       };
-      const send = async (touch) => {
-        const cv = c();
-        try {
-          await invoke("set_input", { input: { player: p, buttons: cv.buttons, touch } });
-        } catch (err) { console.error("set_input(touch) failed:", err); }
-      };
+      // The pen path pushes the same whole state (buttons included, as it
+      // always did) through pushInput once setPen/clearPen have moved the pen.
       const setPen = (x, y, down) => {
         const cv = c();
         cv.pen.x = x; cv.pen.y = y; cv.pen.down = down;
@@ -581,7 +656,7 @@
         const xy = toDs(e);
         if (!xy) return;
         setPen(xy[0], xy[1], true);
-        send(xy);
+        pushInput(p);
       });
       wrap.addEventListener("pointermove", (e) => {
         if (p !== active) return;
@@ -592,13 +667,13 @@
         // reaches the emulated touch screen as pen-down.
         const down = c().pen.down || (e.buttons & 1) !== 0;
         setPen(xy[0], xy[1], down);
-        if (down) send(xy);
+        if (down) pushInput(p);
       });
       const up = (e) => {
         if (p !== active) return;
         if (e) { try { wrap.releasePointerCapture(e.pointerId); } catch (_) {} }
         clearPen();
-        send(null);
+        pushInput(p);
       };
       wrap.addEventListener("pointerup", up);
       wrap.addEventListener("pointercancel", up);
@@ -748,14 +823,18 @@
             true,
           );
           canvases.forEach((c) => (c.hint.style.color = "#ff6b6b"));
-        } else if (!statusError) {
+        } else if (!statusError || performance.now() - statusErrorAt > STATUS_ERROR_MS) {
           setStatus(`${running ? "running" : "idle"} · ${up} · ${connected}${linkCheck}`);
         }
         canvases.forEach((c, i) => {
           const p = st.players?.[i];
           if (!p) return;
           const now = performance.now();
-          const dt = (now - (c.fpsTimer ?? now)) / 1000;
+          // The clock has to start on the first *sample*, not in the branch that
+          // reports an fps - otherwise dt stays 0 for the life of the page and
+          // the readout is dead (history.md v0.1.9t).
+          if (c.fpsTimer === undefined) c.fpsTimer = now;
+          const dt = (now - c.fpsTimer) / 1000;
           const fps = dt > 0.5 ? Math.round(c.frames / dt) : null;
           if (fps !== null) { c.fps.textContent = `${fps} fps`; c.frames = 0; c.fpsTimer = now; }
           c.hint.title = `frames ${p.frames} · sent ${p.packetsSent} · recv ${p.packetsReceived}`;

@@ -115,12 +115,22 @@ fn main() {
 
     // Rebuild the Rust side whenever the C++ sources change, so an edited
     // bridge cannot end up running inside a stale binary.
+    // The whole C++ core, not one file: the archives above are inputs to this
+    // link, and cargo has no way to know when they changed. Watching only the
+    // bridge left the host linked against a stale core every time an emulator
+    // file changed - `src/Wifi.cpp`, which owns the link's timing, included.
     for watch in [
         "src/frontend/tauri/Bridge.cpp",
         "src/frontend/tauri/PlatformBridge.cpp",
         "src/frontend/tauri/melonds_bridge.h",
         "src/net/LocalMP.cpp",
         "src/net/LocalMP.h",
+        "src/Wifi.cpp",
+        "src/Wifi.h",
+        "src/NDS.cpp",
+        "src/NDS.h",
+        "src/GPU.cpp",
+        "src/GPU.h",
     ] {
         println!("cargo:rerun-if-changed={}", project_root.join(watch).display());
     }

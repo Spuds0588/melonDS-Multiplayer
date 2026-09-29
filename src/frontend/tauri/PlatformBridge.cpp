@@ -60,12 +60,30 @@ void Log(LogLevel level, const char* fmt, ...)
     const char* prefix = "Log";
     if ((int)level >= 0 && (int)level < 4) prefix = prefixes[(int)level];
 
-    std::fprintf(stderr, "[melonDS %s:%s] ", t_log_tag.c_str(), prefix);
+    /* One line, one write. Each console runs on its own thread and they share
+       stderr, so a tag written separately from its body could be interleaved
+       with the other thread's line - producing "[melonDS p1:Debug]
+       [melonDS p2:Debug] [mp] <p2's body>" followed by an untagged fragment of
+       p1's body, which misattributes both. Measured at ~1% of tagged lines in a
+       12 minute session, and concentrated on the wifi exchange lines, i.e.
+       exactly the ones a two-console analysis reads. */
+    char buf[1024];
+    int n = std::snprintf(buf, sizeof(buf), "[melonDS %s:%s] ", t_log_tag.c_str(), prefix);
+    if (n < 0) return;
+    size_t used = ((size_t)n < sizeof(buf)) ? (size_t)n : sizeof(buf) - 1;
 
     va_list args;
     va_start(args, fmt);
-    std::vfprintf(stderr, fmt, args);
+    int m = std::vsnprintf(buf + used, sizeof(buf) - used, fmt, args);
     va_end(args);
+    if (m > 0)
+    {
+        const size_t room = sizeof(buf) - used - 1;
+        used += ((size_t)m < room) ? (size_t)m : room;
+    }
+
+    std::fwrite(buf, 1, used, stderr);
+    std::fflush(stderr);
 }
 
 /* ---------------------------------------------------------------- file access */
@@ -528,20 +546,28 @@ static void trace_frame(const char* dir, int slot, const char* kind, u64 timesta
     if (framelen >= 16) format_mac(&frame[10], txmac);
     if (framelen >= 22) format_mac(&frame[16], bssid);
 
-    std::fprintf(stderr,
+    char line[256];
+    int n = std::snprintf(line, sizeof(line),
                  "[link-trace] p%d %s %-5s len=%3d chan=%2d fc=%04X seq=%04X rx=%s tx=%s bssid=%s t=%llu",
                  slot + 1, dir, kind, len, data[9], framectl, seq, rxmac, txmac, bssid,
                  (unsigned long long)timestamp);
+    if (n < 0) return;
+    size_t used = ((size_t)n < sizeof(line)) ? (size_t)n : sizeof(line) - 1;
 
     if (framelen >= 32)
     {
         const u64 sync = *(const u64*)&frame[24];
         const u16 mask = *(const u16*)&frame[26];
-        std::fprintf(stderr, " sync=%016llX mask=%04X",
-                     (unsigned long long)sync, (unsigned)mask);
+        int m = std::snprintf(line + used, sizeof(line) - used, " sync=%016llX mask=%04X",
+                              (unsigned long long)sync, (unsigned)mask);
+        if (m > 0 && (size_t)m < sizeof(line) - used) used += (size_t)m;
     }
 
-    std::fprintf(stderr, "\n");
+    /* Same one-write rule as Platform::Log: this line used to be four
+       fprintf calls, so the two console threads could interleave inside it. */
+    if (used + 1 < sizeof(line)) line[used++] = '\n';
+    std::fwrite(line, 1, used, stderr);
+    std::fflush(stderr);
 }
 
 /* --------------------------------------------------------- local multiplayer */

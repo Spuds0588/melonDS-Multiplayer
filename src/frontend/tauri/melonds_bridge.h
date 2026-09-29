@@ -87,6 +87,28 @@ int md_write_ram(MDInstance* inst, uint32_t addr, const void* data, size_t len);
    and for tests that watch a ROM's progress markers. */
 int md_read_ram(MDInstance* inst, uint32_t addr, void* out, size_t len);
 
+/* What this console's own software has been reading out of the wireless block,
+   as text: every wifi register halfword it has taken (a count and the last
+   value per offset, plus the last 512 reads in order), and every halfword it
+   consumed out of the frame it was most recently handed, in that order.
+
+   This exists because a value the emulator fabricates and a value the peer's
+   game wrote are indistinguishable in any counter taken from the write side or
+   from the wire, and separable only where a game's own bytecode looks at them
+   (history.md v0.1.9h; the recorder is Wifi::MPIo in src/Wifi.h). Writes at
+   most `cap` bytes including the terminator and returns the length written,
+   or -1 if `cap` is too small for even the header. */
+int md_wifi_io_report(MDInstance* inst, char* out, int cap);
+
+/* The parked-handshake probe (see Wifi::SetMPProbe): kind 1 replaces the body
+   bytes the console's game reads with `body` for `value` deliveries, kind 0
+   clears. Returns 0 on success and writes the probe state back out so a caller
+   can watch it fire: `armed` is the kind actually armed (0 when there was
+   nothing to run), `left` how many deliveries it still has to touch and
+   `applied` how many it has changed. Diagnostics only. */
+int md_link_mp_vary(MDInstance* inst, int kind, int value, const uint8_t* body,
+                    int bodylen, int* armed, int* left, uint64_t* applied);
+
 /* -------------------------------------------------------------------- input */
 
 void md_set_buttons(MDInstance* inst, uint32_t mask);
@@ -227,6 +249,101 @@ typedef struct MDLinkStats
 
 /* Fills in out with this console's link state. Returns 0 on success. */
 int md_link_stats(MDInstance* inst, MDLinkStats* out);
+
+/* Everything the multiplayer flight recorder knows about one console
+   (Wifi::MPDiag + LocalMP::MPReplyDiag), in one struct.
+
+   This exists because the previous thirteen live attempts were each read back
+   by hand from a multi-megabyte log: the questions that matter (did the guest's
+   game receive a command, did it answer with its own bytes, did the host read
+   that answer back, and what did either body say) are all small integers, and
+   the host prints them as one line per console per health window. A failed join
+   should therefore be diagnosable from the last two lines of the log instead of
+   a forensic pass over the whole file. Counters are always on; bodies are the
+   last ones seen, truncated to 16 bytes. */
+typedef struct MDMPDigest
+{
+    /* 0 = not in multiplayer, 1 = MP host, 2 = MP client */
+    uint32_t role;
+
+    /* guest side: what the console's own game did */
+    uint64_t cmds_rx;          /* command frames delivered to its game */
+    uint64_t cmds_rx_dup;      /* ... of which repeated the previous seqno */
+    uint64_t answers_sent;     /* answers its game produced */
+    uint64_t answers_blank;    /* zero length "nothing armed" frames */
+    uint64_t answers_canned;   /* firmware stand-ins (fc=0158) */
+    uint64_t arms;             /* reply slots it armed (bit 15 of W_TXSlotReply1) */
+    uint64_t aids_set;         /* W_AIDLow writes that changed the value */
+    uint64_t window_reads;     /* reads of its wireless receive RAM window */
+    uint64_t deauth_sent;      /* deauth frames it transmitted */
+    uint64_t deauth_recv;      /* deauth frames it accepted */
+
+    /* host side */
+    uint64_t cmds_tx;          /* command frames it transmitted */
+    uint64_t cmds_tx_dup;      /* ... of which repeated the previous seqno */
+    uint64_t acks_sent;        /* acks it transmitted */
+    uint64_t acks_client_fail; /* ... of which reported a failed client */
+
+    /* the shared reply queue, from this console's point of view */
+    uint64_t replies_written;  /* answers its own game handed to the bus */
+    uint64_t replies_collected;/* answers it read back with a payload */
+    uint64_t replies_blank;    /* zero length credits it read back */
+    uint64_t windows_empty;    /* collection attempts that came back with nothing */
+    uint64_t stale_dropped;    /* answers skipped for being too old */
+    uint64_t reanchor_dropped; /* unread answers discarded by a new command */
+    uint64_t not_looking;      /* windows that never ran: no peer attached */
+
+    /* the last frames seen, bodies included */
+    uint16_t last_cmd_seq;
+    uint16_t last_cmd_len;     /* body bytes after the 24-byte 802.11 header */
+    uint8_t  last_cmd_body[16];
+    uint16_t last_answer_len;
+    uint8_t  last_answer_body[16];
+    uint16_t last_deauth_reason;
+    uint16_t last_ack_clientfail;
+    uint64_t last_cmd_us;
+    uint64_t last_answer_us;
+
+    /* interrupt level (2026-09-28): a picture that never changes while the CPUs
+       keep running is what a game waiting on an interrupt it never receives
+       looks like, and the byte counters cannot tell that apart from a game
+       that is simply idle. `irq_raised[i]` is every time the wifi block asked
+       its CPU for attention on source i, `irq_acked[i]` every time the game
+       wrote a 1 to clear that bit. The rest is the live register state at the
+       instant the digest was taken, refreshed by SampleMPIrqSnapshot(). */
+    uint64_t irq_raised[16];         /* SetIRQ/IFSet writes per source */
+    uint64_t irq_acked[16];          /* W_IF writes that cleared that bit */
+    uint64_t irq_cpu_line;           /* wifi asserting ARM7 IRQ_Wifi (bit 23) */
+    int32_t  block_beacon_irq14;     /* W_USCompare0 bit0 bookkeeping */
+    uint16_t w_if;                   /* W_IF: pending bits */
+    uint16_t w_ie;                   /* W_IE: enabled bits */
+    uint16_t w_uscntcnt;             /* W_USCountCnt: us-counter gate */
+    uint16_t w_uscmpcnt;             /* W_USCompareCnt: bit0 allows IRQ14 */
+    uint16_t w_bcncount1;            /* counts down to IRQ14 (source 1) */
+    uint16_t w_bcncount2;            /* counts down to IRQ13 (power-down) */
+    uint16_t w_txslot_beacon;
+    uint16_t w_txslot_reply1;
+    uint16_t w_txslot_reply2;
+    uint16_t w_txbusy;
+    uint16_t w_txreqread;
+    uint16_t w_powerstate;
+    uint16_t w_powertx;
+    uint16_t comstatus;
+    uint64_t uscounter;              /* the game-visible us counter */
+    uint64_t uscompare;              /* what it is waiting for */
+} MDMPDigest;
+
+/* Fills in out with this console's multiplayer digest. Returns 0 on success. */
+int md_link_mp_digest(MDInstance* inst, MDMPDigest* out);
+
+/* sizeof(MDMPDigest), so the host can check its own struct against this one at
+   startup. The host reads the digest into a struct it declares by hand, and this
+   project has already lost a session to an FFI declaration mismatch (an `int`
+   read as `usize` in md_link_recv_packet, which made every "did my packet
+   arrive" comparison a coin toss). A mismatch here would be quieter: the numbers
+   would simply be wrong, so it is worth one line at startup to prove the two
+   layouts agree. */
+uint64_t md_link_mp_digest_size(void);
 
 /* Re-anchor this console onto the bus: LocalMP::Begin resets its packet-FIFO
    read offset to the bus's write head and clears its receive semaphores. The

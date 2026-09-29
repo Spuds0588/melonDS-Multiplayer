@@ -17,6 +17,7 @@
 */
 
 #include <cstdlib>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include "NDS.h"
@@ -87,6 +88,35 @@ static void mp_trace_deauth(const char* what, const u8* frame, int framelen)
         (body == 2) ? "" : " (body is not the usual 2-byte reason code)");
 }
 
+/* Records the last body of a command or answer frame for the flight recorder
+   (Wifi::MPDiag, see Wifi.h). Sixteen bytes is the whole of the bodies these
+   games send, with room to watch a longer one start to move. */
+static void mp_record_body(u8* dst, u16* dstlen, const u8* src, int len)
+{
+    if (len < 0) len = 0;
+    *dstlen = (u16)len;
+    const int n = (len > 16) ? 16 : len;
+    if (n > 0) memcpy(dst, src, (size_t)n);
+    if (n < 16) memset(&dst[n], 0, (size_t)(16 - n));
+}
+
+/* The recorded body as hex, for the log lines that print one. What is *stored*
+   stays the raw bytes (the digest carries them on to the Rust side, which
+   formats its own), but printing them with `%s` put nothing on the line
+   whenever the first byte was 00h - which is most of MKDS's answers (`00 80 ...`)
+   - so a line reading `body[6]=` looked like a body that was never recorded and
+   a "does the retry marker ride new content" check built on those lines compared
+   one empty string to another (2026-09-28). `buflen` must fit 3*len. */
+static const char* mp_body_hex(const u8* body, int len, char* buf, size_t buflen)
+{
+    if (len <= 0) { snprintf(buf, buflen, "-"); return buf; }
+    size_t n = 0;
+    for (int i = 0; (i < len) && ((n + 4) < buflen); i++)
+        n += (size_t)snprintf(&buf[n], buflen - n, "%02X ", body[i]);
+    if (n) buf[n - 1] = 0;
+    return buf;
+}
+
 /* Whether a repeated CMD sequence number is handed to the game.
 
    Stock melonDS treats a repeated CMD seqno as a transport-level event: the
@@ -108,30 +138,16 @@ static void mp_trace_deauth(const char* what, const u8* frame, int framelen)
    host showed its join error. NSMB, whose host never repeats a seqno, plays
    fine with the same code, which is why this only ever showed up on MKDS.
 
-   That reasoning was measured without the early reply, and the early reply is
-   what removed its premise: with the armed slot no longer being consumed by
-   the round-end path (see mp_early_reply), a retry is answered from the same
-   armed reply the first copy was, so it no longer falls back to the canned
-   default. What delivering every retry costs is now visible instead, and it is
-   the guest's game that pays: the host of a real join re-sends one command
-   ~700 times a second, and every one of those was handed to the guest's game.
-
-   Measured on 2026-09-25, NSMB two-player script, 12000 frames, with the early
-   reply and MD_REPLY_KEEP=2 in both legs: delivered 2504 answers / 1987
-   collected / 989 empty windows at 5.9x realtime, **0 blanks, 0 canned**;
-   stock 77162 answers / 73267 collected / 37712 empty at 1.30x - the same
-   single command polled 30x as often, every one of those retries now answered
-   by the hardware from the armed slot instead of interrupting the game with a
-   duplicate. Stock is the hardware's own behaviour (a retransmitted CMD is a
-   transport event, not a new command) and the live MKDS run right before this
-   change is what pointed at it: P2's game sat in the room, answered every one
-   of 1356 rounds with the same two bytes, and never reacted to the command the
-   host was repeating at it, while its game was being handed that command 1356
-   times.
-
-   So the default is stock again. MD_CMD_RETRY_NOTIFY=1 restores the delivery
-   behaviour for comparison - it remains the better choice if a guest's game
-   ever needs a retry it cannot see. */
+   Delivering every retry is what an earlier change made the default, on the
+   theory that a guest is only answerable if it hears each retry. It is not the
+   fix it looked like: over the NSMB two-player script it delivers 30x as many
+   commands to the guest's game for the same session, and the one thing it
+   changes on the wire is how often the game is interrupted - the host's
+   retries are answered by the hardware either way. Stock is the hardware's own
+   behaviour (a retransmitted CMD is a transport event, not a new command), so
+   that is the default. MD_CMD_RETRY_NOTIFY=1 restores the delivery behaviour
+   for comparison; it remains the better choice if a guest's game ever needs a
+   retry it cannot see. */
 static bool cmd_retry_notify()
 {
     static const bool on = []() {
@@ -141,84 +157,83 @@ static bool cmd_retry_notify()
     return on;
 }
 
-/* Whether the guest's answer may leave inside the round its CMD arrived in.
-
-   A DS answers a host's CMD from a reply slot the guest armed *before* the
-   command arrived, and the guest arms one when it is handed a command. So the
-   answer to round N is armed while round N is going on, and it can only be
-   sent within round N if the hardware sends it as soon as it is armed. Stock
-   melonDS instead waits for the round to end and sends whatever Reply1 held
-   when the round *started*: the guest's answer then lands in round N+1, and
-   round N is answered by a blank - or, when the arm is missing at the round
-   boundary (the guest writes W_AIDLow around its arm, and the reply path is
-   gated on W_AIDLow), by nothing at all.
-
-   Measured on Mario Kart DS's join (2026-09-25): the client answered every
-   second CMD - `[mp] answering cmd ... AID 1` alternating with `[mp] BLANK
-   reply ... AID 0` - while the host retried one byte-identical command ~1400
-   times, reported clientfail=0002 in the acks of the blank rounds, and the
-   client's game then gave up and the host showed its join error. Half of the
-   host's rounds never got an answer, and MKDS is strict enough that the other
-   half is not enough.
-
-   Upstream is where this comes from: commit 8772258f ("attempt at making
-   local multiplayer faster") added an early-reply path that sends the armed
-   reply from the W_AIDLow / W_TXSlotReply1 writes, timestamped to the end of
-   the CMD's reception, and commit 193c7ed9 reverted it two weeks later - with
-   no reason in the message - together with the GPU-line-aligned transfer
-   timing that came with it. This restores the early reply only and leaves the
-   transfer timing alone.
-
-   Default on; MD_EARLY_REPLY=0 goes back to stock melonDS to A/B it. */
-static bool mp_early_reply()
+/* The pre-fork transport, for the reference A/B of 2026-09-28: `MD_STOCK_MP=1`
+   answers a poll exactly the way stock melonDS does - the AID test and the AID
+   stamped on the reply are the *live* `W_AIDLow`, and nothing is restored from
+   a held arm, so a poll that arrives after the driver cleared the slot is
+   answered by the firmware's stand-in frame. Paired with `MD_STOCK_MP=1` in
+   LocalMP.cpp, which restores stock's reply-queue window and its
+   drop-everything re-anchor, this is the whole transport difference between
+   this fork and upstream/master's `Wifi.cpp`/`LocalMP.cpp` for the two games to
+   run against; the clock is deliberately *not* part of the arm (see
+   Wifi::USTimer - a free-running clock in a frame-locked pair is a defect this
+   fork measured, not a fork-only design choice, and the mission kept it). */
+static bool stock_mp()
 {
     static const bool on = []() {
-        const char* v = std::getenv("MD_EARLY_REPLY");
-        return !(v && *v && (*v == '0'));
+        const char* v = std::getenv("MD_STOCK_MP");
+        return v && *v && (*v != '0');
     }();
     return on;
 }
 
-/* Whether the hardware tells the guest's game that its answer left, and whether
-   it also consumes the arm.
+/* Whether a poll that arrives with the reply slot as the game left it (cleared)
+   is answered with the frame the hardware still holds in its own reply slot -
+   the game's own bytes - or with the firmware's invented `00 00 00 00`
+   stand-in.
 
-   Sending the answer inside its own round (SendMPEarlyReply) skips the one
-   thing stock melonDS's SendMPReply does for the guest: it writes the TX
-   status word 0x0001 into the reply buffer that was just used, which is how the
-   game learns its answer went out, and it consumes the arm (`Reply2 = Reply1;
-   Reply1 = 0`). A game that prepares one answer and then waits to be told it
-   left therefore keeps handing us the *same bytes* forever.
-
-   Mario Kart DS in its room screen is exactly that game. Measured on the live
-   2P MKDS session of 2026-09-25 (v0.1.8o): the host's game asked the same
-   74-byte command 1364 times over ~2s and then deauthed its client, while the
-   client answered every one of those rounds with a byte-identical
-   `fc=0118 body[6]=00 00 5A 5A B8 B6` - the same answer it had prepared
-   before the host's command channel even opened. Nothing about its answer ever
-   moved. With the status word written the guest's game is free to refresh that
-   buffer, and since the arm is left alone (the guest rewrites the address it
-   already registered) the fresh bytes then go out on the next command instead
-   of a blank.
-
-   0 = neither, exactly the behaviour that produced the frozen answer
-   1 = status word and the reply-transferred interrupt (default; the guest's
-       arm is left armed so we can still answer every round)
-   2 = also consume the arm, which is what stock does one round late
-       (measured *alone*, without the interrupt, to make the guest miss the
-       next round: 1645 of 3000 rounds fell back to the firmware's canned
-       reply, and the guest never re-armed) */
-static int mp_early_reply_ack()
+   ON by default (2026-09-28): the stand-in is the one place a value a game
+   reads is neither the peer's game's nor the hardware's, and it was 22% of the
+   guest's answers through a 630s freeze (6267 of 28017, v0.1.9h). The reply
+   registers the game arms (`W_TXSlotReply1`) are latched by the hardware into
+   the slot it transmits (`W_TXSlotReply2`); the game clearing its own slot does
+   not erase the hardware's. `MD_ARM_PERSIST=0` restores the stand-in byte for
+   byte, which is the arm the two earlier runs measured - see history.md
+   v0.1.9i for why the re-measurement under the FCS fix is what the default
+   rests on. */
+static bool arm_persist()
 {
-    static const int mode = []() {
-        const char* v = std::getenv("MD_EARLY_REPLY_ACK");
-        if (!v || !*v) return 1;
-        const int n = atoi(v);
-        if (n < 0) return 0;
-        if (n > 2) return 2;
-        return n;
+    static const bool on = []() {
+        const char* v = std::getenv("MD_ARM_PERSIST");
+        return !(v && *v == '0');
     }();
-    return mode;
+    return on;
 }
+
+/* The receive-side length crop: the *only* place in the delivery path where
+   bytes the sender put in the frame are dropped on purpose. Every game here
+   programs `W_RX_LEN_CROP` to exclude the 4-byte FCS the wireless hardware
+   appends, and the sender's own length entry counts that FCS (GBATEK), so the
+   peer's game reads `frame - 4` and the four bytes it does not read are the
+   sender's FCS slot, not payload - which melonDS's own frame sizes corroborate
+   (`SendMPAck` 32 bytes for a 4-byte body, `SendMPDefaultReply` 28 for an empty
+   one, both with a zeroed tail).
+
+   `MD_RX_NOCROP=1` is the reference arm: it hands the peer's game the whole
+   on-wire length instead (combine with `MD_MP_FCS=0` for the pre-v0.1.9f wire
+   with no crop). Measured on the NSMB route, same save: with the crop the route
+   reaches gameplay; without it the peer's game is handed four bytes more per
+   frame and the two games stop following each other. The crop is load-bearing
+   (history.md v0.1.9s). */
+static bool rx_nocrop()
+{
+    static const bool on = []() {
+        const char* v = std::getenv("MD_RX_NOCROP");
+        return v && *v && (*v != '0');
+    }();
+    return on;
+}
+
+/* The early reply (sending a guest's armed answer inside the round its CMD
+   arrived in, from the W_AIDLow / W_TXSlotReply1 writes) is gone on purpose.
+   Upstream tried it in 8772258f and reverted it in 193c7ed9; this fork
+   restored it and measured what it costs: it answers on the guest's behalf, so
+   the guest's driver never gets the event it is waiting for, and the guest's
+   game is left starved (MKDS's guest arms once for the whole lobby and
+   deauthenticates 4-5s later). It also hides the real question - whether the
+   guest's game has an answer armed at its round boundary - behind a frame the
+   game itself never produced. Stock melonDS's round-end reply is the only
+   path, so every answer on the wire is one a console's own software sent. */
 
 #define IOPORT(x) IO[(x)>>1]
 #define IOPORT8(x) ((u8*)IO)[x]
@@ -390,6 +405,8 @@ void Wifi::Reset()
     //IOPORT(W_BeaconInterval) = 100;
 
     USTimestamp = 0;
+    ClockTicks = 0;
+    ClockLastProbe = 0;
 
     USCounter = 0;
     USCompare = 0;
@@ -413,6 +430,16 @@ void Wifi::Reset()
 
     MPLastSeqno = 0xFFFF;
 
+    MPMYAID = 0;
+    MPArmHeld = false;
+    MPArmSlot = 0;
+    MPArmSerial = 0;
+    MPArmNextSerial = 0;
+    MPArmSeq = 0;
+    MPArmUS = 0;
+    MPArmServedSerial = 0;
+    MPArmServedSeq = 0;
+
     CmdCounter = 0;
 
     USUntilPowerOn = 0;
@@ -422,10 +449,14 @@ void Wifi::Reset()
     NextSync = 0;
     RXTimestamp = 0;
 
-    MPEarlyReplyState = 0;
-    MPEarlyCmdSeq = 0;
-    MPEarlySentSlot = 0;
     MPRXSite = 0;
+
+    /* The flight recorder goes back to zero with everything else, so a digest
+       read after a session starts cannot be from the session before it - and
+       the read recorder with it, for the same reason (a report is read against
+       a session, not against the app's whole lifetime). */
+    MPD = MPDiag{};
+    MPIO = MPIo{};
 
     WifiAP->Reset();
 }
@@ -568,13 +599,22 @@ void Wifi::CheckIRQ(u16 oldflags)
     u16 newflags = IOPORT(W_IF) & IOPORT(W_IE);
 
     if ((oldflags == 0) && (newflags != 0))
+    {
+        /* The wifi block pulling its CPU's interrupt line: the moment a game
+           that is servicing the wifi IRQ would enter its handler. Counted
+           separately from the per-source raises so "the game has been asked
+           N times this window" is not confused with "the block raised N
+           edges". */
+        MPD.irq_cpu_line++;
         NDS.SetIRQ(1, IRQ_Wifi);
+    }
 }
 
 void Wifi::SetIRQ(u32 irq)
 {
     u16 oldflags = IOPORT(W_IF) & IOPORT(W_IE);
 
+    if (irq < 16) MPD.irq_raised[irq]++;
     IOPORT(W_IF) |= (1<<irq);
     CheckIRQ(oldflags);
 }
@@ -605,9 +645,33 @@ void Wifi::SetIRQ14(int source) // 0=USCOMPARE 1=BEACONCOUNT 2=forced
         IOPORT(W_BeaconCount1) = IOPORT(W_BeaconInterval);
 
     if (BlockBeaconIRQ14 && source == 1)
+    {
+        /* The countdown cannot raise IRQ14 while the game has asked to be
+           woken by USCOUNT reaching USCOMPARE instead (bit0 of USCOMPARE0, see
+           the note in the Write handler). That is the shape of a console that
+           belongs to a group: it takes the beacon it just received, adds its
+           offset within the group's beacon schedule, writes that to USCOMPARE
+           and lets the beacon IRQ fire then - which is also the only way this
+           console's *own* beacon ever starts (see the StartTX_Beacon call
+           below). A console that never does this is a console that never
+           announces itself, and the log says so here rather than leaving it to
+           be inferred from a beacon that never goes out. */
+        if (mp_trace())
+            Log(LogLevel::Debug,
+                "[mp] beacon IRQ14 from the countdown is blocked until USCOUNT reaches %llX "
+                "(USCOUNT is %llX): something is scheduling this console's own beacon\n",
+                (unsigned long long)USCompare, (unsigned long long)USCounter);
         return;
+    }
     if (!(IOPORT(W_USCompareCnt) & 0x0001))
+    {
+        if (mp_trace())
+            Log(LogLevel::Debug,
+                "[mp] beacon IRQ14 dropped: USCOMPARE is disabled (USCOMPARECNT=%04X), so no "
+                "beacon can start from here - the game does not want one (source %d)\n",
+                IOPORT(W_USCompareCnt), source);
         return;
+    }
 
     SetIRQ(14);
 
@@ -620,7 +684,14 @@ void Wifi::SetIRQ14(int source) // 0=USCOMPARE 1=BEACONCOUNT 2=forced
     if (IOPORT(W_TXSlotBeacon) & 0x8000)
     {
         StartTX_Beacon();
+        if (mp_trace())
+            Log(LogLevel::Debug, "[mp] beacon started from IRQ14 (source %d): this console is "
+                "announcing itself in its slot\n", source);
     }
+    else if (mp_trace())
+        Log(LogLevel::Debug,
+            "[mp] beacon IRQ14 fired (source %d) with no beacon slot armed (TXSLOTBEACON=%04X): "
+            "this console has nothing to announce itself with\n", source, IOPORT(W_TXSlotBeacon));
 
     if (IOPORT(W_ListenCount) == 0)
         IOPORT(W_ListenCount) = IOPORT(W_ListenInterval);
@@ -637,6 +708,32 @@ void Wifi::SetIRQ15()
     {
         UpdatePowerStatus(1);
     }
+}
+
+void Wifi::SampleMPIrqSnapshot()
+{
+    /* Read-only: every register here is one whose CPU read has no side effect.
+       The ones that do have one (the W_CMDStat halfwords clear themselves, and
+       W_RXBufDataRead advances the read cursor) are deliberately not touched.
+       Called when the digest is exported, so the values are "at digest time"
+       and the counters next to them are "since reset". */
+    MPD.if_now = IOPORT(W_IF);
+    MPD.ie_now = IOPORT(W_IE);
+    MPD.uscntcnt_now = IOPORT(W_USCountCnt);
+    MPD.uscmpcnt_now = IOPORT(W_USCompareCnt);
+    MPD.bcncount1_now = IOPORT(W_BeaconCount1);
+    MPD.bcncount2_now = IOPORT(W_BeaconCount2);
+    MPD.txslot_beacon_now = IOPORT(W_TXSlotBeacon);
+    MPD.txslot_reply1_now = IOPORT(W_TXSlotReply1);
+    MPD.txslot_reply2_now = IOPORT(W_TXSlotReply2);
+    MPD.txbusy_now = IOPORT(W_TXBusy);
+    MPD.txreqread_now = IOPORT(W_TXReqRead);
+    MPD.powerstate_now = IOPORT(W_PowerState);
+    MPD.powertx_now = IOPORT(W_PowerTX);
+    MPD.comstatus_now = (u16)ComStatus;
+    MPD.uscounter_now = USCounter;
+    MPD.uscompare_now = USCompare;
+    MPD.block_beacon_irq14_now = BlockBeaconIRQ14 ? 1 : 0;
 }
 
 
@@ -794,11 +891,74 @@ void Wifi::ReportMPReplyErrors(u16 clientfail)
     }
 }
 
+/* The TX-slot ledger: every slot write (arm, re-arm, clear) and every frame
+   that leaves, so "never relayed" and "relayed but never handed to the peer's
+   game" can be told apart. History, measurements and the audit that consumed
+   it: history.md v0.1.9p. */
+static const char* mp_txslot_name(int num)
+{
+    switch (num)
+    {
+    case 0: return "LOC1";
+    case 1: return "CMD";
+    case 2: return "LOC2";
+    case 3: return "LOC3";
+    case 4: return "BEACON";
+    case 5: return "REPLY";
+    default: return "?";
+    }
+}
+
+/* What a write to a transmit slot means. Bit 15 is the arm bit (the slot is
+   loaded and waiting to be transmitted); without it the slot is disarmed. A
+   re-arm at a *different* buffer address is the game replacing a frame it had
+   queued, which is how a retry looks when the driver rebuilds the frame in
+   between. */
+static const char* mp_txslot_what(u16 val, u16 prev)
+{
+    if (val & 0x8000)
+    {
+        if (!(prev & 0x8000)) return "armed";
+        return ((prev ^ val) & 0x0FFF) ? "re-armed (a new buffer)"
+                                       : "re-armed (the same buffer)";
+    }
+    return (prev & 0x8000) ? "cleared (was armed)" : "cleared (was already clear)";
+}
+
+/* What identifies a frame on the air, and who decides it (history.md v0.1.9v
+   has the sources and the measurements).
+
+   GBATEK: the hardware owns the 802.11 sequence number (`W_TX_SEQNO`
+   "increments on IRQ07" and, when `W_TXBUF_LOCn.Bit13` enables it, replaces the
+   IEEE header's Sequence Control), and it edits only the Sequence Control,
+   `FC.Bit12` and the protocol version - so every *transfer* is a new frame and
+   the Retry bit belongs to the transfer. `TXHDR[04h]` - the byte stock melonDS
+   reads to decide "this buffer was already transmitted" - is the *game's*: 00h
+   use `W_TXSeqNo`, 01h/02h force not to, and "Entries [00h] and [05h] are
+   modified by hardware, all other entries are kept unchanged". Stock reads any
+   nonzero as a retry, and the emulator itself writes that count at the end of
+   every reply transfer, so the flag landed on the second and later use of a
+   reply buffer - making a fresh answer indistinguishable from a retransmission.
+
+   So the reply slot's identity is decided here, and only here: a reply is a new
+   transfer, so it takes a fresh `W_TXSeqNo` value and is never given a
+   synthesized retry marker, whatever the buffer's own bytes say. The buffer's
+   bytes are still written byte-for-byte as stock writes them, because they are
+   load-bearing: two builds that dropped the count parked the NSMB route that
+   plays with it (history.md v0.1.9v). Every other slot keeps stock's rule,
+   where the byte models the games' own retry loops (MKDS's repeated commands,
+   `W_TXSlotCmd` bit 14). */
 void Wifi::TXSendFrame(const TXSlot* slot, int num)
 {
     u32 noseqno = 0;
 
-    if (RAM[slot->Addr + 0x4])
+    if (num == 5)
+    {
+        // the reply slot: always a new transfer, never a retransmission - see
+        // the note above
+        noseqno = 0;
+    }
+    else if (RAM[slot->Addr + 0x4])
     {
         noseqno = 2;
     }
@@ -835,14 +995,45 @@ void Wifi::TXSendFrame(const TXSlot* slot, int num)
 
     memcpy(TXBuffer, &RAM[slot->Addr], 12+len);
 
-    if (noseqno == 2)
+    /* The retry bit is the hardware's own marker for a retransmission *inside*
+       one transfer (the IEEE-header edits hardware does are the Sequence
+       Control value, FC.Bit12 and the protocol version - GBATEK, DS Wifi
+       Hardware Headers). A reply this transport relays is a whole new transfer
+       - the poll it answers is new even when the game has not re-armed the
+       buffer - and it never retransmits a frame inside one, so nothing is
+       synthesized for the reply slot. Stock's coupling (`somebody left that
+       byte nonzero, so this is a retry`) stays for the other slots, where it
+       models the games' own retry loops (MKDS's repeated commands). */
+    if ((noseqno == 2) && (num != 5))
         *(u16*)&TXBuffer[0xC] |= (1<<11);
 
     if (CurChannel == 0) return;
     TXBuffer[9] = CurChannel;
 
+    /* One line per frame that leaves, with the slot registers at that instant,
+       so a frame can be tied to the arm that produced it. The control word is
+       read back out of TXBuffer rather than taken from `framectl`: the no-seqno
+       bit is applied to the buffer above, after `framectl` was read from RAM,
+       so a ledger built on `framectl` reports fc=0118 for frames the wire
+       carries as fc=0918 (history.md v0.1.9p). */
+    if (mp_trace())
+        Log(LogLevel::Debug,
+            "[mp] tx frame: slot %d (%s) fc=%04X%s len=%d seq=%04X bssid=%02X%02X%02X "
+            "· slots beacon %04X cmd %04X reply1 %04X reply2 %04X\n",
+            num, mp_txslot_name(num), *(u16*)&TXBuffer[12],
+            (*(u16*)&TXBuffer[12] == framectl) ? "" : " (of the game's own fc, with no-seqno)",
+            len,
+            (len >= 26) ? *(u16*)&TXBuffer[12 + 22] : 0,
+            TXBuffer[24], TXBuffer[25], TXBuffer[26],
+            IOPORT(W_TXSlotBeacon), IOPORT(W_TXSlotCmd),
+            IOPORT(W_TXSlotReply1), IOPORT(W_TXSlotReply2));
+
     if ((framectl & 0x00FF) == 0x00C0)
+    {
+        MPD.deauth_sent++;
+        MPD.last_deauth_reason = (len >= 26) ? *(u16*)&TXBuffer[12 + 24] : 0;
         mp_trace_deauth("sent", &TXBuffer[12], len);
+    }
 
     switch (num)
     {
@@ -855,15 +1046,69 @@ void Wifi::TXSendFrame(const TXSlot* slot, int num)
 
     case 1:
         *(u16*)&TXBuffer[12 + 24+2] = MPClientMask;
+        /* The host's side of the conversation, recorded at the one place a
+           command frame actually leaves: how many, how many of them repeated
+           the previous seqno (the game's own retry loop), and the body. */
+        {
+            const u16 cmdseq = *(u16*)&TXBuffer[12 + 22];
+            if ((MPD.cmds_tx > 0) && (cmdseq == MPD.last_cmd_seq)) MPD.cmds_tx_dup++;
+            MPD.cmds_tx++;
+            MPD.last_cmd_seq = cmdseq;
+            MPD.last_cmd_us = USTimestamp;
+            mp_record_body(MPD.last_cmd_body, &MPD.last_cmd_len, &TXBuffer[12 + 24], len - 24);
+        }
         Platform::MP_SendCmd(TXBuffer, 12+len, USTimestamp, NDS.UserData);
         break;
 
     case 5:
+        /* Stock's count, kept exactly as stock writes it (the buffer's bytes are
+           load-bearing - see the note above TXSendFrame); what the count no
+           longer does is decide the frame's identity. */
         IncrementTXCount(slot);
-        Platform::MP_SendReply(TXBuffer, 12+len, USTimestamp, IOPORT(W_AIDLow), NDS.UserData);
+        MPD.answers_sent++;
+        MPD.last_answer_us = USTimestamp;
+        mp_record_body(MPD.last_answer_body, &MPD.last_answer_len, &TXBuffer[12 + 24], len - 24);
+        /* The answer's identity next to the arm it came from, so the mapping
+           "round -> arm -> frame -> delivered answer" reads off the log rather
+           than off the interleaving of two console threads' lines. `arm=#0` is
+           a round the game armed nothing for, i.e. the firmware's stand-in. */
+        if (mp_trace())
+        {
+            char hexbody[3 * 16 + 1];
+            Log(LogLevel::Debug,
+                "[mp] answer sent: frame seq=%04X arm=#%llu armed in round seq %04X, "
+                "%d byte frame, body[%d]=%s\n",
+                (len >= 24) ? *(u16*)&TXBuffer[12 + 22] : 0,
+                (unsigned long long)MPArmServedSerial, MPArmServedSeq,
+                len, (int)MPD.last_answer_len,
+                mp_body_hex(MPD.last_answer_body, (int)MPD.last_answer_len, hexbody, sizeof(hexbody)));
+        }
+        /* The AID stamped on the answer is the association's, not the live
+           register's: MKDS clears `W_AIDLow` in the same cycle it arms, the
+           live register reads 0 here, and the host indexes its per-client
+           buffer with it (`packets[(aid-1)*1024]`, LocalMP::RecvReplies) - a
+           wild write that segfaulted the app on the first live run of this
+           path (2026-09-27). */
+        Platform::MP_SendReply(TXBuffer, 12+len, USTimestamp, MPReplyAID(), NDS.UserData);
         break;
 
     case 4:
+        /* The beacon (TXSlots[4], W_TXSlotBeacon). The one field this console
+           writes into the game's own frame is the 8-byte timestamp at payload
+           offset 0, the field the hardware owns; the interval, capability and
+           every IE are the game's (2026-09-27). */
+        if (mp_trace() && len >= 24)
+        {
+            const int pl = len - 24;
+            Log(LogLevel::Debug,
+                "[mp] beacon out: %d byte frame, fc=%04X dest=%02X%02X%02X%02X%02X%02X, "
+                "seq=%04X, %d byte payload (interval %04X capability %04X)\n",
+                len, *(u16*)&TXBuffer[12], TXBuffer[16], TXBuffer[17], TXBuffer[18],
+                TXBuffer[19], TXBuffer[20], TXBuffer[21], *(u16*)&TXBuffer[12 + 22], pl,
+                (pl >= 10) ? *(u16*)&TXBuffer[12 + 24 + 8] : 0,
+                (pl >= 12) ? *(u16*)&TXBuffer[12 + 24 + 10] : 0);
+        }
+
         *(u64*)&TXBuffer[0xC + 24] = USCounter;
         Platform::MP_SendPacket(TXBuffer, 12+len, USTimestamp, NDS.UserData);
         break;
@@ -1032,129 +1277,55 @@ void Wifi::SendMPDefaultReply()
     *(u16*)&reply[0xC + 0x16] = IOPORT(W_TXSeqNo) << 4;
     *(u32*)&reply[0xC + 0x18] = 0;
 
-    int txlen = Platform::MP_SendReply(reply, 12+28, USTimestamp, IOPORT(W_AIDLow), NDS.UserData);
+    MPD.answers_canned++;
+    MPD.last_answer_us = USTimestamp;
+    mp_record_body(MPD.last_answer_body, &MPD.last_answer_len, &reply[12 + 24], 28 - 24);
+
+    /* The same identity line as a real answer carries (TXSendFrame, case 5),
+       with `arm=#0` because there was no arm to send: this round's answer is
+       the firmware's stand-in, and the two must be told apart on the record,
+       not by the shape of the frame. */
+    if (mp_trace())
+    {
+        char hexbody[3 * 16 + 1];
+        Log(LogLevel::Debug,
+            "[mp] answer sent: frame seq=%04X arm=#0 (the firmware's stand-in), "
+            "28 byte frame, body[4]=%s\n",
+            *(u16*)&reply[12 + 22],
+            mp_body_hex(MPD.last_answer_body, (int)MPD.last_answer_len, hexbody, sizeof(hexbody)));
+    }
+    MPArmServedSerial = 0;
+    MPArmServedSeq = 0;
+
+    int txlen = Platform::MP_SendReply(reply, 12+28, USTimestamp, MPReplyAID(), NDS.UserData);
     WIFI_LOG("wifi: sent %d/40 bytes of MP default reply\n", txlen);
 }
 
-/* Sends this round's answer as soon as the guest has armed one, instead of
-   waiting for the round to end (see mp_early_reply above for the why).
+/* The answer a CMD frame is answered with, and where it comes from.
 
-   Called from the CMD-arrival point and from the two writes a guest uses to
-   arm its answer (W_AIDLow and W_TXSlotReply1). The frame goes straight to the
-   bus, bypassing the TX slot's sequence/retry bookkeeping on purpose - the
-   round-end path in FinishRX still runs it, so the hardware's view of the
-   transfer is unchanged, it just must not send a second frame
-   (MPEarlyReplyState == 2). */
-void Wifi::SendMPEarlyReply()
+   Stock answers a client's poll out of the reply slot as it stands when the
+   CMD finishes arriving - a moment the game has not reached yet, because the
+   frame's interrupt has not run. Measured on MKDS (2026-09-27): the driver arms
+   its next answer from inside the handler for the *previous* poll and clears
+   the slot again before that round ends, so it armed 5027 times for 5028 polls
+   and only 2045 were answered. The answer is therefore *held* from the round it
+   was armed in until the poll it answers (MPArmSlot/MPArmHeld), and the only
+   window accepted is the game's own arm - never a firmware default frame.
+
+   What must not change is *when* the game sees the slot consumed: taking the
+   answer as it lands starves the driver (that session armed 16 times in total
+   and then only cleared for the remaining 738 polls). Held to the poll instead,
+   it armed once per poll for all 5028 of them. */
+u16 Wifi::MPReplyAID()
 {
-    if (!mp_early_reply()) return;
-    if (MPEarlyReplyState != 1) return;
-    if (!IsMPClient) return;
-
-    u16 clienttime = *(u16*)&RXBuffer[0xC + 24];
-    u16 clientmask = *(u16*)&RXBuffer[0xC + 26];
-
-    if (!IOPORT(W_AIDLow)) return;
-    if (!(clientmask & (1 << IOPORT(W_AIDLow)))) return;
-    if (!(IOPORT(W_TXSlotReply1) & 0x8000)) return;
-
-    const u16 replyslot = IOPORT(W_TXSlotReply1);
-    u16 addr = (replyslot & 0x0FFF) << 1;
-    u16 len = *(u16*)&RAM[addr + 0xA] & 0x3FFF;
-
-    // the packet is entirely ignored if it lasts longer than the maximum reply time
-    if ((PreambleLen(2) + ((u32)len * 4)) > clienttime) return;
-
-    /* The guest's frame goes out verbatim, so the answer the host reads is
-       exactly the bytes the guest wrote - only the channel byte is stamped in,
-       the same as TXSendFrame does, because the virtual air is
-       channel-transparent but the frame is not. Slot 5's sequence number and
-       TX count bookkeeping is skipped for this round too (see the FinishRX
-       side): running it is what made the guest's next arm land late. */
-    if (CurChannel == 0) return;
-
-    u16 rxrate = *(u16*)&RXBuffer[6];
-    u16 rxlen = *(u16*)&RXBuffer[8];
-
-    memcpy(TXBuffer, &RAM[addr], 12 + len);
-    TXBuffer[9] = CurChannel;
-
-    // the answer belongs to the round that carried the command, so it is
-    // timestamped to the end of that frame's reception
-    u64 ts = RXTimestamp + (rxlen * (rxrate == 0x14 ? 4 : 8));
-    Platform::MP_SendReply(TXBuffer, 12 + len, ts, IOPORT(W_AIDLow), NDS.UserData);
-    MPEarlyReplyState = 2;
-    MPEarlySentSlot = replyslot;
-
-    /* Tell the guest's game its answer left, the way the hardware does.
-
-       Two halves, and both are needed. The status word (stock writes it too,
-       one round late, at the top of SendMPReply) marks the buffer as sent; the
-       *completion* below is the interrupt the guest's game actually arms its
-       next answer on (stock's reply-slot completion in ProcessTX, num==5: IRQ1
-       with W_TXStat=0x0401 when W_TXStatCnt bit 12 is set, plus the RF status
-       and the reply's TXBusy bit). Sending the answer early skipped the whole
-       slot-5 transfer, and with it every one of those effects: the guest's
-       game was never interrupted, armed one answer, and then slept.
-
-       Measured 2026-09-25: a *working* NSMB session wrote W_TXSlotReply1
-       exactly once in 3000 frames, and in a live MKDS session that single
-       armed answer was served for 1368 rounds while the host's game asked the
-       same command 1364 times and deauthed it at 2.1s. */
-    const int ackmode = mp_early_reply_ack();
-    if (ackmode >= 1)
-    {
-        *(u16*)&RAM[addr] = 0x0001;
-
-        if (IOPORT(W_TXStatCnt) & 0x1000)
-        {
-            IOPORT(W_TXStat) = 0x0401;
-            SetIRQ(1);
-        }
-        SetStatus(1);
-        IOPORT(W_TXBusy) &= ~0x80;
-
-        if (ackmode >= 2 && IOPORT(W_TXSlotReply1) == MPEarlySentSlot)
-            IOPORT(W_TXSlotReply1) = 0;
-    }
-
-    {
-        static bool ackreported = false;
-        if (!ackreported)
-        {
-            ackreported = true;
-            const u16 statcnt = IOPORT(W_TXStatCnt);
-            Log(LogLevel::Info,
-                "[mp] early replies complete the guest's reply the way the hardware does "
-                "(TX status word + W_TXStat=0401/IRQ1, MD_EARLY_REPLY_ACK=%d). W_TXStatCnt=%04X, "
-                "so this guest's game %s told its answer went out\n",
-                ackmode, statcnt,
-                (statcnt & 0x1000) ? "is" : "is NOT (bit 12 clear) - it cannot");
-        }
-    }
-
-    if (mp_trace())
-    {
-        /* The body, not just the length: the host's game reads these bytes, so
-           the other two views of this answer (`collected a reply` in the reply
-           queue, and `handing client N's reply to the console's game` on the
-           host) are only comparable to it if it is printed. */
-        char body[3 * 16 + 1] = "-";
-        const int bodylen = (int)len - 24;
-        if (bodylen > 0)
-        {
-            const int n = (bodylen > 16) ? 16 : bodylen;
-            for (int i = 0; i < n; i++)
-                snprintf(&body[i * 3], 4, "%02X ", TXBuffer[12 + 24 + i]);
-            body[n * 3 - 1] = 0;
-        }
-
-        Log(LogLevel::Debug,
-            "[mp] answered cmd seq=%04X in the same round: the guest armed its reply while the "
-            "command was arriving, so the host is not left with a blank (AID %d, mask %04X, "
-            "%d byte frame, fc=%04X, body[%d]=%s)\n",
-            MPEarlyCmdSeq, IOPORT(W_AIDLow), clientmask, len, *(u16*)&TXBuffer[12], bodylen, body);
-    }
+    /* The AID this console answers as. `MPMYAID` (the association) first: the
+       live register is 0 in the window MKDS arms its next answer in, and a
+       reply stamped AID 0 is a wild write on the host (see TXSendFrame, case
+       5). The register is still the answer when no association was seen, which
+       is what stock used for every reply. */
+    if (stock_mp()) return IOPORT(W_AIDLow) & 0x000F;
+    if (MPMYAID) return MPMYAID;
+    return IOPORT(W_AIDLow) & 0x000F;
 }
 
 void Wifi::SendMPReply(u16 clienttime, u16 clientmask)
@@ -1165,12 +1336,17 @@ void Wifi::SendMPReply(u16 clienttime, u16 clientmask)
     //if (slot->Valid)
     if (IOPORT(W_TXSlotReply2) & 0x8000)
         *(u16*)&RAM[slot->Addr] = 0x0001;
-
     // CHECKME!!
     // can the transfer rate for MP replies be set, or is it determined from the CMD transfer rate?
     // how does it work for default empty replies?
     slot->Rate = 2;
 
+    /* The hardware's own latch, on the ledger like every game write to a slot
+       (2026-09-28): this is what puts the game's answer where the transmit
+       machinery reads it, and the game's own slot is cleared beside it. */
+    if (mp_trace())
+        Log(LogLevel::Debug, "[mp] txslot REPLY2 <- %04X (the hardware's latch of REPLY1), "
+            "REPLY1 <- 0000\n", IOPORT(W_TXSlotReply1));
     IOPORT(W_TXSlotReply2) = IOPORT(W_TXSlotReply1);
     IOPORT(W_TXSlotReply1) = 0;
 
@@ -1193,21 +1369,17 @@ void Wifi::SendMPReply(u16 clienttime, u16 clientmask)
 
     // this seems to be set upon IRQ0
     // TODO: how does it behave if the packet addr is changed before it gets sent? (maybe just not possible)
-    // if the answer already left while the command was arriving, this round
-    // still does the hardware's bookkeeping but must not send a second frame
-    const bool already_sent = (MPEarlyReplyState == 2);
-
     if (slot->Valid)
     {
         slot->CurPhase = 0;
 
-        if (!already_sent) TXSendFrame(slot, 5);
+        TXSendFrame(slot, 5);
     }
     else
     {
         slot->CurPhase = 10;
 
-        if (!already_sent) SendMPDefaultReply();
+        SendMPDefaultReply();
     }
 
     u16 clientnum = 0;
@@ -1220,8 +1392,6 @@ void Wifi::SendMPReply(u16 clienttime, u16 clientmask)
     slot->CurPhaseTime = 16 + ((clienttime + 10) * clientnum) + PreambleLen(slot->Rate);
 
     IOPORT(W_TXBusy) |= 0x0080;
-
-    MPEarlyReplyState = 0;
 }
 
 void Wifi::SendMPAck(u16 cmdcount, u16 clientfail)
@@ -1270,6 +1440,9 @@ void Wifi::SendMPAck(u16 cmdcount, u16 clientfail)
     }
 
     int txlen = Platform::MP_SendAck(ack, 12+32, USTimestamp, NDS.UserData);
+    MPD.acks_sent++;
+    if (clientfail) MPD.acks_client_fail++;
+    MPD.last_ack_clientfail = clientfail;
     WIFI_LOG("wifi: sent %d/44 bytes of MP ack, %d %d\n", txlen, ComStatus, RXTime);
 }
 
@@ -1562,11 +1735,22 @@ void Wifi::StartRX()
         RXHalfwordTimeMask = 0xF & kTimeCheckMask;
     }
 
-    u16 addr = IOPORT(W_RXBufWriteCursor) << 1;
+    const u16 zone_start = (u16)((IOPORT(W_RXBufWriteCursor) << 1) & 0x1FFE);
+    u16 addr = zone_start;
     IncrementRXAddr(addr, 12);
     IOPORT(W_RXTXAddr) = addr >> 1;
 
     RXBufferPtr = 12;
+
+    /* Every delivery to this console's own software names the region the game
+       is about to read out of the wireless RAM window, so the read recorder
+       can keep the halfwords it takes out of it, in order. The 12-byte RX
+       header the hardware wrote sits at the region's head (the command path
+       writes it in CheckRX; the reply handoff does not, which is one of the
+       things the report exists to show). */
+    SetMPIoZone(zone_start, (u16)((12 + framelen < 0x1FFF) ? 12 + framelen : 0x1FFE),
+                (framelen >= 26) ? *(u16*)&RXBuffer[12] : 0,
+                (framelen >= 26) ? *(u16*)&RXBuffer[12 + 22] : 0, false);
 
     SetIRQ(6);
     SetStatus(6);
@@ -1594,6 +1778,39 @@ void Wifi::StartRX()
             rxstart, framelen, fc,
             (IsMPClient || IsMP) ? (IsMPClient ? "as an MP client" : "as an MP host") : "outside multiplayer",
             sites[(MPRXSite >= 0 && MPRXSite <= 5) ? MPRXSite : 0]);
+
+        /* The big broadcasts need their contents on the record *in full*:
+           MKDS's host announces its group state in a 120-byte fc=0080 broadcast
+           every ~217ms, and in every run so far the guest's game leaves within
+           ~20ms of being handed one (2026-09-26, and again on the host's
+           115th beacon of the 2026-09-27 session, 7s after the VS tap). Which
+           field it refuses cannot be read off the first 48 bytes: the member
+           table lives in the 52-byte vendor IE that starts at payload offset
+           26, so the whole payload has to be on the record, in numbered lines,
+           for the lobby beacon and the one that precedes the deauth to be
+           compared byte for byte. */
+        if (framelen >= 48)
+        {
+            const int total = framelen - 24;
+            for (int off = 0; off < total; off += 48)
+            {
+                int n = total - off;
+                if (n > 48) n = 48;
+                if (12 + 24 + off + n > (int)sizeof(RXBuffer)) break;
+
+                char hex[3 * 48 + 1];
+                char text[49];
+                for (int i = 0; i < n; i++)
+                {
+                    u8 b = RXBuffer[12 + 24 + off + i];
+                    snprintf(&hex[i * 3], 4, " %02X", b);
+                    text[i] = (b >= 32 && b < 127) ? (char)b : '.';
+                }
+                text[n] = 0;
+                Log(LogLevel::Debug, "[mp]   body[%d..%d]%s  text \"%s\"\n",
+                    off, off + n - 1, hex, text);
+            }
+        }
     }
 }
 
@@ -1665,6 +1882,28 @@ void Wifi::FinishRX()
             {
                 if (!(rxflags & 0x8000))
                 {
+                    /* A beacon whose BSSID is not ours. On a console that has
+                       been associated with a group this is the client's beacon
+                       sync being skipped: the branch at the end of this
+                       function that copies the beacon's timestamp into USCOUNT
+                       only runs for our own BSSID, and a client that does not
+                       take it cannot schedule its own beacon either (see
+                       SetIRQ14). The host's beacon is the only beacon on this
+                       bus, so a client that logs this line is being offered
+                       the host's beacon and refusing it. */
+                    if (mp_trace() && (IsMPClient || MPMYAID))
+                    {
+                        const u8* ours = GetBSSID();
+                        Log(LogLevel::Debug,
+                            "[mp] beacon from another BSSID (%02X:%02X:%02X:%02X:%02X:%02X, ours "
+                            "%02X:%02X:%02X:%02X:%02X:%02X): USCOUNT is not synced to it%s\n",
+                            RXBuffer[12 + 16], RXBuffer[12 + 17], RXBuffer[12 + 18],
+                            RXBuffer[12 + 19], RXBuffer[12 + 20], RXBuffer[12 + 21],
+                            ours[0], ours[1], ours[2], ours[3], ours[4], ours[5],
+                            (IOPORT(W_RXFilter) & (1<<0)) ? "" : " (and RXFilter bit 0 is clear, "
+                            "so the frame is dropped right here)");
+                    }
+
                     if (!(IOPORT(W_RXFilter) & (1<<0)))
                         return;
                 }
@@ -1867,22 +2106,89 @@ void Wifi::FinishRX()
     {
         // build the RX header
 
+        const u16 rxzone_start = (u16)((IOPORT(W_RXBufWriteCursor) << 1) & 0x1FFE);
+        const int rxlen = (int)(*(u16*)&RXBuffer[8]); // the length the header below hands the game
+
+        /* The 12-byte hardware RX header, per GBATEK's "Hardware RX Header
+           (RXHDR)" table: flags (bits0-3 frame type), unknown, *unchanged*,
+           transfer rate, length, MAX/MIN RSSI.
+
+           Offset `+4` is NOT written here on purpose - GBATEK records it as
+           "not updated by hardware, contains old Wifi RAM content", and that is
+           a decision, not an oversight: the v0.1.9i read recorder caught both
+           games reading it (host `17DC`, guest `0FCC` in one parked round) and
+           then consuming the whole body anyway, so the field does not gate
+           consumption. Upstream melonDS skips the halfword identically
+           (`IncrementRXAddr(headeraddr, 4)`) and no version of this fork has
+           ever had a value for it; writing an invented one would be the one
+           thing the record rules out. */
         u16 headeraddr = IOPORT(W_RXBufWriteCursor) << 1;
         *(u16*)&RAM[headeraddr] = rxflags;
         IncrementRXAddr(headeraddr);
-        *(u16*)&RAM[headeraddr] = 0x0040; // ???
-        IncrementRXAddr(headeraddr, 4);
+        *(u16*)&RAM[headeraddr] = 0x0040; // 0040h = Normal (see the table above)
+        IncrementRXAddr(headeraddr, 4); // +4: left as it stands, per GBATEK
         *(u16*)&RAM[headeraddr] = *(u16*)&RXBuffer[6]; // TX rate
         IncrementRXAddr(headeraddr);
         *(u16*)&RAM[headeraddr] = *(u16*)&RXBuffer[8]; // frame length
         IncrementRXAddr(headeraddr);
-        *(u16*)&RAM[headeraddr] = 0x4080; // RSSI
+        *(u16*)&RAM[headeraddr] = 0x4080; // MAX RSSI 80h, MIN RSSI 40h
 
         // signal successful reception
 
         u16 addr = IOPORT(W_RXTXAddr) << 1;
         if (addr & 0x2) IncrementRXAddr(addr);
         IOPORT(W_RXBufWriteCursor) = (addr & ~0x3) >> 1;
+
+        /* What this console's own game is about to be offered, in its terms:
+           the 12-byte header the hardware just wrote at the write cursor and
+           the frame behind it. A CMD frame is where the guest's side of a
+           failed handshake has to be read, because the header is what the game
+           matches on (frame control, length, the `0x0040` word) and the payload
+           behind it is what it has to recognise as a state it can adopt. The
+           write cursor can advance by a halfword between frames, so the region
+           is recorded for `Read` to match the game's own reads against. */
+        /* The region the game is about to be handed, with this round's
+           identity: the recorder keeps what the game reads out of it (see
+           MPIo), and the trace below names the frame for the log. */
+        {
+            const int zlen = 12 + rxlen;
+            SetMPIoZone(rxzone_start, (u16)((zlen < 0x1FFF) ? zlen : 0x1FFE),
+                        (u16)((rxlen >= 26) ? *(u16*)&RXBuffer[12] : 0), seqno, mpcmd != 0);
+        }
+
+        if (mp_trace() && mpcmd)
+        {
+            const u16 z = rxzone_start;
+
+            char hdr[5 * 6 + 1] = "-";
+            for (int i = 0; i < 6; i++)
+                snprintf(&hdr[i * 5], 6, "%04X ", *(u16*)&RAM[(z + (i * 2)) & 0x1FFE]);
+            hdr[6 * 5 - 1] = 0;
+
+            /* The frame itself sits behind the 12-byte header as the console's
+               own copy of it: a 24-byte 802.11 header and then the payload, so
+               the payload the game matches on is at +12+24. */
+            char pay[3 * 16 + 1] = "-";
+            const int paylen = (rxlen > 24) ? (rxlen - 24) : 0;
+            const int payn = (paylen > 16) ? 16 : paylen;
+            for (int i = 0; i < payn; i++)
+                snprintf(&pay[i * 3], 4, "%02X ", RAM[(z + 12 + 24 + i) & 0x1FFF]);
+            if (payn > 0) pay[payn * 3 - 1] = 0;
+
+            const u16 liveaid = IOPORT(W_AIDLow) & 0x000F;
+            const u16 cmdmask = *(u16*)&RXBuffer[0xC + 26];
+
+            Log(LogLevel::Debug,
+                "[mp] cmd seq=%04X offered to this console's game: rxflags=%04X, %d byte "
+                "802.11 frame, header[%s] at %04X, payload@24[%s], clienttime %d, mask %04X, "
+                "AID %d (associated %d: %s)%s\n",
+                seqno, rxflags, rxlen, hdr, rxzone_start, pay,
+                *(u16*)&RXBuffer[0xC + 24], cmdmask,
+                liveaid, MPMYAID,
+                (liveaid && (cmdmask & (1 << liveaid))) ? "this poll is ours"
+                                                       : "this poll is NOT ours",
+                cmd_dupe ? ", a repeat of the previous seqno" : "");
+        }
 
         SetIRQ(0);
     }
@@ -1892,25 +2198,63 @@ void Wifi::FinishRX()
         // reply to CMD frames
 
         u16 clientmask = *(u16*)&RXBuffer[0xC + 26];
-        if (MPEarlyReplyState == 2)
+
+        /* The AID that decides whether this poll is ours is the one this
+           console is associated with. `W_AIDLow` is asked first, because that
+           is stock melonDS and it is right whenever the game is holding the
+           register up - but MKDS's driver clears it as part of the same
+           handler that arms the next answer, and taking that transient as
+           "this console is not addressed" threw away 75% of a live session's
+           rounds before this (see the note above MPReplyAID). */
+        u16 myaid = IOPORT(W_AIDLow) & 0x000F;
+        if (!myaid && !stock_mp()) myaid = MPMYAID;
+
+        if (myaid && (clientmask & (1 << myaid)))
         {
-            /* The answer already left while the command was arriving, so this
-               round has nothing to send - neither the reply nor the blank the
-               AID gate below would send. Deliberately nothing else either:
-               letting the round-end path run for the bookkeeping as upstream's
-               version did (consume the arm, run slot 5's transfer) was measured
-               to make the guest's *next* arm miss its round - 734 of 2504
-               rounds fell back to the firmware's canned `fc=0158` stand-in,
-               against zero when the early send owns the round. */
-        }
-        else if (IOPORT(W_AIDLow) && (clientmask & (1 << IOPORT(W_AIDLow))))
-        {
+            /* The arm the game made for this poll, held since it was written
+               (see the note above MPReplyAID). Taken here, not when it was
+               written, because this is when the game's driver expects the slot
+               consumed, and one arm answers exactly one poll; a poll addressed
+               elsewhere leaves it alone. With no arm held the poll falls
+               through to `SendMPDefaultReply`, whose `00 00 00 00` body
+               asserts a state the peer's game never reported - 22% of the
+               guest's answers through the MKDS freeze (2026-09-28), which is
+               what the arm_persist() default above is about. */
+            const bool live = (IOPORT(W_TXSlotReply1) & 0x8000) != 0;
+            const bool held = !stock_mp() && MPArmHeld && !live;
+            if (held)
+                IOPORT(W_TXSlotReply1) = MPArmSlot;
+            if (stock_mp() || !arm_persist())
+                MPArmHeld = false;
+            MPArmServedSerial = MPArmSerial;
+            MPArmServedSeq = MPArmSeq;
+
+            /* Which arm this poll took, and when the game made it. A game that
+               is following the session arms a fresh answer every round, so the
+               round of the arm and the round of the poll it answers are one
+               apart - an arm from further back is the arm of an earlier poll,
+               which means the host is being answered with the state the guest's
+               game held *before* the command it is answering (2026-09-28). */
             if (mp_trace())
                 Log(LogLevel::Debug,
-                    "[mp] answering cmd seq=%04X: AID %d, host mask %04X, clienttime %d, dupe %d, my clock %llu\n",
-                    seqno, IOPORT(W_AIDLow), clientmask, *(u16*)&RXBuffer[0xC + 24],
-                    cmd_dupe, (unsigned long long)USTimestamp);
+                    "[mp] answering cmd seq=%04X: AID %d, host mask %04X, clienttime %d, "
+                    "my clock %llu, %s (arm #%llu, armed in round seq %04X, %llu us before "
+                    "this poll)\n",
+                    seqno, MPMYAID, clientmask, *(u16*)&RXBuffer[0xC + 24],
+                    (unsigned long long)USTimestamp,
+                    held ? "the answer the game armed for this poll, held across its own clear" :
+                    (live ? "already in the reply slot at the poll"
+                          : "nothing armed: the firmware's own reply"),
+                    (unsigned long long)MPArmSerial, MPArmSeq,
+                    (unsigned long long)(USTimestamp - MPArmUS));
 
+            /* Stock's own reply path, unchanged - including what it does when
+               the slot is not armed: send the firmware's reply (`fc=0158`) far
+               enough into the round for the host's collection to credit it.
+               Never silence: the host's game counts an unanswered poll as a
+               failed client, and 1932 of those in one session is what put
+               "Communication error. Press the A Button." on both screens even
+               though the link itself never dropped a frame. */
             SendMPReply(*(u16*)&RXBuffer[0xC + 24], clientmask);
         }
         else
@@ -1920,22 +2264,15 @@ void Wifi::FinishRX()
             // in the case this client wasn't ready to send a reply
             // TODO: also send this if we have RX disabled
 
-            /* Worth knowing when a join fails: a blank is a zero length frame,
-               and the host's reply collection credits a client only for a
-               packet with a payload (`if (pktheader.Length)` in
-               LocalMP::RecvReplies), so this keeps the host from stalling but
-               still leaves it reporting this client as failed in its ack. It
-               is therefore not evidence of the link being healthy. */
             if (mp_trace())
                 Log(LogLevel::Debug,
                     "[mp] BLANK reply to cmd seq=%04X: AID %d, host mask %04X, not addressed to us "
                     "(mask bit %d) - the host hears silence and counts a failed reply\n",
                     seqno, IOPORT(W_AIDLow), clientmask, IOPORT(W_AIDLow));
 
+            MPD.answers_blank++;
             Platform::MP_SendReply(nullptr, 0, USTimestamp, 0, NDS.UserData);
         }
-
-        MPEarlyReplyState = 0;
     }
     else if ((rxflags & 0x800F) == 0x8001)
     {
@@ -1950,8 +2287,110 @@ void Wifi::FinishRX()
         u64 timestamp = *(u64*)&RXBuffer[12 + 24];
         timestamp += (u64)len;
 
+        const u64 before = USCounter;
         USCounter = timestamp;
+
+        /* This is the client's only source of the host's clock, and the value
+           the game then schedules its own beacon against (see SetIRQ14 and the
+           USCOMPARE0 write). Logging it separates a client that is being
+           synced and doing nothing about it from one that is never synced at
+           all - which is a BSSID mismatch, logged where the beacon arrives. */
+        if (mp_trace())
+            Log(LogLevel::Debug,
+                "[mp] beacon accepted (our BSSID): USCOUNT %llX -> %llX, the beacon's own "
+                "timestamp + %u cycles\n",
+                (unsigned long long)before, (unsigned long long)timestamp, len);
     }
+}
+
+/* See SetMPProbe in Wifi.h. Diagnostics only, and never on the wire: both call
+   sites hand it the frame the console's own game is about to read, so a probe
+   can change what a game sees but never what a console sends. */
+void Wifi::SetMPProbe(int kind, int value, const u8* body, int bodylen)
+{
+    /* Arm with the probe *off* and switch it on last. This runs on the control
+       thread while the emulation thread is in MPClientReplyRX, and arming the
+       kind first left a live window in which the new kind was already armed
+       against the *previous* probe's bytes: one delivery would then carry the
+       wrong body and still be counted against the probe being set. */
+    MPProbeKind = 0;
+    MPProbeLeft = value;
+    MPProbeBodyLen = 0;
+    MPProbeLogged = false;
+
+    if (kind == 1 && body && bodylen > 0)
+    {
+        int n = (bodylen > (int)sizeof(MPProbeBody)) ? (int)sizeof(MPProbeBody) : bodylen;
+        if (n > 16) n = 16;
+        MPProbeBodyLen = n;
+        memcpy(MPProbeBody, body, (size_t)MPProbeBodyLen);
+    }
+
+    /* A body probe with no body is nothing to run, and a probe with no
+       deliveries left is the same as no probe. `value` <= 0 means "until
+       cleared" and is stored as -1, because the hook tests `!= 0` to decide
+       whether a probe is live - arming one with 0 was accepted and then never
+       fired once, which is what the first probe runs of 2026-09-28 recorded. */
+    if (kind == 1 && MPProbeBodyLen > 0)
+    {
+        if (MPProbeLeft <= 0) MPProbeLeft = -1;
+        MPProbeKind = 1;
+    }
+
+    if (mp_trace())
+        Log(LogLevel::Debug,
+            "[mp] probe set: kind %d, %d deliveries, %d body bytes, %llu applied so far\n",
+            MPProbeKind, MPProbeLeft, MPProbeBodyLen,
+            (unsigned long long)MPProbeApplied);
+}
+
+/* The probe's hook (see SetMPProbe): `framelen` is the 802.11 length of the
+   reply already sitting at `RXBuffer[12]`, FCS cropped. Nothing here changes
+   what the peer's game sent - the wire still carries the peer's own bytes - and
+   the line is written once per arm rather than once per delivery: with one cell
+   armed for a whole run, sixty identical lines a second say nothing the
+   `applied` counter does not. A frame with no body behind its header (a blank
+   or cropped reply) leaves the probe armed and waits for one that has. */
+void Wifi::MPProbeBodyHook(int framelen)
+{
+    if (MPProbeKind != 1 || MPProbeLeft == 0) return;
+
+    const int bodylen = framelen - 24;
+    const int n = (MPProbeBodyLen < bodylen) ? MPProbeBodyLen : bodylen;
+    if (n <= 0) return;
+
+    /* What the peer's own game said this round, kept before the override: it is
+       the baseline the injected bytes are read against. */
+    u8 peer[16] {};
+    const int pn = (n > 16) ? 16 : n;
+    memcpy(peer, &RXBuffer[12 + 24], (size_t)pn);
+    memcpy(&RXBuffer[12 + 24], MPProbeBody, (size_t)pn);
+
+    MPProbeApplied++;
+    if (MPProbeLeft > 0) MPProbeLeft--;
+    if (MPProbeLeft == 0) MPProbeKind = 0;
+
+    if (mp_trace() && !MPProbeLogged)
+    {
+        MPProbeLogged = true;
+        char cellhex[3 * 16 + 1] = "-";
+        char said[3 * 16 + 1] = "-";
+        for (int i = 0; i < pn; i++) snprintf(&cellhex[i * 3], 4, "%02X ", MPProbeBody[i]);
+        for (int i = 0; i < pn; i++) snprintf(&said[i * 3], 4, "%02X ", peer[i]);
+        cellhex[pn * 3 - 1] = 0;
+        said[pn * 3 - 1] = 0;
+        Log(LogLevel::Debug,
+            "[mp] probe applied: inject [%s] over the peer's [%s] (%d of %d body bytes), "
+            "applied %llu\n",
+            cellhex, said, pn, bodylen, (unsigned long long)MPProbeApplied);
+    }
+}
+
+void Wifi::GetMPProbe(int* kind, int* left, u64* applied) const
+{
+    if (kind) *kind = MPProbeKind;
+    if (left) *left = MPProbeLeft;
+    if (applied) *applied = MPProbeApplied;
 }
 
 void Wifi::MPClientReplyRX(int client)
@@ -1977,10 +2416,13 @@ void Wifi::MPClientReplyRX(int client)
     u16 framectl = *(u16*)&reply[12];
     if (framectl & (1<<14))
     {
-        framelen -= (IOPORT(W_RXLenCrop) >> 7) & 0x1FE;
-        if (framelen > 24) memmove(&RXBuffer[12+24], &RXBuffer[12+28], framelen);
+        if (!rx_nocrop())
+        {
+            framelen -= (IOPORT(W_RXLenCrop) >> 7) & 0x1FE;
+            if (framelen > 24) memmove(&RXBuffer[12+24], &RXBuffer[12+28], framelen);
+        }
     }
-    else
+    else if (!rx_nocrop())
         framelen -= (IOPORT(W_RXLenCrop) << 1) & 0x1FE;
 
     if (framelen < 0) framelen = 0;
@@ -2002,6 +2444,10 @@ void Wifi::MPClientReplyRX(int client)
     *(u16*)&RXBuffer[6] = txrate;
     *(u16*)&RXBuffer[8] = framelen;
 
+    /* Whatever a probe has to say about the body this console's game is about
+       to read (see MPProbeBodyHook). */
+    MPProbeBodyHook(framelen);
+
     /* What the host's own game is about to read, as opposed to what the
        client said it sent (its `[mp] answered cmd` line) and what the reply
        queue handed over (RecvReplies' `collected a reply` line). Three views
@@ -2021,8 +2467,9 @@ void Wifi::MPClientReplyRX(int client)
 
         Log(LogLevel::Debug,
             "[mp] handing client %d's reply to the console's game: %d byte frame, "
-            "fc=%04X, body[%d]=%s%s\n",
-            client, framelen, *(u16*)&RXBuffer[12], bodylen, body,
+            "fc=%04X, seq=%04X, body[%d]=%s%s\n",
+            client, framelen, *(u16*)&RXBuffer[12],
+            (framelen >= 24) ? *(u16*)&RXBuffer[12 + 22] : 0, bodylen, body,
             (framelen <= 24) ? " - no body at all, so the game sees an empty answer" : "");
     }
 
@@ -2073,6 +2520,8 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
                 // TODO: make this more resilient
                 IsMP = false;
                 IsMPClient = false;
+                MPArmHeld = false;
+                MPMYAID = 0;
             }
         }
 
@@ -2121,10 +2570,13 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
         // TODO: what are the maximum crop values?
         if (framectl & (1<<14))
         {
-            framelen -= (IOPORT(W_RXLenCrop) >> 7) & 0x1FE;
-            if (framelen > 24) memmove(&RXBuffer[12+24], &RXBuffer[12+28], framelen);
+            if (!rx_nocrop())
+            {
+                framelen -= (IOPORT(W_RXLenCrop) >> 7) & 0x1FE;
+                if (framelen > 24) memmove(&RXBuffer[12+24], &RXBuffer[12+28], framelen);
+            }
         }
-        else
+        else if (!rx_nocrop())
             framelen -= (IOPORT(W_RXLenCrop) << 1) & 0x1FE;
 
         if (framelen < 0) framelen = 0;
@@ -2164,7 +2616,19 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
 
             IsMP = true;
             IsMPClient = true;
-            USTimestamp = timestamp;
+            MPD.role = 2;
+
+            /* The AID the host assigned this console. It is remembered here
+               because the game's own `W_AIDLow` is not a stable answer to "is
+               this poll ours" - MKDS clears it while it prepares the next
+               answer, and a poll that lands in that window belongs to this
+               console just as much as one that does not. */
+            MPMYAID = aid & 0xF;
+            /* No clock snap here any more. This used to copy the host's
+               timestamp into the client's own clock - the one alignment the
+               two consoles ever got, and the reason their clocks could part
+               afterwards without bound. `USTimestamp` is emulated time now
+               (see Wifi::USTimer), so it is already the host's base. */
             NextSync = RXTimestamp + (framelen * (txrate==0x14 ? 4:8));
         }
 
@@ -2174,6 +2638,13 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
     }
     else if ((frametype == 0x00C0) && timestamp && macgood && IsMPClient)
     {
+        MPD.deauth_recv++;
+        MPD.last_deauth_reason = (framelen >= 26) ? *(u16*)&RXBuffer[12 + 24] : 0;
+        MPD.role = 0;
+
+        /* Out of the group: no poll is ours to answer any more. */
+        MPArmHeld = false;
+        MPMYAID = 0;
         mp_trace_deauth("received", &RXBuffer[12], framelen);
         if (mp_trace())
             Log(LogLevel::Info,
@@ -2209,13 +2680,21 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
                carries a timestamp our own US clock has already passed: the
                client cannot meet the host's schedule, which on real hardware
                the sync frames prevent. */
+            /* Whether this round repeats the previous command's sequence
+               number. Tested against MPLastSeqno, which FinishRX updates to
+               the frame it is processing right now - so this is the *current*
+               frame's seqno against the previous frame's, which is exactly
+               the retransmit test FinishRX itself makes. */
+            const u16 cmdseq = *(u16*)&RXBuffer[12 + 22];
+            const bool cmd_dupe_rx = (cmdseq == MPLastSeqno);
+
             if (mp_trace())
                 Log(LogLevel::Debug,
                     "[mp] cmd from host: host clock %llu, my clock %llu (lead %lld), window %d us, "
                     "mask %04X, %s to the console's game\n",
                     (unsigned long long)timestamp, (unsigned long long)USTimestamp,
                     (long long)(timestamp - USTimestamp), clienttime, clientmask,
-                    (MPEarlyCmdSeq == MPLastSeqno)
+                    cmd_dupe_rx
                         ? (cmd_retry_notify() ? "the same seqno as the last command, still delivered"
                                               : "the same seqno as the last command, NOT delivered")
                         : "a new command, delivered");
@@ -2223,14 +2702,23 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
             // include the MP reply time window
             NextSync += 112 + ((clienttime + 10) * NumClients(clientmask));
 
-            /* A command is arriving. From here until the round ends, the guest
-               may arm its answer and have the hardware send it in this same
-               round; SendMPEarlyReply is also called from the two writes the
-               guest arms with, and from here so that an arm that is already
-               armed when the command arrives is honoured too. */
-            MPEarlyCmdSeq = *(u16*)&RXBuffer[12 + 22];
-            MPEarlyReplyState = 1;
-            SendMPEarlyReply();
+            /* The guest side of the flight recorder: a command reached this
+               console's game, with its body, and whether it repeated the
+               previous round's sequence number (see cmd_dupe_rx above). */
+            MPD.cmds_rx++;
+            if (cmd_dupe_rx) MPD.cmds_rx_dup++;
+            MPD.last_cmd_seq = cmdseq;
+            MPD.last_cmd_us = USTimestamp;
+
+            /* The other half of the same experiment: the bytes the *guest's*
+               game is about to read out of the host's command, available to the
+               same body override as a reply. It runs before this console
+               records the command, so `last_cmd_body` - and the `mp pN last:
+               cmd` digest line - describe the body the game was actually handed
+               rather than the one the wire carried. */
+            MPProbeBodyHook((int)framelen);
+
+            mp_record_body(MPD.last_cmd_body, &MPD.last_cmd_len, &RXBuffer[12 + 24], (int)framelen - 24);
         }
         else if (MACEqual(&RXBuffer[12 + 4], MPAckMAC))
         {
@@ -2280,7 +2768,31 @@ void Wifi::MSTimer()
 
 void Wifi::USTimer(u32 param)
 {
-    USTimestamp += kTimerInterval;
+    /* The wireless clock is the console's emulated time (NDS::GetSharedUSClock),
+       not a counter that only advances while the radio is powered: every
+       comparison this module makes across consoles goes through it (frame
+       timestamps, the reply window, `NextSync`/`RXTimestamp`, the staleness
+       test). The two consoles' clocks used to part by up to 254ms of emulated
+       time over one MKDS join - the games write VCOUNT, which delays a frame,
+       and a frame is what one session step advances - so the clock is now
+       derived from the frame count, which is advanced in lockstep, and the two
+       agree by construction. The game-visible `USCounter` is untouched. */
+    USTimestamp = NDS.GetSharedUSClock();
+    ClockTicks++;
+
+    /* One line a second while tracing: this console's clock against its own
+       frame count, which is how the two consoles' clocks are compared (a frame
+       is 16,715us of it - see kReplyStaleWindow). The useful reading is that
+       the frame count and the clock climb together on both consoles: while
+       they did not, the client's clock ran 254ms ahead of its host over one
+       MKDS join and stayed there. */
+    if (mp_trace() && ((USTimestamp - ClockLastProbe) >= 1000000))
+    {
+        ClockLastProbe = USTimestamp;
+        Log(LogLevel::Debug, "[mp] clock probe: us %llu ticks %llu arm7 %llu frames %u\n",
+            (unsigned long long)USTimestamp, (unsigned long long)ClockTicks,
+            (unsigned long long)NDS.ARM7Timestamp, NDS.NumFrames);
+    }
 
     if (IsMPClient && (!ComStatus))
     {
@@ -2528,6 +3040,354 @@ void Wifi::RFTransfer_Type3()
 
 u16 Wifi::Read(u32 addr)
 {
+    /* Every read the console's own software makes of the wireless block goes
+       through here, so the recorder below sees the value the game saw rather
+       than the value the emulator meant to store - the two differ exactly
+       where a fabricated value reaches a game's bytecode, which is the whole
+       question the v0.1.9h read left open. */
+    const u16 val = ReadRaw(addr);
+    RecordMPIoRead(addr, val);
+    return val;
+}
+
+void Wifi::RecordMPIoRead(u32 addr, u16 val)
+{
+    addr &= 0x7FFE;
+
+    if (addr < 0x1000)
+    {
+        /* The register window. Counted per halfword offset with the last value
+           read, and kept in order for the last kRing reads so a round can be
+           read back as the sequence of values the game actually consumed. */
+        const u32 i = (addr >> 1) & 0x7FF;
+        MPIO.reg_reads[i]++;
+        MPIO.reg_last[i] = val;
+
+        const u32 r = (u32)(MPIO.ring_total % (u64)MPIo::kRing);
+        MPIO.ring_off[r] = (u16)addr;
+        MPIO.ring_val[r] = val;
+        MPIO.ring_total++;
+        return;
+    }
+
+    /* The wireless RAM window: every read of it is kept, in order, with the
+       value it returned. Only the last kRing are retained (the window is
+       where the game's mail arrives and it reads tens of thousands of times a
+       session), and the zone brackets below say which of them fell inside the
+       frame the console was just handed. */
+    if (addr >= 0x4000 && addr < 0x6000)
+    {
+        const u16 off = (u16)(addr & 0x1FFE);
+        /* Whether this read fell inside the frame the console was handed is
+           decided now, not at print time: the bracket is replaced by the next
+           delivery, so a question asked later would answer for the wrong
+           frame. */
+        const bool inside = MPIO.zone_len &&
+            (u16)((off - MPIO.zone_start) & 0x1FFE) < (u16)MPIO.zone_len;
+        {
+            const u32 r = (u32)(MPIO.rx_total % (u64)MPIo::kRing);
+            MPIO.rx_off[r] = off;
+            MPIO.rx_val[r] = val;
+            MPIO.rx_in[r] = inside ? 1 : 0;
+            MPIO.rx_total++;
+        }
+
+        if (inside)
+        {
+            MPIO.zone_total++;
+            if (MPIO.zone_n < (u32)MPIo::kZone)
+            {
+                MPIO.zone_off[MPIO.zone_n] = off;
+                MPIO.zone_val[MPIO.zone_n] = val;
+                MPIO.zone_n++;
+            }
+
+            /* The game taking the command it was handed out of the buffer,
+               header and payload alike. This is the read that separates "the
+               guest's game looked at the transition and stayed where it was"
+               from "the frame never reached the game's hands at all", and it
+               is the first few of them that matter, so it is throttled hard
+               while the recorder keeps all of them. */
+            if (mp_trace() && MPIO.zone_is_cmd &&
+                (MPIO.zone_total <= 6 || (MPIO.zone_total % 64) == 0))
+                Log(LogLevel::Debug,
+                    "[mp] the console's game reads the command it was handed: cmd seq=%04X, "
+                    "%llu halfwords read so far, this one at %04X of the %u byte region "
+                    "from %04X\n",
+                    MPIO.zone_seq, (unsigned long long)MPIO.zone_total, off,
+                    (unsigned)MPIO.zone_len, (unsigned)MPIO.zone_start);
+        }
+    }
+}
+
+void Wifi::SetMPIoZone(u16 start, u16 len, u16 fc, u16 seq, bool is_cmd)
+{
+    /* A new frame replaces the last one and starts a fresh consumption list:
+       what the game took out of the frame *it was just handed* is the unit the
+       question is asked in, and the report is taken on demand, so in a steady
+       freeze the frame on show is the one being exchanged right now. */
+    MPIO.zone_start = start;
+    MPIO.zone_len = len;
+    MPIO.zone_fc = fc;
+    MPIO.zone_seq = seq;
+    MPIO.zone_is_cmd = is_cmd ? 1 : 0;
+    MPIO.zone_n = 0;
+    MPIO.zone_total = 0;
+    MPIO.zone_gen++;
+}
+
+static const char* mpio_reg_name(u32 off)
+{
+    switch (off)
+    {
+    case 0x000: return "W_ID";
+    case 0x004: return "W_ModeReset";
+    case 0x006: return "W_ModeWEP";
+    case 0x008: return "W_TXStatCnt";
+    case 0x010: return "W_IF";
+    case 0x012: return "W_IE";
+    case 0x018: return "W_MACAddr0";
+    case 0x01A: return "W_MACAddr1";
+    case 0x01C: return "W_MACAddr2";
+    case 0x020: return "W_BSSID0";
+    case 0x022: return "W_BSSID1";
+    case 0x024: return "W_BSSID2";
+    case 0x028: return "W_AIDLow";
+    case 0x02A: return "W_AIDFull";
+    case 0x02C: return "W_TXRetryLimit";
+    case 0x030: return "W_RXCnt";
+    case 0x032: return "W_WEPCnt";
+    case 0x034: return "W_TRXPower";
+    case 0x036: return "W_PowerUS";
+    case 0x038: return "W_PowerTX";
+    case 0x03C: return "W_PowerState";
+    case 0x040: return "W_PowerForce";
+    case 0x044: return "W_Random";
+    case 0x048: return "W_PowerDownCtrl";
+    case 0x050: return "W_RXBufBegin";
+    case 0x052: return "W_RXBufEnd";
+    case 0x054: return "W_RXBufWriteCursor";
+    case 0x056: return "W_RXBufWriteAddr";
+    case 0x058: return "W_RXBufReadAddr";
+    case 0x05A: return "W_RXBufReadCursor";
+    case 0x05C: return "W_RXBufCount";
+    case 0x060: return "W_RXBufDataRead";
+    case 0x062: return "W_RXBufGapAddr";
+    case 0x064: return "W_RXBufGapSize";
+    case 0x068: return "W_TXBufWriteAddr";
+    case 0x06C: return "W_TXBufCount";
+    case 0x070: return "W_TXBufDataWrite";
+    case 0x074: return "W_TXBufGapAddr";
+    case 0x076: return "W_TXBufGapSize";
+    case 0x080: return "W_TXSlotBeacon";
+    case 0x084: return "W_TXBeaconTIM";
+    case 0x088: return "W_ListenCount";
+    case 0x08C: return "W_BeaconInterval";
+    case 0x08E: return "W_ListenInterval";
+    case 0x090: return "W_TXSlotCmd";
+    case 0x094: return "W_TXSlotReply1";
+    case 0x098: return "W_TXSlotReply2";
+    case 0x0A0: return "W_TXSlotLoc1";
+    case 0x0A4: return "W_TXSlotLoc2";
+    case 0x0A8: return "W_TXSlotLoc3";
+    case 0x0AC: return "W_TXReqReset";
+    case 0x0AE: return "W_TXReqSet";
+    case 0x0B0: return "W_TXReqRead";
+    case 0x0B4: return "W_TXSlotReset";
+    case 0x0B6: return "W_TXBusy";
+    case 0x0B8: return "W_TXStat";
+    case 0x0BC: return "W_Preamble";
+    case 0x0C0: return "W_CmdTotalTime";
+    case 0x0C4: return "W_CmdReplyTime";
+    case 0x0D0: return "W_RXFilter";
+    case 0x0DA: return "W_RXLenCrop";
+    case 0x0E0: return "W_RXFilter2";
+    case 0x0E8: return "W_USCountCnt";
+    case 0x0EA: return "W_USCompareCnt";
+    case 0x0EE: return "W_CmdCountCnt";
+    case 0x0F0: return "W_USCompare0";
+    case 0x0F2: return "W_USCompare1";
+    case 0x0F4: return "W_USCompare2";
+    case 0x0F6: return "W_USCompare3";
+    case 0x0F8: return "W_USCount0";
+    case 0x0FA: return "W_USCount1";
+    case 0x0FC: return "W_USCount2";
+    case 0x0FE: return "W_USCount3";
+    case 0x10C: return "W_ContentFree";
+    case 0x110: return "W_PreBeacon";
+    case 0x118: return "W_CmdCount";
+    case 0x11C: return "W_BeaconCount1";
+    case 0x134: return "W_BeaconCount2";
+    case 0x158: return "W_BBCnt";
+    case 0x15A: return "W_BBWrite";
+    case 0x15C: return "W_BBRead";
+    case 0x15E: return "W_BBBusy";
+    case 0x160: return "W_BBMode";
+    case 0x168: return "W_BBPower";
+    case 0x17C: return "W_RFData2";
+    case 0x17E: return "W_RFData1";
+    case 0x180: return "W_RFBusy";
+    case 0x184: return "W_RFCnt";
+    case 0x194: return "W_TXHeaderCnt";
+    case 0x19C: return "W_RFPins";
+    case 0x1A8: return "W_RXStatIncIF";
+    case 0x1AA: return "W_RXStatIncIE";
+    case 0x1AC: return "W_RXStatHalfIF";
+    case 0x1AE: return "W_RXStatHalfIE";
+    case 0x1C0: return "W_TXErrorCount";
+    case 0x1C4: return "W_RXCount";
+    case 0x1D0: return "W_CMDStat0";
+    case 0x1D2: return "W_CMDStat1";
+    case 0x1D4: return "W_CMDStat2";
+    case 0x1D6: return "W_CMDStat3";
+    case 0x1D8: return "W_CMDStat4";
+    case 0x1DA: return "W_CMDStat5";
+    case 0x1DC: return "W_CMDStat6";
+    case 0x1DE: return "W_CMDStat7";
+    case 0x210: return "W_TXSeqNo";
+    case 0x214: return "W_RFStatus";
+    case 0x21C: return "W_IFSet";
+    case 0x268: return "W_RXTXAddr";
+    default: return "?";
+    }
+}
+
+int Wifi::FormatMPIoReport(char* out, size_t cap) const
+{
+    if (!out || cap < 256) return -1;
+
+    int n = 0;
+    const auto put = [&](const char* fmt, ...) {
+        if ((size_t)n >= cap - 1) return;
+        va_list ap;
+        va_start(ap, fmt);
+        const int w = vsnprintf(out + n, cap - (size_t)n, fmt, ap);
+        va_end(ap);
+        if (w <= 0) return;
+        n += w;
+        if ((size_t)n > cap - 1) n = (int)cap - 1;
+    };
+
+    put("mpio: role=%d%s%s  USCOUNT=%llX USCOMPARE=%llX  zone gen=%llu\n",
+        MPD.role, IsMP ? " (host)" : "", IsMPClient ? " (client)" : "",
+        (unsigned long long)USCounter, (unsigned long long)USCompare,
+        (unsigned long long)MPIO.zone_gen);
+
+    /* The frame this console was handed, what it contains now, and every
+       halfword the game has taken out of it in the order it took them - the
+       only form in which "what value did it branch on" is answerable. */
+    put("  handed: start=%04X len=%u fc=%04X seq=%04X%s  consumed=%llu halfwords\n",
+        MPIO.zone_start, MPIO.zone_len, MPIO.zone_fc, MPIO.zone_seq,
+        MPIO.zone_is_cmd ? " (a command)" : " (not a command)",
+        (unsigned long long)MPIO.zone_total);
+
+    if (MPIO.zone_len)
+    {
+        put("  as it stands in RAM (the 12-byte RX header first):");
+        const int zl = (MPIO.zone_len > 128) ? 128 : (int)MPIO.zone_len;
+        for (int i = 0; i < zl; i += 2)
+        {
+            if ((i % 32) == 0) put("\n    %04X:", (MPIO.zone_start + i) & 0x1FFE);
+            put(" %04X", *(const u16*)&RAM[(MPIO.zone_start + i) & 0x1FFE]);
+        }
+        put("\n");
+
+        put("  read order, oldest first (offset:value, H=RX header, B=frame body):\n   ");
+        for (u32 i = 0; i < MPIO.zone_n; i++)
+        {
+            const bool inbody = (u16)((MPIO.zone_off[i] - MPIO.zone_start) & 0x1FFE) >= 12;
+            put(" %04X:%04X%c", MPIO.zone_off[i], MPIO.zone_val[i], inbody ? 'B' : 'H');
+            if ((i % 8) == 7) put("\n   ");
+        }
+        put("\n");
+    }
+
+    /* The buffer's own pointers, written side: where the emulated hardware
+       thinks the game is reading from and writing to. Next to the reads below
+       they say whether the game's read position and the region the recorder
+       bracketed agree - and where they disagree, that disagreement is a
+       candidate for the thing a game's code branches on. */
+    put("  RX buffer: begin=%04X end=%04X writecursor=%04X readaddr=%04X "
+        "readcursor=%04X count=%04X rxtxaddr=%04X\n",
+        IOPORT(W_RXBufBegin), IOPORT(W_RXBufEnd), IOPORT(W_RXBufWriteCursor),
+        IOPORT(W_RXBufReadAddr), IOPORT(W_RXBufReadCursor), IOPORT(W_RXBufCount),
+        IOPORT(W_RXTXAddr));
+
+    /* Every halfword this console's game has taken out of the wireless RAM
+       window, in the order it took them, with the value the emulation returned
+       - the raw material for "what value did it branch on". The trailing
+       letter marks whether the read fell inside the region of the frame the
+       console was last handed (`I`) or outside it (`o`), so a game reading a
+       region the delivery path never bracketed is visible at a glance. */
+    put("  wireless-RAM reads in order, oldest first (last %d of %llu) "
+        "(I=inside the last handed frame, o=outside it):\n   ", (int)MPIo::kRing,
+        (unsigned long long)MPIO.rx_total);
+    {
+        const u64 keep = (MPIO.rx_total < (u64)MPIo::kRing) ? MPIO.rx_total
+                                                           : (u64)MPIo::kRing;
+        const u64 first = MPIO.rx_total - keep;
+        for (u64 k = 0; k < keep; k++)
+        {
+            const u32 r = (u32)((first + k) % (u64)MPIo::kRing);
+            put(" %04X:%04X%c", MPIO.rx_off[r], MPIO.rx_val[r], MPIO.rx_in[r] ? 'I' : 'o');
+            if (((u32)k % 8) == 7) put("\n   ");
+        }
+        put("\n");
+    }
+
+    put("  wifi registers the game read, most-read first (offset name reads last):\n");
+    u32 done[24];
+    int ndone = 0;
+    for (int rank = 0; rank < (int)(sizeof(done) / sizeof(done[0])); rank++)
+    {
+        u32 best = 0;
+        u32 besti = 0;
+        bool found = false;
+        for (u32 i = 0; i < (u32)MPIo::kRegWords; i++)
+        {
+            if (MPIO.reg_reads[i] == 0) continue;
+            bool seen = false;
+            for (int d = 0; d < ndone; d++)
+                if (done[d] == i) { seen = true; break; }
+            if (seen) continue;
+            if (!found || MPIO.reg_reads[i] > best)
+            {
+                best = MPIO.reg_reads[i];
+                besti = i;
+                found = true;
+            }
+        }
+        if (!found) break;
+        done[ndone++] = besti;
+        put("    %03X %-18s %-9u %04X\n", besti << 1, mpio_reg_name(besti << 1), best,
+            MPIO.reg_last[besti]);
+    }
+
+    put("  register reads in order, oldest first (last %d of %llu):\n   ", (int)MPIo::kRing,
+        (unsigned long long)MPIO.ring_total);
+    const u64 keep = (MPIO.ring_total < (u64)MPIo::kRing) ? MPIO.ring_total : (u64)MPIo::kRing;
+    const u64 first = MPIO.ring_total - keep;
+    for (u64 k = 0; k < keep; k++)
+    {
+        const u32 r = (u32)((first + k) % (u64)MPIo::kRing);
+        put(" %03X:%04X", MPIO.ring_off[r], MPIO.ring_val[r]);
+        if (((u32)k % 10) == 9) put("\n   ");
+    }
+    put("\n");
+
+    put("  irq: cpu-line=%llu", (unsigned long long)MPD.irq_cpu_line);
+    for (int i = 0; i < 16; i++)
+        if (MPD.irq_raised[i] || MPD.irq_acked[i])
+            put(" %d:raised=%llu acked=%llu", i, (unsigned long long)MPD.irq_raised[i],
+                (unsigned long long)MPD.irq_acked[i]);
+    put("  IF=%04X IE=%04X pending=%04X\n", MPD.if_now, MPD.ie_now,
+        (u16)(MPD.if_now & MPD.ie_now));
+
+    return n;
+}
+
+u16 Wifi::ReadRaw(u32 addr)
+{
     if (addr >= 0x04810000)
         return 0;
 
@@ -2547,18 +3407,27 @@ u16 Wifi::Read(u32 addr)
         u16 end = IOPORT(W_RXBufEnd) & 0x1FFE;
         bool inrx = (begin <= end) ? (off >= begin && off < end)
                                    : (off >= begin || off < end);
-        if (inrx && (IsMP || IsMPClient) && mp_trace())
+        if (inrx && (IsMP || IsMPClient))
         {
-            static unsigned long rxwinreads = 0;
-            static u64 lastreport = 0;
-            ++rxwinreads;
-            if ((USTimestamp - lastreport) > 20000)
+            /* Always counted (the flight recorder), printed on a schedule: what
+               this answers is whether the console's *game* ever reads the mail
+               the link delivered, which the wire counters cannot see. */
+            MPD.window_reads++;
+
+
+            if (mp_trace())
             {
-                lastreport = USTimestamp;
-                Log(LogLevel::Debug,
-                    "[mp] the console's game reads its wireless receive RAM window: %lu so far, "
-                    "this one at %04X (%s)\n",
-                    rxwinreads, off, IsMPClient ? "as an MP client" : "as an MP host");
+                static u64 lastreport = 0;
+
+                if ((USTimestamp - lastreport) > 20000)
+                {
+                    lastreport = USTimestamp;
+                    Log(LogLevel::Debug,
+                        "[mp] the console's game reads its wireless receive RAM window: %llu so far, "
+                        "this one at %04X (%s)\n",
+                        (unsigned long long)MPD.window_reads, off,
+                        IsMPClient ? "as an MP client" : "as an MP host");
+                }
             }
         }
         return *(u16*)&RAM[addr & 0x1FFE];
@@ -2731,6 +3600,11 @@ void Wifi::Write(u32 addr, u16 val)
                 IOPORT(W_BSSID2) = 0;
                 IOPORT(W_AIDLow) = 0;
                 IOPORT(W_AIDFull) = 0;
+
+                /* The registers are back to their defaults, so the group this
+                   console was in is gone with them. */
+                MPArmHeld = false;
+                MPMYAID = 0;
                 IOPORT(W_TXRetryLimit) = 0x0707;
                 IOPORT(0x02E) = 0;
                 IOPORT(W_RXBufBegin) = 0x4000;
@@ -2776,11 +3650,23 @@ void Wifi::Write(u32 addr, u16 val)
         }
         return;
     case W_IF:
-        IOPORT(W_IF) &= ~val;
+        {
+            /* The game acknowledging sources: each 1 written clears that
+               pending bit (`IOPORT(W_IF) &= ~val` below), which is a wifi IRQ
+               handler returning from the source it was woken for. Counted per
+               source, so raised-vs-acked says both whether the handler still
+               runs at all and which source it keeps taking. */
+            u16 clearing = val & IOPORT(W_IF);
+            for (int i = 0; i < 16; i++)
+                if (clearing & (1<<i)) MPD.irq_acked[i]++;
+            IOPORT(W_IF) &= ~val;
+        }
         return;
     case W_IFSet:
         {
             u16 oldflags = IOPORT(W_IF) & IOPORT(W_IE);
+            for (int i = 0; i < 16; i++)
+                if ((val & 0xFBFF) & (1<<i)) MPD.irq_raised[i]++;
             IOPORT(W_IF) |= (val & 0xFBFF);
             CheckIRQ(oldflags);
             Log(LogLevel::Debug, "wifi: force-setting IF %04X\n", val);
@@ -2791,13 +3677,21 @@ void Wifi::Write(u32 addr, u16 val)
         /* Part of the guest's MP timeline: a guest clears this while it has no
            answer prepared, and sets its AID when it does. Logged on change
            only, because the write is otherwise a per-round no-op. */
+        if (IOPORT(W_AIDLow) != (val & 0x000F))
+            MPD.aids_set++;
+
+        /* The game holds its AID up for most of a round and clears it while it
+           prepares the next answer; the value it holds is the association, so
+           it is remembered for the rounds it is cleared in. */
+        if (val & 0x000F)
+            MPMYAID = val & 0x000F;
+
         if (mp_trace() && (IOPORT(W_AIDLow) != (val & 0x000F)))
             Log(LogLevel::Debug,
-                "[mp] guest set its AID to %d (round state %d, cmd seq %04X): %s\n",
-                val & 0x000F, MPEarlyReplyState, MPEarlyCmdSeq,
+                "[mp] guest set its AID to %d (last cmd seq %04X): %s\n",
+                val & 0x000F, MPLastSeqno,
                 (val & 0x000F) ? "it is ready to answer" : "it has nothing to answer with");
         IOPORT(W_AIDLow) = val & 0x000F;
-        SendMPEarlyReply();
         return;
 
     case W_AIDFull:
@@ -2864,6 +3758,14 @@ void Wifi::Write(u32 addr, u16 val)
 
     case W_USCountCnt: val &= 0x0001; break;
     case W_USCompareCnt:
+        if (mp_trace() && ((val & 0x0001) != (IOPORT(W_USCompareCnt) & 0x0001)))
+            Log(LogLevel::Debug,
+                "[mp] USCOMPARECNT %s: IRQ14 %s be raised by USCOUNT reaching USCOMPARE"
+                "%s\n",
+                (val & 0x0001) ? "enabled" : "disabled",
+                (val & 0x0001) ? "can" : "cannot",
+                (val & 0x0001) ? "" : " - the countdown cannot raise it either, so this console "
+                                 "sends no beacon of its own");
         if (val & 0x0002) SetIRQ14(2);
         val &= 0x0001;
         break;
@@ -2874,8 +3776,25 @@ void Wifi::Write(u32 addr, u16 val)
     case W_USCount3: USCounter = (USCounter & 0x0000FFFFFFFFFFFF) | ((u64)val << 48); return;
 
     case W_USCompare0:
-        USCompare = (USCompare & 0xFFFFFFFFFFFF0000) | (u64)(val & 0xFC00);
-        if (val & 0x0001) BlockBeaconIRQ14 = true;
+        {
+            const u64 oldcompare = USCompare;
+            USCompare = (USCompare & 0xFFFFFFFFFFFF0000) | (u64)(val & 0xFC00);
+            if (val & 0x0001) BlockBeaconIRQ14 = true;
+
+            /* The group-membership dance described in SetIRQ14's comment: the
+               value comes from the beacon the console just received, and bit0
+               asks for the beacon IRQ to wait for it. A console that writes
+               this is a console that took a beacon and is scheduling its own
+               into the group's beacon schedule. */
+            if (mp_trace() && ((USCompare != oldcompare) || (val & 0x0001)))
+                Log(LogLevel::Debug,
+                    "[mp] USCOMPARE0 <- %04X: USCOMPARE is now %llX, USCOUNT is %llX "
+                    "(%s)%s\n",
+                    val, (unsigned long long)USCompare, (unsigned long long)USCounter,
+                    (USCompare >= USCounter) ? "ahead of USCOUNT" : "already passed by USCOUNT",
+                    (val & 0x0001) ? ", bit0 set: the beacon countdown's IRQ14 is blocked until "
+                                     "USCOUNT reaches it" : "");
+        }
         return;
     case W_USCompare1: USCompare = (USCompare & 0xFFFFFFFF0000FFFF) | ((u64)val << 16); return;
     case W_USCompare2: USCompare = (USCompare & 0xFFFF0000FFFFFFFF) | ((u64)val << 32); return;
@@ -2910,6 +3829,12 @@ void Wifi::Write(u32 addr, u16 val)
         }
         if (val & 0x0080)
         {
+            /* The game's own copy request (GBATEK's reply latch), on the same
+               ledger as the emulator's latch in SendMPReply: it is the second
+               writer of the one transmit slot a game cannot write. */
+            if (mp_trace())
+                Log(LogLevel::Debug, "[mp] txslot REPLY2 <- %04X (RXCNT bit 7: the game's own "
+                    "latch of REPLY1), REPLY1 <- 0000\n", IOPORT(W_TXSlotReply1));
             IOPORT(W_TXSlotReply2) = IOPORT(W_TXSlotReply1);
             IOPORT(W_TXSlotReply1) = 0;
         }
@@ -2996,16 +3921,35 @@ void Wifi::Write(u32 addr, u16 val)
         break;
 
     case W_TXSlotBeacon:
+        if (mp_trace())
+            Log(LogLevel::Debug, "[mp] txslot BEACON <- %04X %s\n",
+                val, mp_txslot_what(val, IOPORT(W_TXSlotBeacon)));
         IsMP = (val & 0x8000) != 0;
+        if (IsMP) MPD.role = 1;           /* Every (re)arm of this console's own beacon, with the length it
+           points at: the beacon is what a group's members announce themselves
+           in, so which console is beaconing, and when it stopped, is the first
+           thing to check in a session that ends with one member leaving - the
+           host arms and sends one every ~217ms throughout, the client never
+           arms one at all (2026-09-27). */
+        if (mp_trace() && (val & 0x8000))
+        {
+            const u16 baddr = (val & 0x0FFF) << 1;
+            const int blen = (int)(*(u16*)&RAM[baddr + 0xA] & 0x3FFF);
+            Log(LogLevel::Debug,
+                "[mp] beacon armed: slot %04X, %d byte frame, fc=%04X dest=%02X%02X..\n",
+                val, blen, (blen >= 12) ? *(u16*)&RAM[baddr + 0xC] : 0,
+                (blen >= 10) ? RAM[baddr + 0x10] : 0, (blen >= 10) ? RAM[baddr + 0x11] : 0);
+        }
+        else if (mp_trace() && (val != IOPORT(W_TXSlotBeacon)))
+            Log(LogLevel::Debug,
+                "[mp] TXSLOTBEACON <- %04X without bit 15: this console is disarming (or has "
+                "never armed) the beacon it would announce itself with\n", val);
         break;
 
     case W_TXSlotReply1:
-        /* The guest arming its answer. If it does that while a command is
-           arriving, the hardware answers within the same round rather than
-           making the host wait a round for it; see SendMPEarlyReply. The log
-           below is for the guest arming *after* its round was already
-           answered - the event that shows whether the guest's game is
-           refreshing its answer at all (see mp_early_reply_ack). */
+        if (mp_trace())
+            Log(LogLevel::Debug, "[mp] txslot REPLY1 <- %04X %s\n",
+                val, mp_txslot_what(val, IOPORT(W_TXSlotReply1)));
         /* Every arm, with the bytes it holds, because that is the one thing a
            frozen host command cannot tell apart: a guest whose game is done
            talking (it armed once and never again) and a guest whose game is
@@ -3029,17 +3973,41 @@ void Wifi::Write(u32 addr, u16 val)
             }
 
             Log(LogLevel::Debug,
-                "[mp] guest arms an answer: slot %04X, %d byte frame, body[%d]=%s "
-                "(round state %d, cmd seq %04X, %s the buffer last answered from)\n",
-                val, armlen, bodylen, body, MPEarlyReplyState, MPEarlyCmdSeq,
-                (val == MPEarlySentSlot) ? "the same as" : "not");
+                "[mp] guest arms an answer: arm #%llu, slot %04X, %d byte frame, body[%d]=%s "
+                "(last cmd seq %04X, my clock %llu)\n",
+                (unsigned long long)(MPArmNextSerial + 1), val, armlen, bodylen, body,
+                MPLastSeqno, (unsigned long long)USTimestamp);
         }
 
         IOPORT(W_TXSlotReply1) = val;
-        SendMPEarlyReply();
+        if (val & 0x8000)
+        {
+            MPD.arms++;
+
+            /* The game's answer, held and not sent. Sending it from here (from
+               inside the game's own write) is measured to starve its driver,
+               see the note above MPReplyAID; FinishRX hands it to stock's
+               SendMPReply when the poll it answers arrives. The driver's own
+               clear (a write of 0) is deliberately not treated as a disarm:
+               measured, it comes 100 us after every arm, in the same round, and
+               is the driver's bookkeeping for a buffer it is done with, not a
+               withdrawal of the answer - and each new arm replaces the held one
+               (see the note in FinishRX for why it is not spent). */
+            MPArmSlot = val;
+            MPArmHeld = true;
+            /* When this arm was made, and in which round: the poll that spends
+               it can then say whose round it belongs to (see FinishRX). */
+            MPArmSerial = ++MPArmNextSerial;
+            MPArmSeq = MPLastSeqno;
+            MPArmUS = USTimestamp;
+        }
         return;
 
     case W_TXSlotCmd:
+        if (mp_trace())
+            Log(LogLevel::Debug, "[mp] txslot CMD <- %04X %s%s\n",
+                val, mp_txslot_what(val, IOPORT(W_TXSlotCmd)),
+                (val & 0x4000) ? ", with the retransmit bit" : "");
         /* A guest writing this is starting its own CMD transfer - either it is
            taking over as host, or the game is retransmitting. Bit 14 is the
            "same command again" flag, which is what a game that is waiting for
@@ -3055,6 +4023,12 @@ void Wifi::Write(u32 addr, u16 val)
     case W_TXSlotLoc1:
     case W_TXSlotLoc2:
     case W_TXSlotLoc3:
+        /* A CMD write falls through to here, and it has already logged itself:
+           name this one only for the LOC slots it is actually the case for. */
+        if (mp_trace() && (addr >= W_TXSlotLoc1))
+            Log(LogLevel::Debug, "[mp] txslot LOC%d <- %04X %s\n",
+                (int)(addr - W_TXSlotLoc1) / 4 + 1, val,
+                mp_txslot_what(val, IOPORT(addr & 0xFFF)));
         // checkme: is it possible to cancel a queued transfer that hasn't started yet
         // by clearing bit15 here?
         IOPORT(addr&0xFFF) = val;
@@ -3066,12 +4040,24 @@ void Wifi::Write(u32 addr, u16 val)
         //printf("wifi: write port%03X %04X\n", addr, val);
         break;
 
+    case W_TXSlotReply2:
+        /* Read-only, and faithfully so: the hardware latches
+           `W_TXSlotReply1` into this slot itself (see SendMPReply and the
+           `W_RXCnt` bit-7 copy), so a game write here is ignored. It is on the
+           ledger all the same, because "the game armed a slot and nothing was
+           ever transmitted out of it" is one of the two shapes a missing frame
+           can have, and a write that is silently swallowed is exactly what an
+           audit has to be able to see. */
+        if (mp_trace())
+            Log(LogLevel::Debug, "[mp] txslot REPLY2 <- %04X IGNORED (read-only: the "
+                "hardware latches REPLY1 into it)\n", val);
+        return;
+
     // read-only ports
     case 0x000:
     case 0x034:
     case 0x044:
     case 0x054:
-    case 0x098:
     case 0x0B0:
     case 0x0B6:
     case 0x0B8:

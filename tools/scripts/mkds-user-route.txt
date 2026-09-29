@@ -1,0 +1,51 @@
+# mkds-user-route.txt - replay of the user's button-driven MKDS local-play route.
+#
+# Source: the failing run of 2026-09-26 20:03:53Z-20:04:03Z, whose log was
+# archived as logs/archive/md_app.log-20260926-150701.gz. That run was played
+# with buttons only (26 events, 0 touches) and the guest deauthed at
+# +1962.988s, 5.6s after its radio came up. This script replays the same 20
+# presses with the same 1-3s spacing so the failure can be reproduced without
+# a human at the keyboard.
+#
+#   tools/appctl.py script tools/scripts/mkds-user-route.txt
+#
+# Start from a freshly booted app, but **wait ~23s after launch first**: the
+# first A lands on MKDS's title screen, and pressing earlier lands on the boot
+# sequence instead, which misaligns every later press.
+# The chain to watch for in the log afterwards:
+#   t=+3s  p1 wireless on  (begin #2)   <- down+A on the main menu
+#   t=+4s  p1 wireless off (end #2)     <- up+A
+#   t=+5s  p1 wireless on  (begin #3)   <- A creates the group
+#   t=+7s  p2 wireless on  (begin #2)   <- p2 enters local play
+#   t=+10s p2 guest set its AID to 1    <- p2 joins
+#   t=+14s ?                            <- the moment under investigation
+
+# t=0.0  first screen -> main menu, on both consoles at once
+press a --player 1 --ms 100
+press a --player 2 --ms 100
+sleep 2500
+
+# t=3.0  p1: down + A
+press down --player 1 --ms 100
+sleep 300
+press a --player 1 --ms 100
+sleep 600
+
+# t=4.0  p1: up + A
+press up --player 1 --ms 100
+sleep 300
+press a --player 1 --ms 100
+sleep 600
+
+# t=5.0  p1: A
+press a --player 1 --ms 100
+sleep 1900
+
+# t=7.0  p2: down + A
+press down --player 2 --ms 100
+sleep 300
+press a --player 2 --ms 100
+sleep 2600
+
+# t=10.0 p2: A
+press a --player 2 --ms 100

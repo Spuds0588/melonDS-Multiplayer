@@ -16,6 +16,9 @@
 use parking_lot::{Condvar, Mutex, RwLock};
 use tauri::Manager;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -81,6 +84,67 @@ struct MDLinkStats {
     epoch_us: u64,
 }
 
+/// The multiplayer flight recorder (md_link_mp_digest in melonds_bridge.h):
+/// what each game actually did with the link, as opposed to what the wire
+/// carried. Field order must match the C struct exactly.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct MDMPDigest {
+    role: u32, // 0 = not in MP, 1 = host, 2 = guest
+    cmds_rx: u64,
+    cmds_rx_dup: u64,
+    answers_sent: u64,
+    answers_blank: u64,
+    answers_canned: u64,
+    arms: u64,
+    aids_set: u64,
+    window_reads: u64,
+    deauth_sent: u64,
+    deauth_recv: u64,
+    cmds_tx: u64,
+    cmds_tx_dup: u64,
+    acks_sent: u64,
+    acks_client_fail: u64,
+    replies_written: u64,
+    replies_collected: u64,
+    replies_blank: u64,
+    windows_empty: u64,
+    stale_dropped: u64,
+    reanchor_dropped: u64,
+    not_looking: u64,
+    last_cmd_seq: u16,
+    last_cmd_len: u16,
+    last_cmd_body: [u8; 16],
+    last_answer_len: u16,
+    last_answer_body: [u8; 16],
+    last_deauth_reason: u16,
+    last_ack_clientfail: u16,
+    last_cmd_us: u64,
+    last_answer_us: u64,
+    // interrupt level (see the C struct): per-source raises and acks, then the
+    // wifi register state at the instant the digest was taken.
+    irq_raised: [u64; 16],
+    irq_acked: [u64; 16],
+    irq_cpu_line: u64,
+    block_beacon_irq14: i32,
+    w_if: u16,
+    w_ie: u16,
+    w_uscntcnt: u16,
+    w_uscmpcnt: u16,
+    w_bcncount1: u16,
+    w_bcncount2: u16,
+    w_txslot_beacon: u16,
+    w_txslot_reply1: u16,
+    w_txslot_reply2: u16,
+    w_txbusy: u16,
+    w_txreqread: u16,
+    w_powerstate: u16,
+    w_powertx: u16,
+    comstatus: u16,
+    uscounter: u64,
+    uscompare: u64,
+}
+
 extern "C" {
     fn md_create(console_type: i32, name: *const i8) -> *mut MDInstance;
     fn md_destroy(inst: *mut MDInstance);
@@ -113,6 +177,8 @@ extern "C" {
     fn md_link_set_reply_timeout(ms: i32);
     fn md_link_set_reply_budget(inst: *mut MDInstance, budget_ns: i64);
     fn md_link_stats(inst: *mut MDInstance, out: *mut MDLinkStats) -> i32;
+    fn md_link_mp_digest(inst: *mut MDInstance, out: *mut MDMPDigest) -> i32;
+    fn md_link_mp_digest_size() -> u64;
     fn md_link_resync(inst: *mut MDInstance);
     fn md_link_connected_mask() -> u32;
     fn md_link_send_packet(inst: *mut MDInstance, data: *const u8, len: usize, timestamp: u64) -> i32;
@@ -124,7 +190,214 @@ extern "C" {
     // reliable while receives looked flaky).
     fn md_link_recv_packet(inst: *mut MDInstance, out: *mut u8, cap: usize, timestamp: *mut u64) -> i32;
     fn md_write_io16(inst: *mut MDInstance, cpu: i32, addr: u32, value: u16) -> i32;
+    fn md_read_io16(inst: *mut MDInstance, cpu: i32, addr: u32) -> u16;
+    fn md_wifi_io_report(inst: *mut MDInstance, out: *mut i8, cap: i32) -> i32;
+    fn md_link_mp_vary(
+        inst: *mut MDInstance,
+        kind: i32,
+        value: i32,
+        body: *const u8,
+        bodylen: i32,
+        armed: *mut i32,
+        left: *mut i32,
+        applied: *mut u64,
+    ) -> i32;
+    fn md_read_gpu(inst: *mut MDInstance, addr: u32) -> u32;
     fn md_link_slot(inst: *mut MDInstance) -> i32;
+}
+
+/// Hex for a frame body, clamped to the 16 bytes the digest carries.
+fn mp_body_hex(body: &[u8; 16], len: u16) -> String {
+    let n = (len as usize).min(body.len());
+    if n == 0 {
+        return "-".to_string();
+    }
+
+    let mut s = String::with_capacity(n * 3);
+    for (i, b) in body[..n].iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(&format!("{:02X}", b));
+    }
+    if (len as usize) > n {
+        s.push_str(" ..");
+    }
+    s
+}
+
+fn mp_secs(us: u64) -> String {
+    format!("{:.2}s", us as f64 / 1e6)
+}
+
+/// One console's multiplayer flight recorder, as two log lines.
+///
+/// This exists because thirteen live attempts were each read back by hand from
+/// a multi-megabyte log to answer the same short list of questions: did the
+/// guest's game get a command, did it answer with its own bytes, did the host
+/// read that answer back, and did either body ever move. Whoever reads the next
+/// failed run should get all of it, plus deltas since the last window, from the
+/// last few lines of the log.
+fn mp_digest_lines(p: usize, d: &MDMPDigest, prev: &MDMPDigest) -> Vec<String> {
+    let role = match d.role {
+        1 => "host",
+        2 => "guest",
+        _ => "not in MP",
+    };
+    let d64 = |now: u64, then: u64| now.wrapping_sub(then);
+
+    let mut counters = format!(
+        "mp p{} [{}]: cmds rx {}(+{}, dup {}) · answered {}(+{}, blank {}, canned {}) · arms {} aids {} · window reads {}(+{}) · replies sent {} collected {}(+{}) empty {}(+{}) stale {} reanchor-dropped {} blank {} notlooking {} · deauth out {} in {}",
+        p + 1,
+        role,
+        d.cmds_rx,
+        d64(d.cmds_rx, prev.cmds_rx),
+        d.cmds_rx_dup,
+        d.answers_sent,
+        d64(d.answers_sent, prev.answers_sent),
+        d.answers_blank,
+        d.answers_canned,
+        d.arms,
+        d.aids_set,
+        d.window_reads,
+        d64(d.window_reads, prev.window_reads),
+        d.replies_written,
+        d.replies_collected,
+        d64(d.replies_collected, prev.replies_collected),
+        d.windows_empty,
+        d64(d.windows_empty, prev.windows_empty),
+        d.stale_dropped,
+        d.reanchor_dropped,
+        d.replies_blank,
+        d.not_looking,
+        d.deauth_sent,
+        d.deauth_recv,
+    );
+
+    // The host half only when the console is (or was) one: a console that never
+    // transmitted a command has nothing to say here.
+    if d.cmds_tx > 0 {
+        counters.push_str(&format!(
+            " · host side: cmds tx {}(+{}, dup {}) · acks {}(+{}, clientfail {})",
+            d.cmds_tx,
+            d64(d.cmds_tx, prev.cmds_tx),
+            d.cmds_tx_dup,
+            d.acks_sent,
+            d64(d.acks_sent, prev.acks_sent),
+            d.acks_client_fail,
+        ));
+    }
+
+    // A console that has never touched the link (menus, single player) prints
+    // nothing at all: the digest is meant to be the two lines that explain a
+    // multiplayer failure, not four lines of zeros every window.
+    let silent = (d.role == 0)
+        && (d.cmds_rx == 0)
+        && (d.cmds_tx == 0)
+        && (d.answers_sent == 0)
+        && (d.window_reads == 0);
+    if silent {
+        return Vec::new();
+    }
+
+    /* The interrupt level, on its own line: which wifi source asked this
+       console's CPU for attention since the last window (`raised`, with the
+       sources that have ever fired), which ones its handler acknowledged
+       (`acked`), and the register state where a game that is waiting would be
+       waiting. A console whose handler still runs shows `raised` and `acked`
+       climbing together and its arm counter above climbing with them; a
+       console waiting on an interrupt it never gets shows the source it needs
+       at a flat zero next to a nonzero pending bit in `W_IF`/`W_IE`.
+       Only sources that have ever fired are listed, so the line stays
+       readable, and `pending` is the subset of W_IF the game has enabled. */
+    let irq_list = |arr: &[u64; 16], pv: &[u64; 16]| -> String {
+        let mut out = Vec::new();
+        for i in 0..16 {
+            if arr[i] > 0 || pv[i] > 0 {
+                out.push(format!("{}:{:+}", i, d64(arr[i], pv[i])));
+            }
+        }
+        if out.is_empty() {
+            "none".to_string()
+        } else {
+            out.join(" ")
+        }
+    };
+    let irq = format!(
+        "mp p{} irq: cpu line {}(+{}) · raised {} · acked {} · IF {:04X} IE {:04X} pending {:04X}",
+        p + 1,
+        d.irq_cpu_line,
+        d64(d.irq_cpu_line, prev.irq_cpu_line),
+        irq_list(&d.irq_raised, &prev.irq_raised),
+        irq_list(&d.irq_acked, &prev.irq_acked),
+        d.w_if,
+        d.w_ie,
+        d.w_if & d.w_ie,
+    );
+    let hw = format!(
+        "mp p{} hw: uscnt {} uscmp {} us {:X}/{:X}{} · bcn {} {} · slot b {:04X} r1 {:04X} r2 {:04X} · txbusy {:04X} req {:04X} com {} pwr {:04X}/{:04X}",
+        p + 1,
+        d.w_uscntcnt,
+        d.w_uscmpcnt,
+        d.uscounter,
+        d.uscompare,
+        if d.block_beacon_irq14 != 0 { " bcn-irq14-blocked" } else { "" },
+        d.w_bcncount1,
+        d.w_bcncount2,
+        d.w_txslot_beacon,
+        d.w_txslot_reply1,
+        d.w_txslot_reply2,
+        d.w_txbusy,
+        d.w_txreqread,
+        d.comstatus,
+        d.w_powerstate,
+        d.w_powertx,
+    );
+
+    let at = |us: u64| {
+        if us > 0 {
+            format!("+{}", mp_secs(us))
+        } else {
+            "-".to_string()
+        }
+    };
+
+    let mut last = format!(
+        "mp p{} last: cmd seq {:04X} len {} body {} at {}",
+        p + 1,
+        d.last_cmd_seq,
+        d.last_cmd_len,
+        mp_body_hex(&d.last_cmd_body, d.last_cmd_len),
+        at(d.last_cmd_us),
+    );
+    last.push_str(&format!(
+        " · answer len {} body {} at {}",
+        d.last_answer_len,
+        mp_body_hex(&d.last_answer_body, d.last_answer_len),
+        at(d.last_answer_us),
+    ));
+    // The host's own view of whether its game was told the guest failed.
+    if d.acks_sent > 0 {
+        last.push_str(&format!(" · last ack clientfail {:04X}", d.last_ack_clientfail));
+    }
+    if (d.deauth_sent > 0) || (d.deauth_recv > 0) {
+        last.push_str(&format!(" · last deauth reason {:04X}", d.last_deauth_reason));
+    }
+
+    vec![counters, irq, hw, last]
+}
+
+fn mp_digest(p: usize, inst: *mut MDInstance, prev: &MDMPDigest) -> MDMPDigest {
+    let mut digest = MDMPDigest::default();
+    if unsafe { md_link_mp_digest(inst, &mut digest) } != 0 {
+        return digest;
+    }
+
+    for line in mp_digest_lines(p, &digest, prev) {
+        log::info!("{}", line);
+    }
+
+    digest
 }
 
 fn cstr(s: &str) -> std::ffi::CString {
@@ -303,7 +576,26 @@ struct FrameBuf {
     /// Console frame counter at snapshot time; the frontend repaints only when
     /// this moves.
     seq: u64,
+    /// Picture liveness. The console frame counter above keeps climbing in a
+    /// game that has wedged or is parked on a static screen - the frame pump
+    /// cannot tell - so liveness is measured from the picture itself: how many
+    /// frames changed at all (`beats`), how long it has been since the last one
+    /// (`last_beat_frame`, in console frames), and how much of the sampled
+    /// picture moved (`changed`, in pixels). A run whose digest is green and
+    /// whose picture has not changed in 500 frames is a frozen game, not a
+    /// healthy link.
+    beats: u64,
+    changed: u64,
+    last_beat_frame: u64,
+    /// Last frame's strided pixel sample (see SAMPLE_STRIDE).
+    sample: Vec<u32>,
 }
+
+/// Every Nth pixel of each screen is compared. 1 in 16 detects any sprite or
+/// text movement at a cost small enough to run on every frame of every
+/// console.
+const SAMPLE_STRIDE: usize = 16;
+const SAMPLE_PIXELS: usize = MD_SCREEN_PIXELS / SAMPLE_STRIDE;
 
 impl FrameBuf {
     fn new() -> Self {
@@ -311,6 +603,35 @@ impl FrameBuf {
             top: vec![0; MD_SCREEN_PIXELS],
             bottom: vec![0; MD_SCREEN_PIXELS],
             seq: 0,
+            beats: 0,
+            changed: 0,
+            last_beat_frame: 0,
+            sample: vec![0; SAMPLE_PIXELS * 2],
+        }
+    }
+
+    /// Counts this frame against liveness. Returns the console frame counter
+    /// the picture last changed at, so a caller can say how long ago that was.
+    fn note_picture(&mut self) {
+        let mut moved = 0u64;
+        for i in 0..SAMPLE_PIXELS {
+            let idx = i * SAMPLE_STRIDE;
+            let top = self.top[idx];
+            let bottom = self.bottom[idx];
+            if self.sample[i] != top {
+                self.sample[i] = top;
+                moved += 1;
+            }
+            if self.sample[SAMPLE_PIXELS + i] != bottom {
+                self.sample[SAMPLE_PIXELS + i] = bottom;
+                moved += 1;
+            }
+        }
+
+        if moved > 0 {
+            self.beats += 1;
+            self.changed += moved;
+            self.last_beat_frame = self.seq;
         }
     }
 }
@@ -450,6 +771,28 @@ fn start_session_inner(
 
     unsafe {
         md_link_init();
+
+        // Prove the digest structs agree before any of their numbers are
+        // believed. A layout mismatch would not crash - it would just make the
+        // flight recorder lie, which is the one thing it cannot be allowed to do
+        // (this project already lost a session to an FFI declaration mismatch:
+        // md_link_recv_packet's `int` read as `usize`).
+        {
+            let c_size = md_link_mp_digest_size();
+            let rust_size = std::mem::size_of::<MDMPDigest>() as u64;
+            if c_size == rust_size {
+                log::info!(
+                    "mp digest struct: {} bytes in C and Rust alike - the flight recorder's numbers can be trusted",
+                    c_size
+                );
+            } else {
+                log::error!(
+                    "mp digest struct MISMATCH: C says {} bytes, Rust says {} - every digest number will be wrong until md_link_mp_digest's struct is fixed in both places",
+                    c_size,
+                    rust_size
+                );
+            }
+        }
         // Poll-mode receive plus a host reply timeout measured against ONE
         // EMULATED FRAME, not against a wall clock guess.
         //
@@ -475,12 +818,23 @@ fn start_session_inner(
         // nothing for the larger bound.
         // Override with MD_REPLY_TIMEOUT_MS to sweep without a rebuild.
         md_link_set_recv_timeout(0);
-        let reply_timeout_ms = std::env::var("MD_REPLY_TIMEOUT_MS")
+        const DEFAULT_REPLY_TIMEOUT_MS: i32 = 34;
+        let timeout_override = std::env::var("MD_REPLY_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.trim().parse::<i32>().ok())
-            .filter(|ms| *ms >= 0)
-            .unwrap_or(34);
-        log::info!("link reply timeout: {reply_timeout_ms}ms (2 emulated frames at 59.826fps)");
+            .filter(|ms| *ms >= 0);
+        let reply_timeout_ms = timeout_override.unwrap_or(DEFAULT_REPLY_TIMEOUT_MS);
+        // One emulated frame is 1000*889/53150 = 16.73ms of wall clock, so say
+        // where this number sits in those units and where it came from. The
+        // line used to end "(2 emulated frames at 59.826fps)" for *every*
+        // value, so a sweep at MD_REPLY_TIMEOUT_MS=2 read as two frames when it
+        // is an eighth of one - which is how "the app runs a 2ms ceiling" got
+        // as far as it did.
+        log::info!(
+            "link reply timeout: {reply_timeout_ms}ms = {:.2} emulated frames ({})",
+            reply_timeout_ms as f64 * 53_150.0 / (1000.0 * 889.0),
+            if timeout_override.is_some() { "MD_REPLY_TIMEOUT_MS" } else { "default" },
+        );
         md_link_set_reply_timeout(reply_timeout_ms);
 
         // ...and the same quantity again, as a per-frame budget instead of a
@@ -495,19 +849,34 @@ fn start_session_inner(
         // schedule the wait eats idle slack, off schedule the frame comes
         // first and the game hears `clientfail` the usual way. See
         // MPInterface::SetReplyBudget.
-        // Override with MD_REPLY_BUDGET_MS to sweep without a rebuild.
-        let reply_budget_ms = std::env::var("MD_REPLY_BUDGET_MS")
+        // Override with MD_REPLY_BUDGET_FRAMES to sweep without a rebuild, or
+        // set it negative to leave the waits unbounded (the same thing
+        // MD_REPLY_BUDGET_NS=-1 means in the harness). The knob counts
+        // *emulated frames* - the unit the budget is stated in - and it used to
+        // be called MD_REPLY_BUDGET_MS while its value was read as a frame
+        // count, so a sweep at 17 bought 17 frames (284ms) rather than 17ms and
+        // a sweep at -1 bought the default rather than "no cap".
+        let frames_of_slack = std::env::var("MD_REPLY_BUDGET_FRAMES")
             .ok()
             .and_then(|v| v.trim().parse::<i64>().ok())
-            .unwrap_or(-1);
-        let frames_of_slack = if reply_budget_ms >= 0 { reply_budget_ms } else { 2 };
+            .unwrap_or(2);
         REPLY_BUDGET_NS.store(
-            (frames_of_slack * 1_000_000_000 * 889 / 53_150) as i64,
+            if frames_of_slack < 0 {
+                -1
+            } else {
+                frames_of_slack * 1_000_000_000 * 889 / 53_150
+            },
             Ordering::SeqCst,
         );
-        log::info!(
-            "link reply budget: {frames_of_slack} emulated frame(s) of wall clock per frame for a whole console's reply waits"
-        );
+        if frames_of_slack < 0 {
+            log::info!(
+                "link reply budget: unbounded (MD_REPLY_BUDGET_FRAMES<0) - every window may spend its full reply timeout"
+            );
+        } else {
+            log::info!(
+                "link reply budget: {frames_of_slack} emulated frame(s) of wall clock per frame for a whole console's reply waits"
+            );
+        }
     }
 
     let n = players as usize;
@@ -643,6 +1012,7 @@ fn start_session_inner(
         .unwrap_or(false);
     let health = {
         let insts = instances.clone();
+        let health_frames = frames.clone();
         let health_stop = Arc::clone(&stop);
         let health_monitor = Arc::clone(&monitor);
         std::thread::Builder::new()
@@ -651,8 +1021,19 @@ fn start_session_inner(
                 #[derive(Clone, Copy, Default)]
                 struct Snapshot {
                     frames: u32,
+                    beats: u64,
+                    changed: u64,
+                    last_beat_frame: u64,
                     tx: u64,
                     rx: u64,
+                    // Bytes, beside the frame counts: the harness states a
+                    // link's two directions in bytes (`sent=17219 (1,127,344
+                    // bytes)`), so a run driven through the app could not be
+                    // compared with a harness run on the same axis at all. The
+                    // numbers were already in MDLinkStats and the health line
+                    // printed only the packets.
+                    tx_bytes: u64,
+                    rx_bytes: u64,
                     rx_bcast: u64,
                     rx_cmd: u64,
                     rx_rep: u64,
@@ -681,6 +1062,17 @@ fn start_session_inner(
                 let mut pc_prev: Vec<(u32, u32)> = vec![(0, 0); insts.len()];
                 let mut pc_moved: Vec<u32> = vec![0; insts.len()];
                 let mut pc_samples: Vec<u32> = vec![0; insts.len()];
+
+                // The multiplayer flight recorder, sampled apart from the
+                // five-second window as well: a radio going off or a deauth
+                // leaving is the moment a session dies, and it deserves a digest
+                // in the log at that moment rather than up to five seconds after
+                // it. `mp_prev` is also the delta base for the window's line, so
+                // "since the last time this was printed" stays true either way.
+                let mut mp_prev: Vec<MDMPDigest> = vec![MDMPDigest::default(); insts.len()];
+                let mut mp_state: Vec<(u32, u32, u32, u64, u64)> =
+                    vec![(0, 0, 0, 0, 0); insts.len()];
+                let mut mp_tick: u32 = 0;
                 while !health_stop.load(Ordering::SeqCst) {
                     for slot in pc_moved.iter_mut() {
                         *slot = 0;
@@ -706,6 +1098,44 @@ fn start_session_inner(
                             }
                             pc_prev[i] = (pc9, pc7);
                         }
+
+                        // Every 500ms of the window: has any console's
+                        // multiplayer state moved - radio on or off, a deauth
+                        // sent or received, its role changed? If so, print the
+                        // digest now, while the reason is still the present
+                        // tense.
+                        mp_tick += 1;
+                        if mp_tick % 10 == 0 {
+                            for (i, inst) in insts.iter().enumerate() {
+                                let mut probe = MDMPDigest::default();
+                                if unsafe { md_link_mp_digest(inst.ptr, &mut probe) } != 0 {
+                                    continue;
+                                }
+                                let mut stats = MDLinkStats::default();
+                                unsafe { md_link_stats(inst.ptr, &mut stats) };
+
+                                let state = (
+                                    probe.role,
+                                    stats.begin_count,
+                                    stats.end_count,
+                                    probe.deauth_sent,
+                                    probe.deauth_recv,
+                                );
+                                if state != mp_state[i] {
+                                    log::warn!(
+                                        "[mp-digest] p{} multiplayer state changed (wireless on/off {}/{}, deauth out/in {}/{}, role {}) - the digest as it stands:",
+                                        i + 1,
+                                        state.1,
+                                        state.2,
+                                        state.3,
+                                        state.4,
+                                        state.0,
+                                    );
+                                    mp_prev[i] = mp_digest(i, inst.ptr, &mp_prev[i]);
+                                    mp_state[i] = state;
+                                }
+                            }
+                        }
                     }
                     if health_stop.load(Ordering::SeqCst) {
                         break;
@@ -714,10 +1144,22 @@ fn start_session_inner(
                         let mut stats = MDLinkStats::default();
                         unsafe { md_link_stats(inst.ptr, &mut stats) };
                         let frames = unsafe { md_frame_counter(inst.ptr) };
+                        // Liveness as the picture sees it: a wedged or
+                        // screen-locked game keeps producing frames, so the
+                        // frame counter cannot be the health signal on its own.
+                        let (beats, changed, last_beat_frame) = {
+                            let buf = health_frames[i].lock();
+                            (buf.beats, buf.changed, buf.last_beat_frame)
+                        };
                         let snap = Snapshot {
                             frames,
+                            beats,
+                            changed,
+                            last_beat_frame,
                             tx: stats.packets_sent,
                             rx: stats.packets_received,
+                            tx_bytes: stats.bytes_sent,
+                            rx_bytes: stats.bytes_received,
                             rx_bcast: stats.rx_broadcast,
                             rx_cmd: stats.rx_cmd,
                             rx_rep: stats.rx_reply,
@@ -736,6 +1178,8 @@ fn start_session_inner(
                         let d_frames = snap.frames.wrapping_sub(p.frames);
                         let d_tx = snap.tx.wrapping_sub(p.tx);
                         let d_rx = snap.rx.wrapping_sub(p.rx);
+                        let d_tx_bytes = snap.tx_bytes.wrapping_sub(p.tx_bytes);
+                        let d_rx_bytes = snap.rx_bytes.wrapping_sub(p.rx_bytes);
                         let d_polls = snap.rx_polls.wrapping_sub(p.rx_polls);
                         // Wireless is "on" between a begin and its matching end.
                         let wireless_on = stats.begin_count > stats.end_count;
@@ -831,22 +1275,70 @@ fn start_session_inner(
                             );
                         }
 
+                        /* "last change N frames ago" is the number that makes a
+                           stopped game visible: green link counters say nothing
+                           about whether either console's game is still moving.
+                           It is called "still", not "FROZEN": a menu, a dialog
+                           and a loading screen all hold one image, so a still
+                           picture on its own says a screen is waiting, not that
+                           anything is wrong (the CPU's own movement, printed
+                           beside it, is what separates a wait from a hang). */
+                        let since_beat = snap.frames.saturating_sub(snap.last_beat_frame as u32) as u64;
+                        let picture = if since_beat > 300 {
+                            format!("still (picture last changed {} frames ago)", since_beat)
+                        } else {
+                            format!("changing ({}f ago)", since_beat)
+                        };
+
                         log::info!(
-                            "health p{}: {} · frames {}(+{}) · tx {}(+{}) · rx {}(+{}) · slots 0x{:x} · wifi on/off {}/{} · pc {}/{}",
+                            "health p{}: {} · frames {}(+{}) · picture {}(+{}) · tx {}(+{}, {}B(+{})) · rx {}(+{}, {}B(+{})) · slots 0x{:x} · wifi on/off {}/{} · pc {}/{}",
                             i + 1,
                             state,
                             snap.frames,
                             d_frames,
+                            picture,
+                            snap.beats.wrapping_sub(p.beats),
                             snap.tx,
                             d_tx,
+                            snap.tx_bytes,
+                            d_tx_bytes,
                             snap.rx,
                             d_rx,
+                            snap.rx_bytes,
+                            d_rx_bytes,
                             snap.connected,
                             snap.begin,
                             snap.end,
                             pc_moved[i],
                             pc_samples[i],
                         );
+
+                        // Info, not a warning: a still picture is the one state
+                        // the picture cannot judge. A game waiting on a peer
+                        // looks the same from here as MPH's and MKDS's menus do,
+                        // and measured on the app on 2026-09-29 player 2 sat on a
+                        // still screen for 6,856 frames with its program counter
+                        // moving in half the samples - reading that as FROZEN
+                        // sent the same pass down a hang hunt twice. The CPUs'
+                        // own movement is printed with it, and `wedged` above is
+                        // the case that is actually a stall.
+                        if since_beat > 300 {
+                            log::info!(
+                                "p{}: the picture has not changed in {} frames ({} changed pixels over {} beats) while the program counter moved in {}/{} samples - a screen that does not animate and a game waiting on something look the same from here",
+                                i + 1,
+                                since_beat,
+                                snap.changed,
+                                snap.beats,
+                                pc_moved[i],
+                                pc_samples[i],
+                            );
+                        }
+
+                        // The flight recorder, once per window: what each game
+                        // did with the link, which is what the wire counters
+                        // above cannot see.
+                        mp_prev[i] = mp_digest(i, inst.ptr, &mp_prev[i]);
+
                         if verbose && (rx_active || d_tx > 0 || d_polls > 0) {
                             log::info!(
                                 "  verbose p{}: rx bcast/cmd/reply/ack {}/{}/{}/{} (+{}/+{}/+{}/+{}) · polls {} (empty {}) · tx cmd/reply/ack +{}/+{}/+{} · rx-age {}us · arm9pc {:#010X} arm7pc {:#010X}",
@@ -1088,8 +1580,11 @@ fn run_loop(
                 if !top.is_null() && !bottom.is_null() {
                     std::ptr::copy_nonoverlapping(top, buf.top.as_mut_ptr(), MD_SCREEN_PIXELS);
                     std::ptr::copy_nonoverlapping(bottom, buf.bottom.as_mut_ptr(), MD_SCREEN_PIXELS);
+                    buf.seq = u64::from(md_frame_counter(inst.ptr));
+                    // Liveness, from the picture: the frame counter alone cannot
+                    // tell a running game from one parked on a static screen.
+                    buf.note_picture();
                 }
-                buf.seq = u64::from(md_frame_counter(inst.ptr));
             }
         }
 
@@ -2077,6 +2572,1052 @@ fn spawn_heartbeat(app: tauri::AppHandle) {
 }
 
 // ---------------------------------------------------------------------------
+// Test-drive control channel (opt-in, loopback only)
+// ---------------------------------------------------------------------------
+//
+// A second, scriptable way into the app, for driving it from a shell: press
+// keys through the frontend's *real* handlers, inject game input, ask what the
+// app is doing, and read the emulated screens back as text or PNG.
+//
+// Why not X11/Wayland input injection or tauri-driver: this session runs on
+// Wayland (XWayland is present but xdotool is not, and synthetic events would
+// depend on compositor focus), while the webview can be driven directly and
+// deterministically through Tauri's own eval()/invoke() from any thread. The
+// screen reader matters more than the screenshot: an agent reads text, so the
+// ASCII renderer below turns a 256x192 DS screen into characters it can
+// actually interpret (a PNG it cannot).
+//
+// Off unless MD_CONTROL_PORT is set. Binds 127.0.0.1 only, one JSON object per
+// line, one response line each; tools/appctl.py wraps it.
+
+/// JavaScript installed before every control-channel evaluation: frame access
+/// and the screen reader. Kept in the page so the Rust side needs no image
+/// crate at all - the webview already has the pixels in canvas form.
+const CTRL_PRELUDE: &str = r#"
+window.__mdctl = window.__mdctl || {};
+(function (D) {
+  D.W = 256; D.H = 192; D.BPS = 256 * 192 * 4;
+  D.frames = async function () {
+    const b = await window.__TAURI__.core.invoke('get_frames');
+    return (b instanceof ArrayBuffer) ? b : null;
+  };
+  D.unpack = function (buf) {
+    const u8 = new Uint8Array(buf);
+    const n = Math.floor(buf.byteLength / (8 + 2 * D.BPS));
+    return { n: n, u8: u8, at: function (p) { return p * (8 + 2 * D.BPS) + 8; } };
+  };
+  // The one place "is there anything to read" is decided, and the one place a
+  // console index is range-checked: `see`, `bands` and `shot` all answer from
+  // here, so an idle app and an out-of-range player read the same wherever they
+  // are asked. Those used to be three checks in two languages and the wording
+  // drifted: on an empty app the client's copy answered "player 1 of 0 -- out of
+  // range", naming a range with no player in it where the truth is that nothing
+  // runs (2026-09-29).
+  D.frameSet = async function () {
+    const buf = await D.frames();
+    if (!buf) return { err: '(no session: get_frames returned an empty body)' };
+    const pl = D.unpack(buf);
+    if (pl.n < 1) return { err: '(no session: no console is running)' };
+    return { pl: pl };
+  };
+  D.console = async function (player) {
+    const s = await D.frameSet();
+    if (s.err) return s;
+    if (!(player >= 1 && player <= s.pl.n))
+      return { err: '(player ' + player + ' out of range: 1..' + s.pl.n + ')' };
+    return { pl: s.pl, off: s.pl.at(player - 1) };
+  };
+  D.shot = async function () {
+    const s = await D.frameSet();
+    if (s.err) return '';
+    const pl = s.pl;
+    const cv = document.createElement('canvas');
+    cv.width = D.W * pl.n; cv.height = D.H * 2;
+    const ctx = cv.getContext('2d');
+    for (let p = 0; p < pl.n; p++) {
+      const off = pl.at(p);
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(pl.u8.subarray(off, off + D.BPS)), D.W, D.H), p * D.W, 0);
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(pl.u8.subarray(off + D.BPS, off + 2 * D.BPS)), D.W, D.H), p * D.W, D.H);
+    }
+    return cv.toDataURL('image/png');
+  };
+  D.ascii = async function (player, screen, cols, crop, aspect) {
+    const c = await D.console(player);
+    if (c.err) return c.err;
+    const pl = c.pl, off = c.off;
+    const want = [];
+    if (screen === 0 || screen === 1) want.push(['top', pl.u8.subarray(off, off + D.BPS)]);
+    if (screen === 0 || screen === 2) want.push(['bottom', pl.u8.subarray(off + D.BPS, off + 2 * D.BPS)]);
+    const ramp = ' .:-=+*#%@';
+    const out = [];
+    for (const [name, px] of want) {
+      const x0 = crop ? crop.x : 0, y0 = crop ? crop.y : 0;
+      const w = crop ? crop.w : D.W, h = crop ? crop.h : D.H;
+      // Terminal cells are about twice as tall as wide, so 0.5 keeps the
+      // picture's proportions - but DS text is an 8px font, and halving the
+      // vertical resolution smears it into soup. aspect 1 (one character per
+      // pixel) makes menu text readable at the cost of looking stretched.
+      const rows = Math.max(1, Math.round(cols * (h / w) * (aspect || 0.5)));
+      out.push('-- player ' + player + ' ' + name + ' (' + w + 'x' + h + ' at ' + x0 + ',' + y0 + ' -> ' + cols + 'x' + rows + ') --');
+      for (let ry = 0; ry < rows; ry++) {
+        let line = '';
+        for (let rx = 0; rx < cols; rx++) {
+          const sx0 = x0 + Math.floor(rx * w / cols), sx1 = Math.max(sx0 + 1, x0 + Math.floor((rx + 1) * w / cols));
+          const sy0 = y0 + Math.floor(ry * h / rows), sy1 = Math.max(sy0 + 1, y0 + Math.floor((ry + 1) * h / rows));
+          let sum = 0, cnt = 0;
+          for (let y = sy0; y < sy1; y++) {
+            for (let x = sx0; x < sx1; x++) {
+              const i = (y * D.W + x) * 4;
+              sum += 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
+              cnt++;
+            }
+          }
+          const lum = cnt ? sum / cnt : 0;
+          // Inverted on purpose: DS menus are dark text on bright panels, so
+          // dense characters must mean dark pixels or the text turns into
+          // blanks against the space character.
+          const idx = Math.min(9, Math.max(0, Math.round((255 - lum) / 255 * 9)));
+          line += ramp[idx];
+        }
+        out.push(line);
+      }
+    }
+    return out.join('\n');
+  };
+  // The rows that look like text: a DS menu line is the one place on a screen
+  // with many dark/light transitions across it, which is what makes it
+  // readable at one character per pixel (the caller crops each band and reads
+  // the strip one character per pixel - that is how the MKDS route was found).
+  // Beside D.ascii because it is the same reading of the same bytes: it used to
+  // be a string of JavaScript in the Python client, with its own copy of the
+  // empty-state and range checks (2026-09-29).
+  D.bands = async function (player, screen, edge, rows) {
+    const c = await D.console(player);
+    if (c.err) return c.err;
+    const px = c.pl.u8, base = c.off + (screen === 2 ? D.BPS : 0);
+    const score = [];
+    for (let y = 0; y < D.H; y++) {
+      let e = 0;
+      for (let x = 0; x < D.W - 1; x++) {
+        const a = base + (y * D.W + x) * 4, b = a + 4;
+        const la = 0.2126 * px[a] + 0.7152 * px[a + 1] + 0.0722 * px[a + 2];
+        const lb = 0.2126 * px[b] + 0.7152 * px[b + 1] + 0.0722 * px[b + 2];
+        if (Math.abs(la - lb) > edge) e++;
+      }
+      score.push(e);
+    }
+    const out = [];
+    let start = null;
+    for (let y = 0; y <= D.H; y++) {
+      const hot = y < D.H && score[y] >= rows;
+      if (hot) { if (start === null) start = y; }
+      else if (start !== null) {
+        let best = 0;
+        for (let k = start; k < y; k++) best = Math.max(best, score[k]);
+        out.push('y ' + start + '..' + (y - 1) + '   h ' + (y - start) + '   score ' + best);
+        start = null;
+      }
+    }
+    return out.length ? out.join('\n') : '(no text bands: a solid or empty screen)';
+  };
+  // A console's <h2> holds its name and a .fps span side by side, so plain
+  // textContent glues them together and reports "Player 148 fps" (measured on a
+  // running 2-player session 2026-09-28, and read as a UI bug for a minute).
+  // Join the child nodes with a space instead - the visual gap the flex layout
+  // shows.
+  const titleText = function (h) {
+    if (!h) return '';
+    return Array.from(h.childNodes)
+      .map(function (n) { return (n.textContent || '').trim(); })
+      .filter(Boolean)
+      .join(' ');
+  };
+  D.ui = function () {
+    const cards = Array.from(document.querySelectorAll('.console'));
+    return JSON.stringify({
+      status: (document.getElementById('status') || {}).textContent || '',
+      canvases: document.querySelectorAll('canvas').length,
+      bodyClass: document.body.className,
+      active: titleText(document.querySelector('.console.active h2')) || null,
+      console_titles: cards.map(function (c) { return titleText(c.querySelector('h2')); }),
+      fps: Array.from(document.querySelectorAll('.fps')).map(function (f) { return f.textContent; }),
+      start_disabled: !!(document.getElementById('start') || {}).disabled,
+      stop_disabled: !!(document.getElementById('stop') || {}).disabled
+    });
+  };
+  D.click = function (sel) {
+    const e = document.querySelector(sel);
+    if (!e) return 'not found: ' + sel;
+    // A disabled control ignores the click entirely, so reporting success for
+    // one is a lie the driver cannot detect: `click #selftest` on an idle app
+    // (the button is disabled when nothing runs) read as "clicked #selftest"
+    // and nothing happened (2026-09-28 playtest).
+    if (e.disabled) return 'disabled: ' + sel + ' (nothing to click - is a session running?)';
+    e.click();
+    return 'clicked ' + sel;
+  };
+  /* `key` and `index` ask the page about its own vocabulary instead of keeping
+     a list of their own: `window.__mdkey` (does the page act on this name?) and
+     `window.__mdselect` (which console does it drive?) are defined next to the
+     handlers in frontend/index.html that own it - the keymap the backend sent,
+     the console digits, Tab and the peek key. Those two halves used to be the
+     frontend's map and the channel's willingness to accept any string at all,
+     and they had drifted: `key Bogus` dispatched an event nothing listens for
+     and reported success (2026-09-29). Nothing here names a key the frontend
+     does not, so there is no second list left to drift. */
+  D.key = function (code, down) {
+    if (!window.__mdkey(code)) {
+      throw new Error("this page cannot act on key '" + code + "': it acts on the console " +
+        "digits, Tab, the peek key, and the keys in the running session's own console " +
+        "keymap - so a console key needs a session, and a name the map does not carry " +
+        "moves nothing");
+    }
+    window.dispatchEvent(new KeyboardEvent(down ? 'keydown' : 'keyup', { code: code, key: code, bubbles: true }));
+    return (down ? 'keydown ' : 'keyup ') + code;
+  };
+  /* Input goes through the page's own per-console state, not straight at the
+     core: the page is what holds a console's buttons and pen together, and a
+     write from here that skipped it left the page's copy behind - the next
+     key event then pushed that stale copy over the guest's pen. The page
+     throws for a console that is not running, which this passes through. */
+  D.input = async function (player, buttons, touch) {
+    return await window.__mdinput(player, buttons, touch);
+  };
+})(window.__mdctl);
+"#;
+
+static CTRL_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static CTRL_REPLIES: Mutex<BTreeMap<u64, String>> = Mutex::new(BTreeMap::new());
+
+/// The webview half of a control evaluation: the injected IIFE reports its
+/// result (or its error) through this command, keyed by the request id.
+#[tauri::command]
+fn md_ctrl_report(id: u64, data: String) {
+    CTRL_REPLIES.lock().insert(id, data);
+}
+
+/// Evaluate `body` in the webview and wait for its value. The body runs inside
+/// an async wrapper with the prelude in scope, so it may await.
+fn ctrl_eval(app: &tauri::AppHandle, body: &str, timeout: Duration) -> Result<String, String> {
+    let id = CTRL_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let win = app
+        .get_webview_window("main")
+        .ok_or_else(|| "the app has no 'main' window".to_string())?;
+    // The body goes into the page as source, not through `eval`/`new Function`:
+    // the window's CSP is `script-src 'self' 'unsafe-inline'` with no
+    // `unsafe-eval`, so anything that compiles a string at runtime is refused
+    // (measured 2026-09-28: a `new Function` wrapper turned every `eval`, valid
+    // or not, into "Refused to evaluate a string as JavaScript"). That has one
+    // cost: a body with a *syntax* error fails the whole script's parse, so it
+    // cannot report its own error. The timeout path below asks the window a
+    // trivial question to tell that apart from a window that is gone or busy,
+    // instead of blaming the window for the caller's typo.
+    let js = format!(
+        "{prelude}(async function(){{try{{const v=await ({body});window.__TAURI__.core.invoke('md_ctrl_report',{{id:{id},data:(typeof v==='string')?v:JSON.stringify(v)}});}}\
+         catch(e){{window.__TAURI__.core.invoke('md_ctrl_report',{{id:{id},data:'__ERR__ '+((e&&e.message)?e.message:String(e))}});}}}})().catch(function(){{}});",
+        body = body,
+        id = id,
+        prelude = CTRL_PRELUDE
+    );
+    win.eval(&js)
+        .map_err(|e| format!("eval into the webview failed: {e}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(v) = CTRL_REPLIES.lock().remove(&id) {
+            // The wrapper above reports a thrown expression with this marker,
+            // and this is the only producer, so unwrapping it here is what
+            // makes a failure inside the page a failure of the command - a
+            // `key Bogus` that threw, or an `eval` of a bad expression, used to
+            // come back as successful data whose first word was the marker.
+            return match v.strip_prefix("__ERR__ ") {
+                Some(err) => Err(err.to_string()),
+                None => Ok(v),
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            // Is the webview there at all? A yes/no question it cannot fail to
+            // answer separates "your expression never ran" from "the window is
+            // not talking".
+            let alive = ctrl_eval_once(app, "1", Duration::from_secs(2)).is_some();
+            return Err(if alive {
+                format!(
+                    "the webview answered nothing for this expression in {:?} while still answering other \
+                     questions - so either the expression failed before it could report (a syntax error \
+                     cannot report itself: the CSP forbids runtime compilation, so a bad body fails the \
+                     whole script's parse) or the page went away under it (a `location.reload()` does that, \
+                     and the session survives it - retry and the channel answers again)",
+                    timeout
+                )
+            } else {
+                format!("the webview did not answer within {:?} (window gone or busy?)", timeout)
+            });
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// One injection, no fallbacks: `Some` when the webview reported within
+/// `timeout`, `None` otherwise. Used to classify a timeout above.
+fn ctrl_eval_once(app: &tauri::AppHandle, body: &str, timeout: Duration) -> Option<String> {
+    let id = CTRL_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let win = app.get_webview_window("main")?;
+    let js = format!(
+        "{prelude}window.__TAURI__.core.invoke('md_ctrl_report',{{id:{id},data:String({body})}});",
+        prelude = CTRL_PRELUDE,
+        id = id,
+        body = body
+    );
+    win.eval(&js).ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Some(v) = CTRL_REPLIES.lock().remove(&id) {
+            return Some(v);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    None
+}
+
+/// Where `shot` writes: next to the log file when MD_LOG points one out, so a
+/// screenshot is found by the same post-mortem instinct as the log itself.
+fn ctrl_shots_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("MD_SHOTS_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    if let Ok(log) = std::env::var("MD_LOG") {
+        if let Some(parent) = PathBuf::from(log).parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.join("shots");
+            }
+        }
+    }
+    PathBuf::from("logs/shots")
+}
+
+/// Minimal base64 decoder for the one thing that needs it: a screenshot
+/// returning as a `data:image/png;base64,...` URL. 40 lines instead of a crate.
+fn ctrl_b64(data: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a') as u32 + 26),
+            b'0'..=b'9' => Some((c - b'0') as u32 + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(data.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &c in data.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = val(c)?;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Rust-side state, readable without the webview (so it still answers when the
+/// UI is wedged - which is exactly when a test drive wants to ask).
+fn ctrl_status(app: &tauri::AppHandle) -> serde_json::Value {
+    let state = app.state::<AppState>();
+    let current = state.session.read();
+    let Some(session) = current.as_ref() else {
+        return serde_json::json!({ "active": false });
+    };
+    let mut frames = Vec::with_capacity(session.frames.len());
+    for (i, fb) in session.frames.iter().enumerate() {
+        let buf = fb.lock();
+        frames.push(serde_json::json!({ "player": i + 1, "seq": buf.seq }));
+    }
+    serde_json::json!({
+        "active": true,
+        "players": session.players,
+        "rom": session.rom.display().to_string(),
+        "title": session.title.clone(),
+        "elapsed_s": session.started_at.elapsed().as_secs(),
+        "link_mask": unsafe { md_link_connected_mask() },
+        "frames": frames,
+    })
+}
+
+/// Statistics over one screen: mean luma, share of the screen that is black,
+/// and a checksum that changes whenever a sampled pixel does.
+///
+/// Pixels are read in the frontend's byte order (R,G,B,A in memory, because the
+/// webview turns them straight into ImageData), and every 8th pixel is enough
+/// for "is this screen black, and is it the same black as last time".
+fn screen_stats(px: *const u32) -> serde_json::Value {
+    const STRIDE: usize = 8;
+    let mut sum: u64 = 0;
+    let mut black: u32 = 0;
+    let mut crc: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut n: u32 = 0;
+    for i in (0..MD_SCREEN_PIXELS).step_by(STRIDE) {
+        // Read-only sample of the renderer's own buffer. The pump copies this
+        // between frames; another thread reading it can see a torn line, which
+        // for a mean and a checksum is noise, not a wrong answer.
+        let v = unsafe { *px.add(i) };
+        let (r, g, b) = (v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF);
+        sum += u64::from((2126 * r + 7152 * g + 722 * b) / 10000);
+        if r < 8 && g < 8 && b < 8 {
+            black += 1;
+        }
+        crc = (crc ^ u64::from(v)).wrapping_mul(0x0000_0100_0000_01B3);
+        n += 1;
+    }
+    serde_json::json!({
+        "mean": (sum / u64::from(n)) as u32,
+        "black_pct": black * 100 / n,
+        "crc": format!("{crc:016X}"),
+    })
+}
+
+/// What a console's own picture and display registers say, right now.
+///
+/// `see` renders the last frame the pump copied, so a black screen there could
+/// be a black frame, a stale copy, or a console whose pump has stopped. This
+/// reads the renderer's framebuffers directly *and* the registers that decide
+/// what a screen shows, because a black screen has three very different
+/// authors: the game drawing black, the game turning the LCDs off
+/// (`POWCNT1` bit 0 - the soft renderer fills both framebuffers black for that,
+/// GPU_Soft.cpp), or a 2D unit disabled in `POWCNT1` (unit A black, unit B
+/// white). Comparing the framebuffer against the copy says whether our path is
+/// faithful; the registers say what the console was asked to display.
+fn ctrl_probe(app: &tauri::AppHandle, player: usize) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let current = state.session.read();
+    let session = current.as_ref().ok_or("no session")?;
+    let inst = session
+        .instances
+        .get(player)
+        .ok_or_else(|| format!("player {} is not running", player + 1))?;
+
+    let (mut top, mut bottom) = (std::ptr::null(), std::ptr::null());
+    let got = unsafe { md_get_screens(inst.ptr, &mut top, &mut bottom) } == 0
+        && !top.is_null()
+        && !bottom.is_null();
+
+    // DISPCNT is 32-bit and the bits that matter most (the display mode at 16-
+    // 17, the layer enables at 8-12) span both halves, so read it whole.
+    let reg16 = |addr: u32| unsafe { u32::from(md_read_io16(inst.ptr, 9, addr)) };
+    let reg32 = |addr: u32| unsafe { md_read_gpu(inst.ptr, addr) };
+    let powcnt1 = reg16(0x0400_0304);
+    let dispcnt_a = reg32(0x0400_0000);
+    let dispcnt_b = reg32(0x0400_1000);
+
+    let (copy, live) = {
+        let buf = session.frames[player].lock();
+        (
+            serde_json::json!({
+                "seq": buf.seq,
+                "beats": buf.beats,
+                "changed": buf.changed,
+                "last_beat_frame": buf.last_beat_frame,
+                "top": screen_stats(buf.top.as_ptr()),
+                "bottom": screen_stats(buf.bottom.as_ptr()),
+            }),
+            serde_json::json!({
+                "top": if got { screen_stats(top) } else { serde_json::Value::Null },
+                "bottom": if got { screen_stats(bottom) } else { serde_json::Value::Null },
+            }),
+        )
+    };
+
+    // The interrupt level, from the same flight recorder the health thread
+    // prints: the per-source wifi raise/ack counters and the wifi register
+    // snapshot taken at export time, plus the two program counters. A black
+    // picture with the CPUs still moving is a game waiting on an interrupt,
+    // and this is where that shows as numbers instead of an inference.
+    let mut wifi = MDMPDigest::default();
+    unsafe { md_link_mp_digest(inst.ptr, &mut wifi) };
+    let irq_list = |arr: &[u64; 16]| -> String {
+        let mut out = Vec::new();
+        for (i, v) in arr.iter().enumerate() {
+            if *v > 0 {
+                out.push(format!("{i}:{v}"));
+            }
+        }
+        if out.is_empty() { "none".to_string() } else { out.join(" ") }
+    };
+
+    // The wifi IRQ is ARM7 IRQ_Wifi (bit 23), so it lives in the high halfword
+    // of the ARM7's IE/IF; IME says whether that CPU can take interrupts at all.
+    let ie7_hi = unsafe { md_read_io16(inst.ptr, 7, 0x0400_0212) };
+    let if7_hi = unsafe { md_read_io16(inst.ptr, 7, 0x0400_0216) };
+
+    // Built as its own value rather than inline: serde_json's `json!` expands
+    // recursively, and one level of nesting around this many keys is enough to
+    // hit the macro's recursion limit.
+    let wifi_json = serde_json::json!({
+        "role": wifi.role,
+        "irq_cpu_line": wifi.irq_cpu_line,
+        "raised": irq_list(&wifi.irq_raised),
+        "acked": irq_list(&wifi.irq_acked),
+        "arms": wifi.arms,
+        "answered": wifi.answers_sent,
+        "canned": wifi.answers_canned,
+        "cmds_rx": wifi.cmds_rx,
+        "cmds_tx": wifi.cmds_tx,
+        "w_if": format!("{:04X}", wifi.w_if),
+        "w_ie": format!("{:04X}", wifi.w_ie),
+        "w_pending": format!("{:04X}", wifi.w_if & wifi.w_ie),
+        "arm7_ime": format!("{:04X}", unsafe { md_read_io16(inst.ptr, 7, 0x0400_0208) }),
+        "arm7_ie7": format!("{ie7_hi:04X}"),
+        "arm7_if7": format!("{if7_hi:04X}"),
+        "wifi_ie_bit": ie7_hi & 0x80 != 0,
+        "wifi_if_bit": if7_hi & 0x80 != 0,
+        "us_cntl": format!("{} / {}", wifi.w_uscntcnt, wifi.w_uscmpcnt),
+        "us_at": format!("{:X} / {:X}", wifi.uscounter, wifi.uscompare),
+        "beacon_irq14_blocked": wifi.block_beacon_irq14 != 0,
+        "bcn_count": format!("{:04X} / {:04X}", wifi.w_bcncount1, wifi.w_bcncount2),
+        "txslots": format!("b {:04X} r1 {:04X} r2 {:04X}",
+                          wifi.w_txslot_beacon, wifi.w_txslot_reply1, wifi.w_txslot_reply2),
+        "txbusy": format!("{:04X}", wifi.w_txbusy),
+        "txreqread": format!("{:04X}", wifi.w_txreqread),
+        "comstatus": wifi.comstatus,
+        "powerstate": format!("{:04X}", wifi.w_powerstate),
+        "powertx": format!("{:04X}", wifi.w_powertx),
+    });
+
+    Ok(serde_json::json!({
+        "player": player + 1,
+        "frames": unsafe { md_frame_counter(inst.ptr) },
+        "asleep": unsafe { md_console_asleep(inst.ptr) } != 0,
+        "pc9": format!("{:08X}", unsafe { md_get_pc(inst.ptr, 9) }),
+        "pc7": format!("{:08X}", unsafe { md_get_pc(inst.ptr, 7) }),
+        "powcnt1": format!("{powcnt1:04X}"),
+        "screens_enabled": powcnt1 & 1 != 0,
+        "engine_a": powcnt1 & (1 << 1) != 0,
+        "engine_b": powcnt1 & (1 << 9) != 0,
+        "screen_swap": powcnt1 & (1 << 15) != 0,
+        "dispcnt_a": format!("{dispcnt_a:08X}"),
+        "dispcnt_b": format!("{dispcnt_b:08X}"),
+        "bright_a": format!("{:04X}", reg16(0x0400_006C)),
+        "bright_b": format!("{:04X}", reg16(0x0400_106C)),
+        "vcount": reg16(0x0400_0006) & 0x1FF,
+        "wifi": wifi_json,
+        "framebuffer": live,
+        "copy": copy,
+    }))
+}
+
+/// What a console's own game is reading out of its wireless block, as text.
+///
+/// A value the emulator fabricates and a value the peer's game wrote look
+/// identical in every counter taken from the write side or from the wire; the
+/// only place they can be told apart is where the game's own bytecode reads
+/// them. So this returns the reads themselves - the wifi registers the game
+/// has touched with their counts and last values, the last few hundred of them
+/// in order, and every halfword it consumed out of the frame it was most
+/// recently handed (see `Wifi::MPIo`). Read it next to `probe` (which gives the
+/// same instant's ports and program counters) and the two say whether the game
+/// is looking at something we made up.
+fn ctrl_wifi_io(app: &tauri::AppHandle, player: usize) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let current = state.session.read();
+    let session = current.as_ref().ok_or("no session")?;
+    let inst = session
+        .instances
+        .get(player)
+        .ok_or_else(|| format!("player {} is not running", player + 1))?;
+
+    // The report is bounded by construction (24 registers, 512 ring entries,
+    // 128 zone bytes, 256 zone reads: a few kB), so one buffer sized well
+    // above that is enough and the C side reports truncation as a full buffer.
+    const CAP: usize = 64 * 1024;
+    let mut buf = vec![0i8; CAP];
+    let n = unsafe { md_wifi_io_report(inst.ptr, buf.as_mut_ptr(), CAP as i32) };
+    if n < 0 {
+        return Err("the wifi io report did not fit its buffer".to_string());
+    }
+    let bytes: Vec<u8> = buf[..n as usize].iter().map(|b| *b as u8).collect();
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Parse a hex string ("00 80 00 00" or "0080 0000", either case) into bytes.
+/// Refuses a non-hex spelling rather than guessing, because a probe whose body
+/// silently came out empty would look like a probe that did nothing.
+fn ctrl_hex_bytes(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut hi: Option<u8> = None;
+    for c in s.chars() {
+        if c == ' ' || c == ',' || c == '_' || c == '-' {
+            continue;
+        }
+        match c.to_digit(16) {
+            Some(d) => match hi.take() {
+                None => hi = Some(d as u8),
+                Some(h) => out.push((h << 4) | d as u8),
+            },
+            None => return Vec::new(),
+        }
+    }
+    out
+}
+
+fn ctrl_mp_vary(
+    app: &tauri::AppHandle,
+    player: usize,
+    kind: i32,
+    value: i32,
+    body: &[u8],
+) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let current = state.session.read();
+    let session = current.as_ref().ok_or("no session")?;
+    let inst = session
+        .instances
+        .get(player)
+        .ok_or_else(|| format!("player {} is not running", player + 1))?;
+
+    let mut armed = 0i32;
+    let mut left = 0i32;
+    let mut applied = 0u64;
+    let rc = unsafe {
+        md_link_mp_vary(
+            inst.ptr,
+            kind,
+            value,
+            if body.is_empty() {
+                std::ptr::null()
+            } else {
+                body.as_ptr()
+            },
+            body.len() as i32,
+            &mut armed,
+            &mut left,
+            &mut applied,
+        )
+    };
+    if rc != 0 {
+        return Err(format!("md_link_mp_vary failed ({rc})"));
+    }
+    // `kind` is what the probe is *actually* armed as (0 when a body-less body
+    // probe was accepted as nothing), not what the caller asked for.
+    Ok(serde_json::json!({
+        "player": player + 1,
+        "kind": armed,
+        "left": left,
+        "applied": applied,
+    }))
+}
+
+fn ctrl_json_player(req: &serde_json::Value) -> Result<u8, String> {
+    let p = req.get("player").and_then(|v| v.as_u64()).unwrap_or(1);
+    if !(1..=4).contains(&p) {
+        return Err(format!("player {p} is out of range 1..4"));
+    }
+    Ok((p - 1) as u8)
+}
+
+fn ctrl_array4(req: &serde_json::Value, key: &str) -> Option<[i64; 4]> {
+    let a = req.get(key)?.as_array()?;
+    if a.len() != 4 {
+        return None;
+    }
+    let mut out = [0i64; 4];
+    for (i, v) in a.iter().enumerate() {
+        out[i] = v.as_i64()?;
+    }
+    Some(out)
+}
+
+/// One request line -> one response object.
+fn ctrl_dispatch(app: &tauri::AppHandle, line: &str) -> serde_json::Value {
+    let reply = |data: serde_json::Value| serde_json::json!({ "ok": true, "data": data });
+    let failed = |err: String| serde_json::json!({ "ok": false, "error": err });
+
+    let req: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(err) => return failed(format!("bad JSON: {err}")),
+    };
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+    let arg_str = |key: &str| -> Option<String> {
+        req.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    };
+
+    // Every eval goes through the same prelude, and every command logs: the
+    // post-mortem and the test script then read the same story.
+    let ev = |body: &str| ctrl_eval(app, body, Duration::from_secs(20));
+
+    let mut resp = match cmd {
+        "ping" => reply(serde_json::json!("pong")),
+        "status" => reply(ctrl_status(app)),
+        "ui" => match ev("__mdctl.ui()") {
+            Ok(v) => reply(serde_json::json!(v)),
+            Err(e) => failed(e),
+        },
+        "eval" => match arg_str("expr") {
+            Some(expr) => match ev(&expr) {
+                Ok(v) => reply(serde_json::json!(v)),
+                Err(e) => failed(e),
+            },
+            None => failed("eval needs an 'expr' string".into()),
+        },
+        "key" => {
+            let code = arg_str("code").unwrap_or_default();
+            let down = req.get("down").and_then(|v| v.as_bool()).unwrap_or(true);
+            if code.is_empty() {
+                failed("key needs a 'code' (a KeyboardEvent.code, e.g. KeyA)".into())
+            } else {
+                match ev(&format!("__mdctl.key('{code}', {down})")) {
+                    Ok(v) => reply(serde_json::json!(v)),
+                    Err(e) => failed(e),
+                }
+            }
+        }
+        "index" => {
+            // The console selector is the page's own (window.__mdselect, beside
+            // the digit handling and setActive in frontend/index.html); the
+            // channel used to dispatch a digit by hand and then read the DOM to
+            // see whether that had worked.
+            match ctrl_json_player(&req) {
+                Ok(player) => match ev(&format!("window.__mdselect({player})")) {
+                    Ok(v) => reply(serde_json::json!(v)),
+                    Err(e) => failed(e),
+                },
+                Err(e) => failed(e),
+            }
+        }
+        "click" => match arg_str("selector") {
+            Some(sel) => match ev(&format!("__mdctl.click('{sel}')")) {
+                Ok(v) => reply(serde_json::json!(v)),
+                Err(e) => failed(e),
+            },
+            None => failed("click needs a 'selector'".into()),
+        },
+        "input" => {
+            let player = match ctrl_json_player(&req) {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let buttons = req.get("buttons").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let touch = match ctrl_array4(&req, "touch") {
+                Some(t) => format!("[{}, {}]", t[0], t[1]),
+                None => "null".to_string(),
+            };
+            match ev(&format!("__mdctl.input({player}, {buttons}, {touch})")) {
+                Ok(v) => reply(serde_json::json!(v)),
+                Err(e) => failed(e),
+            }
+        }
+        "press" => {
+            // Hold buttons for a while: DS games read the keypad far faster
+            // than a shell spawns processes, so the pause lives here.
+            let player = match ctrl_json_player(&req) {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            // Refused rather than defaulted. The channel takes a mask and the
+            // *client* turns names into masks (tools/appctl.py's BUTTONS); a
+            // name that arrives here used to be read as 0, so the command held
+            // nothing, answered `held buttons 0x0`, and left no `[input]` line
+            // for a reader to notice it by - the silent-success shape this
+            // project keeps having to remove (2026-09-29: `--press-a` and the
+            // park battery pressed A four times and held nothing at all).
+            let buttons = match req.get("buttons").and_then(|v| v.as_u64()) {
+                Some(b) => b as u32,
+                None => {
+                    return failed(format!(
+                        "press needs a button mask as a number (1 is A, 16 is right); got {:?} - names belong to the client (tools/appctl.py parses them)",
+                        req.get("buttons").cloned().unwrap_or(serde_json::Value::Null)
+                    ))
+                }
+            };
+            let ms = req.get("ms").and_then(|v| v.as_u64()).unwrap_or(120);
+            if let Err(e) = ev(&format!("__mdctl.input({player}, {buttons}, null)")) {
+                return failed(e);
+            }
+            std::thread::sleep(Duration::from_millis(ms));
+            match ev(&format!("__mdctl.input({player}, 0, null)")) {
+                Ok(_) => reply(serde_json::json!(format!(
+                    "held buttons {buttons:#x} on player {} for {ms}ms",
+                    player + 1
+                ))),
+                Err(e) => failed(e),
+            }
+        }
+        "touch" => {
+            let player = match ctrl_json_player(&req) {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let x = req.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+            let y = req.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+            let ms = req.get("ms").and_then(|v| v.as_u64());
+            if let Err(e) = ev(&format!("__mdctl.input({player}, 0, [{x}, {y}])")) {
+                return failed(e);
+            }
+            match ms {
+                Some(ms) => {
+                    std::thread::sleep(Duration::from_millis(ms));
+                    match ev(&format!("__mdctl.input({player}, 0, null)")) {
+                        Ok(_) => reply(serde_json::json!(format!(
+                            "touched player {} at {x},{y} for {ms}ms",
+                            player + 1
+                        ))),
+                        Err(e) => failed(e),
+                    }
+                }
+                None => reply(serde_json::json!(format!(
+                    "player {} touch down at {x},{y} (until 'untouch')",
+                    player + 1
+                ))),
+            }
+        }
+        "untouch" => match ctrl_json_player(&req) {
+            Ok(player) => match ev(&format!("__mdctl.input({player}, 0, null)")) {
+                Ok(_) => reply(serde_json::json!(format!("player {} pen up", player + 1))),
+                Err(e) => failed(e),
+            },
+            Err(e) => failed(e),
+        },
+        "probe" => match ctrl_json_player(&req) {
+            Ok(player) => match ctrl_probe(app, player as usize) {
+                Ok(v) => reply(v),
+                Err(e) => failed(e),
+            },
+            Err(e) => failed(e),
+        },
+        "wifiio" => match ctrl_json_player(&req) {
+            Ok(player) => match ctrl_wifi_io(app, player as usize) {
+                Ok(v) => reply(serde_json::json!(v)),
+                Err(e) => failed(e),
+            },
+            Err(e) => failed(e),
+        },
+        // The one-input probe of the parked handshake: `body` replaces the body
+        // bytes the console's game reads with the given hex, `off` clears it and
+        // reports the cumulative `applied` counter. Which bytes those are follows
+        // from the console: player 1's game reads the answers it collects, player
+        // 2's the commands it is handed. Diagnostics, never on unless asked for
+        // here.
+        "vary" => match ctrl_json_player(&req) {
+            Ok(player) => {
+                let kind = match arg_str("kind").unwrap_or_else(|| "off".into()).as_str() {
+                    "off" | "0" => 0,
+                    "body" | "1" => 1,
+                    other => return failed(format!("vary kind must be off/body, not {other}")),
+                };
+                let value = req.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let body_arg = arg_str("body").unwrap_or_default();
+                let body = ctrl_hex_bytes(&body_arg);
+                // A misspelled body used to be accepted and then armed nothing,
+                // answering `kind 1` for a probe that could never fire - the
+                // same silent miss the coordinate check exists for
+                // (2026-09-28 playtest: `vary body --body "zz"`).
+                if kind == 1 && body.is_empty() {
+                    return failed(format!(
+                        "vary body needs hex bytes (e.g. --body \"00 80 00 00\"), got '{body_arg}'"
+                    ));
+                }
+                match ctrl_mp_vary(app, player as usize, kind, value, &body) {
+                    Ok(v) => reply(v),
+                    Err(e) => failed(e),
+                }
+            }
+            Err(e) => failed(e),
+        },
+        "see" => {
+            let player = match ctrl_json_player(&req) {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            // The CLI spells screens out and the channel takes numbers, and
+            // the two used to disagree silently: `{"screen":"bottom"}` failed
+            // the u64 parse, fell back to 0 and rendered *both* screens, so a
+            // caller asking for the touch screen got the top one as well (a
+            // driver waiting for the touch screen to hold still was really
+            // waiting for an animating top screen - 2026-09-28). Take either
+            // spelling, and refuse a value that is neither.
+            let screen = match req.get("screen") {
+                None => 0,
+                Some(v) => match v.as_u64() {
+                    Some(n) if n <= 2 => n,
+                    _ => match v.as_str().map(|s| s.to_ascii_lowercase()).as_deref() {
+                        Some("top") => 1,
+                        Some("bottom") => 2,
+                        Some("both") => 0,
+                        _ => {
+                            return failed(
+                                "'screen' is 0/1/2 or \"top\"/\"bottom\"/\"both\"".into(),
+                            )
+                        }
+                    },
+                },
+            };
+            let cols = req
+                .get("cols")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(128)
+                .clamp(16, 256);
+            let aspect = req
+                .get("aspect")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5)
+                .clamp(0.25, 4.0);
+            let crop = match ctrl_array4(&req, "crop") {
+                Some([x, y, w, h]) => format!("{{x:{x},y:{y},w:{w},h:{h}}}"),
+                None => "null".to_string(),
+            };
+            let want_player = (player + 1) as u64;
+            match ev(&format!(
+                "__mdctl.ascii({want_player}, {screen}, {cols}, {crop}, {aspect})"
+            )) {
+                Ok(v) => reply(serde_json::json!(v)),
+                Err(e) => failed(e),
+            }
+        }
+        "shot" => match ev("__mdctl.shot()") {
+            Ok(url) => {
+                let bytes = url
+                    .strip_prefix("data:image/png;base64,")
+                    .and_then(ctrl_b64);
+                match bytes {
+                    Some(png) if !png.is_empty() => {
+                        let name = arg_str("name").unwrap_or_else(|| {
+                            format!("shot-{}", now_ms())
+                        });
+                        let dir = ctrl_shots_dir();
+                        let path = dir.join(if name.ends_with(".png") {
+                            name.clone()
+                        } else {
+                            format!("{name}.png")
+                        });
+                        let written = std::fs::create_dir_all(&dir)
+                            .and_then(|_| std::fs::write(&path, &png));
+                        match written {
+                            Ok(()) => reply(serde_json::json!({
+                                "path": path.display().to_string(),
+                                "bytes": png.len(),
+                            })),
+                            Err(err) => failed(format!("cannot write {}: {err}", path.display())),
+                        }
+                    }
+                    _ => failed("the page returned no PNG (no session, or empty frames)".into()),
+                }
+            }
+            Err(e) => failed(e),
+        },
+        "text" => {
+            let sel = arg_str("selector").unwrap_or_else(|| "#status".to_string());
+            match ev(&format!(
+                "(function(){{const e=document.querySelector('{sel}');return e?e.textContent:'(no {sel})';}})()"
+            )) {
+                Ok(v) => reply(serde_json::json!(v)),
+                Err(e) => failed(e),
+            }
+        },
+        "sleep" => {
+            let ms = req.get("ms").and_then(|v| v.as_u64()).unwrap_or(100);
+            std::thread::sleep(Duration::from_millis(ms));
+            reply(serde_json::json!(format!("slept {ms}ms")))
+        }
+        "quit" => match ev("window.__TAURI__.core.invoke('quit_app')") {
+            Ok(_) => reply(serde_json::json!("quit requested")),
+            Err(e) => failed(e),
+        },
+        other => failed(format!(
+            "unknown command '{other}' (ping, status, ui, eval, key, index, click, input, press, touch, untouch, see, shot, text, sleep, quit)"
+        )),
+    };
+
+    if let Some(obj) = resp.as_object_mut() {
+        obj.insert("id".into(), id);
+    }
+    // The log line is the run's post-mortem, and it is documented as
+    // `[control] <cmd>: <result>` - so an object reply has to be printed, not
+    // reduced to "ok" (which is what `vary`/`status`/`probe` used to log, losing
+    // the `applied` counter a probe is read by).
+    let brief = if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+        format!("ERROR {err}")
+    } else {
+        match resp.get("data") {
+            Some(serde_json::Value::String(s)) => s.chars().take(120).collect(),
+            Some(other) => other.to_string().chars().take(120).collect(),
+            None => String::from("ok"),
+        }
+    };
+    if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        log::info!("[control] {cmd}: {brief}");
+    } else {
+        log::warn!("[control] {cmd}: {brief}");
+    }
+    resp
+}
+
+fn ctrl_serve(app: tauri::AppHandle, stream: TcpStream) {
+    let reader = match stream.try_clone() {
+        Ok(s) => BufReader::new(s),
+        Err(_) => return,
+    };
+    let mut writer = stream;
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut out = serde_json::to_string(&ctrl_dispatch(&app, &line))
+            .unwrap_or_else(|_| String::from("{\"ok\":false,\"error\":\"unserializable reply\"}"));
+        out.push('\n');
+        if writer.write_all(out.as_bytes()).is_err() {
+            break;
+        }
+        let _ = writer.flush();
+    }
+}
+
+fn spawn_control_server(app: tauri::AppHandle) {
+    let Ok(requested) = std::env::var("MD_CONTROL_PORT") else {
+        return; // off by default: this channel can press buttons and quit the app
+    };
+    let port: u16 = match requested.trim().parse() {
+        Ok(p) => p,
+        Err(_) => {
+            log::error!(
+                "MD_CONTROL_PORT='{requested}' is not a port number; the control channel stays off"
+            );
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name("control".into())
+        .spawn(move || {
+            let listener = match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(l) => l,
+                Err(err) => {
+                    log::error!("control channel: cannot bind 127.0.0.1:{port}: {err}");
+                    return;
+                }
+            };
+            log::warn!(
+                "control channel listening on 127.0.0.1:{port} - a test-drive interface that can \
+                 press buttons and read the screens. Loopback only; never expose it."
+            );
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let app = app.clone();
+                std::thread::spawn(move || ctrl_serve(app, stream));
+            }
+        });
+    if let Err(err) = spawned {
+        log::error!("could not start the control channel thread: {err}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -2115,6 +3656,7 @@ pub fn run() {
             ui_config,
             ui_heartbeat,
             frontend_log,
+            md_ctrl_report,
         ])
         .setup(|app| {
             try_autostart(app.handle());
@@ -2135,6 +3677,9 @@ pub fn run() {
     install_signal_handlers("after webview");
 
     spawn_heartbeat(app.handle().clone());
+
+    // Opt-in test-drive channel (MD_CONTROL_PORT): off in normal runs.
+    spawn_control_server(app.handle().clone());
 
     // Window and exit events are the difference between "the user closed it"
     // and "it died": a clean close leaves a line here, a crash leaves none.

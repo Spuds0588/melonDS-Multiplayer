@@ -50,3 +50,8 @@ reports/
 # Rust / Tauri build output
 src-tauri/target/
 src-tauri/gen/schemas/
+
+# Run logs from tools/run_app.sh. In the repo on purpose - /tmp lost a whole
+# session's evidence to a reboot once (history.md v0.1.8t) - but still too
+# chatty to commit (>1MB a run with MD_LINK_VERBOSE=1).
+logs/

@@ -115,9 +115,15 @@ It writes:
 
 | file | what it is |
 | --- | --- |
-| `/tmp/md_app.log` | this run: host log, core logs, `[link-event]` lines, health + heartbeat |
-| `/tmp/md_app.log.prev` | the previous run, kept |
+| `logs/md_app.log` | this run: host log, core logs, `[link-event]` lines, health + heartbeat |
+| `logs/md_app.log.prev` | the previous run, kept |
+| `logs/archive/md_app.log-<stamp>.gz` | older runs, gzipped, ten kept |
 | `/tmp/md_crash_<pid>.txt` | a native fault or a Rust panic, with a backtrace |
+
+Logs are **in the repo** (`logs/`, gitignored), not `/tmp`, and that is on
+purpose: `/tmp` is tmpfs, and a reboot in 2026-09-26 took a whole run's evidence
+with it (history.md v0.1.8t). `MD_LOG` overrides the location. The crash files
+are still in `/tmp` - if a run matters, read them before rebooting.
 
 Reading a log after a bad session, in order of usefulness:
 
@@ -143,8 +149,54 @@ Reading a log after a bad session, in order of usefulness:
 * `LINK ACTIVE / STALL / IDLE / OFF` health lines classify each console every
   5s; `p_n stalled with peers on the bus - resynced its bus state (kick #n)`
   records an automatic cure. `MD_LINK_VERBOSE=1` adds per-kind packet counters.
+  Each line carries both directions in both units - `tx 5670(+621,
+  281938B(+29670)) · rx 2685(+299, 128B(+0))`. The frame counts alone could not
+  be compared with a harness run, whose link block is stated in bytes
+  (`sent=17219 (1,127,344 bytes)`), so a run driven through the app could not be
+  held to the harness's bar on the axis the bar is written in. Read the two
+  directions differently: the *sender's* `bytes_sent` is exact, while a
+  **host's** `bytes_received` is a lower bound (its clients' replies arrive
+  through `LocalMP::RecvReplies`, which counts the packet and cannot size the
+  payload - 128 bytes against 2,685 frames is that bound, not a loss); compare
+  the host's `bytes_sent` with the guest's `bytes_received`, window for window.
+  The two cumulative totals differ by the traffic sent before the guest's radio
+  came on, which is why the per-window deltas are the comparable number.
 * `[link-event]` lines are timestamped wireless power on/off with slot masks -
   session restarts and re-joins are visible as events, not counter resets.
+* `mp pN [host|guest]: ...` followed by `mp pN last: ...` - the **multiplayer
+  flight recorder**, once per console per 5s window *and again immediately*
+  whenever that console's multiplayer state changes (radio on or off, a deauth
+  sent or received, its role changing). For a failed join these two lines are
+  the first thing to read, not the last: they are what each game did with the
+  link, as opposed to what the wire carried.
+  * `cmds rx / cmds tx (+delta, dup)` - did the guest's game get a command, and
+    how often the seqno repeated. Careful: `dup` is **not** a retry indicator on
+    its own - the working NSMB reference repeats one seqno for 9207 of its 9208
+    commands, because melonDS's CMD retry mechanism and a polling host both do
+    that by design. The signal is `dup` *with a frozen body* (see the `last:`
+    line). The two consoles' own last-body views differ by the 4-byte FCS the
+    frame carries in its trailing slot (`W_RXLenCrop`), which the *receiving*
+    side's length entry excludes: compare the first `len - 4` bytes against each
+    other. The rule the transport follows is GBATEK's - the sender's length
+    includes the FCS, the receiver's excludes it (history.md v0.1.9r).
+  * `answered (+delta, early, blank, canned)` - did the guest's game answer,
+    inside its own round or late, with its own bytes or the firmware's `fc=0158`
+    stand-in (`canned > 0` means the guest had nothing armed).
+  * `window reads` - how many times the console's game has read its wireless
+    receive RAM window. This is the one number that separates "the mail was
+    never delivered" from "the game read it and refused it".
+  * `replies sent / collected / empty / stale / reanchor-dropped / blank /
+    notlooking` - the host's side of the answer queue, with the four distinct
+    ways an answer is lost kept apart. `replies sent` climbing on the guest
+    while `collected` stays flat on the host is a transport/queue defect;
+    both climbing while `acks (clientfail N)` climbs on the host means the host's
+    game is being told its peer failed.
+  * `deauth out/in`, and on the second line `cmd seq/len/body`, `answer
+    len/body`, `last ack clientfail`, `last deauth reason` - the actual bytes and
+    the last decision either game made, with the US-clock time each was seen.
+
+  Counters are always on (`Wifi::MPDiag`, `LocalMP::MPReplyDiag`; exported by
+  `md_link_mp_digest`). A console that has never touched the link prints nothing.
 
 #### Link operations run on the console's own thread
 
@@ -162,14 +214,29 @@ default: it puts a foreign frame into the game's receive stream). The always-on
 verification does not need it - real traffic crossing the bus is the proof, and
 the counters appear in the status bar as `link check ok N · resyncs M`.
 
+**Its window is narrow, and it is worth knowing before you go looking for probe
+lines in a log.** The monitor's first gate is `md_link_connected_mask()` needing
+two bits, and that mask *is* the consoles' wireless power (`begin_count >
+end_count`), so the window is "two consoles have powered their own radio and
+none of them has received a packet for ten seconds" - a *linked pair gone quiet*.
+Everywhere else the monitor takes the always-on arm instead: a game at a title
+screen never powers the radio (mask `0x0`, and the diag ROM does not either),
+a live NSMB session has packets in every window (mask `0x3`, counted as
+`verifiedWindows`), and a `Link test` click powers the radios on and then puts
+them back, so the mask returns to `0x0`. On success the probe logs nothing - it
+bumps `verifiedWindows`/`lastOkMsAgo`, which the session state's `monitor` block
+carries; on failure it logs `link monitor: bus probe p1->p2 not delivered -
+resyncing both consoles` and bumps `resyncs`. v0.1.9y tried to reach a window
+through the app (title screens, the diag ROM, a live session, a Link-test click)
+and reached none of them.
+
 #### Soak testing
 
 The harness is the only way to run a two-console session for a long time
 unattended (the app needs a human for the menus):
 
 ```bash
-./build-tauri/md_game_session "Test Roms/game.nds" --players 2 --frames 60000 \
-  --pc-every 4000 --touch ... --touchtap ...
+FRAMES=60000 tools/scripts/nsmb-route.sh --pc-every 4000
 ```
 
 60000 frames is ~16.7 emulated minutes per console; a clean run ends with
@@ -237,13 +304,13 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
     guest had nothing armed. On the wire that reply is `fc=0158` and the game's
     own answers are `fc=0118`; a client whose answers are mostly `fc=0158` is a
     client that stopped being asked.
-  * `[mp] answered cmd seq=... in the same round: the guest armed its reply
-    while the command was arriving ... (AID 1, mask 0002, 30 byte frame,
-    fc=0118, body[6]=00 00 5A 5A B8 B6)` - the early reply (see
-    `MD_EARLY_REPLY` below) answering within the round that asked, with the
-    bytes it is sending. On a joining client this should appear once per CMD,
-    with no `[mp] BLANK reply` next to it; a `BLANK` next to it means the answer
-    is late again and the host will retry.
+  * `[mp] answering cmd seq=... (AID 1, host mask 0002, clienttime 446, dupe 0)`
+    next to `[mp] BLANK reply to cmd seq=... (AID 0, host mask 0002)` - the two
+    halves of a guest's round. The `answering` one means the guest had a reply
+    armed and its AID set at the boundary, so its own answer went out; the
+    `BLANK` one means `W_AIDLow` was 0 and the guest's game had nothing to
+    answer with that round. Both are the guest's game's doing, and their ratio
+    is what the host's `clientfail` count in the acks is made of.
   * `reply window: not even looking for p1's replies - the bus has no other
     console attached (asked for mask 0002, connected 0001)` - the host is
     reporting every client as failed without reading its queue once. If this
@@ -266,7 +333,9 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
     Three views of one reply, and they are meant to be compared: the client's
     `answered cmd` body, the queue's `collected a reply` body, and this one. If
     the first two agree and this one is shorter, `W_RXLenCrop` did that (the DS
-    crops the FCS, so a 6-byte body arrives as 2); if the first two disagree,
+    crops the FCS, so a 6-byte body arrives as 2 - which is the documented
+    behaviour, not a loss; the sender's length counts the FCS, the receiver's
+    excludes it); if the first two disagree,
     the transport mangled the reply. `no body at all` on this line means the
     game was handed an empty answer.
   * `[mp] deauth sent: <tx> -> <rx>, 42 byte frame, reason 0000` / `[mp] deauth
@@ -275,6 +344,33 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
     MKDS attempts, so it prints on both ends with the body's reason code: the
     sender tells you which game gave up, the receiver's line is followed by a
     note that the console has just left multiplayer.
+
+  * `mp p1 irq: cpu line 110754(+962) · raised 0:+299 1:+620 6:+299 7:+620
+    12:+299 13:+22 14:+22 · acked 0:+299 1:+620 12:+299 13:+22 14:+22 · IF 88C0
+    IE 703F pending 0000` - the interrupt level, one line per console per window.
+    `raised` is every time the wifi block asked that CPU for attention on that
+    source (`SetIRQ`, and the bits forced through `W_IFSet`), `acked` every time
+    the game wrote a 1 to clear it, each with its delta since the last window and
+    listing only sources that have ever fired. `cpu line` is the 0->nonzero
+    transitions that pull ARM7 `IRQ_Wifi`. `IF`/`IE` are the block's own flags
+    and `pending` is `IF & IE`. Read it as: a source whose `raised` and `acked`
+    climb together is a source the game keeps servicing; a nonzero `pending` with
+    no `raised` movement is a source raised and never taken; `acked` flat while
+    `raised` climbs is a game that stopped entering its handler.
+  * `mp p1 hw: uscnt 1 uscmp 1 us 2345CA74/2342E800 · bcn 34 0 · slot b 0000 r1
+    0000 r2 811A · txbusy 0000 req 0002 com 0 pwr 0000/0003` - the register state
+    at the instant the digest was taken: the US counter gate and compare gate,
+    `USCOUNT`/`USCOMPARE` (the value a game waiting on the USCOMPARE -> IRQ14
+    wake is waiting for; `bcn-irq14-blocked` appears here when `W_USCompare0`
+    bit 0 has latched `BlockBeaconIRQ14`), the beacon counts, the four TX slot
+    registers, `TXBusy`/`TXReqRead`, `ComStatus` and `PowerState`/`PowerTX`.
+    This is what separates "the game is waiting on the link" from "the game is
+    waiting on its own next frame".
+  * `{"cmd":"probe","player":N}` (the control channel's `probe`, see
+    `tools/mkds_join.py`'s `screen_truth`) carries the same wifi block plus `pc9`/`pc7`, so the
+    interrupt state and both program counters can be read at any instant from a
+    running session rather than only per 5s window - `tools/mkds_join.py` prints
+    it as its `irq` line on every step report.
 
   For scale, a healthy reference session (NSMB, documented script below) prints
   ~2500 answers - nearly all of them, ~2500, retries of the previous seqno - of
@@ -293,38 +389,89 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   (135 identical `seq=02B0` commands, the peer's first two replies real and the
   rest canned, then both games bailing out). Set `=0` only to reproduce stock
   behaviour for comparison. Both settings keep the smoke test at 66/0.
-* **`MD_EARLY_REPLY` (default on) sends a client's answer inside the round its
-  command arrived in.** A DS answers a command from a reply slot the guest armed
-  *before* it arrived, and the guest arms one when it is handed a command - so
-  the answer to round N is armed *during* round N and can only leave in round N
-  if the hardware sends it the moment it is armed. Stock melonDS waits for the
-  round to end and sends whatever `Reply1` held when the round started, which
-  puts the answer in round N+1 and leaves round N with a blank (`[mp] BLANK
-  reply ... AID 0`; the gate is on `W_AIDLow`, which the guest writes around its
-  arm) - measured on MKDS's join 2026-09-25: 1302 blanks against 83 real
-  answers, the host re-sending one byte-identical command 1383 times until the
-  client's game gave up. Upstream fixed this in `8772258f` and reverted it in
-  `193c7ed9`; this restores the early reply only, not the GPU-line-aligned
-  transfer timing that came with it, and the round the early reply answers sends
-  nothing else (upstream still ran the round-end slot bookkeeping, which was
-  measured to make the guest's next arm miss its round: 734 of 2504 rounds fell
-  back to the canned frame). `=0` goes back to stock. NSMB two-player
-  script, same save, 12000 frames: every answer inside its own round (2505/2505)
-  and **zero** canned `fc=0158` stand-ins, against 0 and 752 (30%) with `=0`, at
-  the same speed and collection rate; smoke test 66/0 both ways.
+* **`MD_ARM_PERSIST` (default ON since 2026-09-28) answers a poll the guest's
+  game armed nothing for with the frame the game itself last armed.** With it
+  on, the reply slot the driver clears (`W_TXSlotReply1`) is re-supplied from
+  the arm the driver made, because the slot it clears is not the slot the
+  hardware transmits (`W_TXSlotReply2`) and the driver's clear is its own
+  bookkeeping, not a withdrawal of the answer. With it off, an arm answers
+  exactly one poll, and a poll arriving before the game has armed for it is
+  answered by the firmware's `fc=0158` stand-in whose body is `00 00 00 00` -
+  a *fabricated* peer state, measured at 22% of one MKDS freeze's rounds. On the
+  full route with it on, the stand-in fires **once** per run (the cold-start
+  round before the guest's game first armed): `canned 1`, `blank 0`, `stale 0`,
+  `deauth out 0 in 0`, both consoles `LINK ACTIVE` for 3300+ rounds, and the
+  parked post-VS state unchanged to the byte (same `45d15630` screen hash). The
+  `reason 0003` deauth that two v0.1.9h runs hit with it on did **not**
+  reproduce - those runs predate the FCS fix and `MD_REPLY_KEEP=1`. Set `=0`
+  only to reproduce the pre-2026-09-28 wire for comparison; both settings keep
+  the smoke test at 66/0. See history.md v0.1.9i.
+* **`MD_MP_FCS` (default on) writes the frame's FCS into its own trailing four
+  bytes.** GBATEK: the sender's TX length *includes* a 4-byte FCS that "the
+  hardware generates for you", and the receiver's RX header length is
+  "excluding FCS checksum" - which is what `W_RX_LEN_CROP` and `Wifi::CheckRX`'s
+  crop implement. So the transport must leave the frame's own length alone and
+  put the CRC in the slot the length already counts. `MD_MP_FCS=0` leaves the
+  game's own bytes there (stock melonDS computes no FCS at all); it is a
+  fidelity A/B, not a behaviour switch - both settings hand the peer's game the
+  same header+body. What *was* a behaviour switch is the form v0.1.9f shipped,
+  which appended the CRC *after* the frame and raised the length by 4: every
+  frame's received length then came out four bytes long, and the NSMB
+  two-player route parked in the game's own discovery screen for that reason
+  (12000 frames, one env var apart: appended = `FROZEN PICTURE`, last change
+  (today's health lines call a picture that has stopped `still`, at `info`, and
+  leave `looks wedged` for a console whose program counter really stopped - a
+  still screen with live CPUs is a menu or a dialog, not a fault, v0.1.9ae)
+  9215 frames before the end; in place or `=0` = both consoles `running` with
+  262-byte session payloads to the last frame), and a second in-place run
+  reproduces the pre-fix-era reference to within one picture beat (7915/7773
+  beats, 19402920/18472983 pixels moved, against that run's 7916/7766 and
+  19399829/18041680). See history.md v0.1.9r.
+* **`MD_RX_NOCROP=1` skips the receive-side length crop, and it is the arm that
+  proves the crop is load-bearing.** Every game here programs `W_RX_LEN_CROP`
+  to 2, and `framelen -= (IOPORT(W_RXLenCrop) << 1) & 0x1FE` in `Wifi::CheckRX`
+  (and `MPClientReplyRX`) is what turns the sender's length - which counts the
+  4-byte FCS, see `MD_MP_FCS` above - into the length the peer's game reads. It
+  is the only place in delivery where bytes the sender wrote are dropped on
+  purpose, so with `MD_MP_FCS=0` the knob is the A/B for "are those four bytes
+  payload or the FCS slot": the NSMB two-player route that plays with the crop
+  **parks without it** (guest's answer frozen at `00 80 5A 5A B8 B6`, host state
+  `0F 00`, a console dies), i.e. giving the peer's game four more bytes per
+  frame reproduces the park. Both arms keep the smoke test at 66/0. See
+  history.md v0.1.9s.
+* **`MD_EARLY_REPLY` and `MD_EARLY_REPLY_ACK` were REMOVED on 2026-09-27.** Both
+  the early reply (`Wifi::SendMPEarlyReply`, sending a client's armed answer
+  inside the round its command arrived in) and the knob that controlled its
+  guest-side bookkeeping are gone, so stock melonDS's round-end `SendMPReply` is
+  the only reply path and every frame on the wire is one a console's own
+  software produced. Why it went: it answers on the guest's behalf, so the
+  guest's driver never gets the event it waits for (MKDS's guest arms once per
+  lobby and deauthenticates seconds after joining), and it hides the question
+  the digest exists to answer - whether the guest's game has an answer armed at
+  its round boundary. It was default-off since v0.1.8v and never fixed a run.
+  Its last measurement, which is why nothing should re-add it without a new one:
+  NSMB's two-player script with `MD_EARLY_REPLY=1`, same save, 12000 frames, had
+  both consoles' screens **byte-identical from frame 3200 to 12000** (a game
+  parked, not playing) while the digest reported a flawless link - every one of
+  the 9196 rounds answered, 0 blank, 0 canned, 0 deauth - at the idle-screen
+  speed of 4.86x, against 3.28x with the picture moving. `md_game_session` now
+  fails a run whose picture stops changing, so that shape cannot be mistaken for
+  health again. History: `history.md` v0.1.8k-v0.1.8w, upstream `8772258f`
+  (added) and `193c7ed9` (reverted).
 
-  The early reply has a second half, **`MD_EARLY_REPLY_ACK` (default 1)**: sending
-  an answer inside its round skips the reply-slot transfer, and with it all four
-  things the hardware does to the *guest* when its answer leaves - the TX status
-  word (`RAM[replybuf] = 0x0001`, which stock also writes, one round late, at the
-  top of `SendMPReply`), the RF status, the `TXBusy` bit, and the
-  transfer-completion interrupt (`ProcessTX`, `num == 5`: `W_TXStat = 0x0401` +
-  IRQ1 when `W_TXStatCnt` bit 12 is set). `1` restores both, `2` additionally
-  consumes the arm as stock does, `0` behaves exactly as v0.1.8k-v0.1.8n did.
-  Measured on NSMB: all three settings are indistinguishable (answered
-  77202/77101/1645, and `W_TXStatCnt=0000` there, so that guest's game had not
-  asked for the interrupt at all), which is why 1 is the default - it cannot be
-  worse on the wire and it is what the hardware does. `[mp] early replies
+  **Why the early reply is off by default (v0.1.8v).** It answers *on the
+  guest's behalf*: the arm is turned into a frame by our fast path, so the
+  guest's own driver never gets the event its state machine is waiting for. A
+  game that keeps a guest sitting in a lobby then starves: MKDS's guest arms
+  **once** for the whole lobby (`arms 1`, answer body frozen at `00 00 5A 5A B8
+  B6`) and deauthenticates (`reason 0003`) 4-5s after joining - every run, with a
+  perfect wire. Stock behaviour re-arms the game every round (`arms 9792`,
+  `aids 6757`, answer moving to `00 80`), the host collects normally and the
+  lobby closes into game select with both consoles still linked. Cost: about
+  two-thirds of the guest's rounds go out blank (`answered 3378, blank 6417`) -
+  the game's own pacing, which MKDS accepts. NSMB tolerates the early answer
+  (12000 frames, 3.29x realtime), so this only shows up in a lobby-style game;
+  use `=1` when speed matters and a join does not. `[mp] early replies
   complete the guest's reply the way the hardware does ... W_TXStatCnt=...`
   reports which of the two a run is in, once.
 * **`MD_CMD_RETRY_NOTIFY=1` is what live runs use.** It costs nothing measurable
@@ -373,11 +520,30 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   collected=0000` in the log: if those are frequent while the client's
   `tx_reply` keeps climbing, the host is hanging up early - raise this.
   This number is the ceiling for a *single* window. How much a frame may spend
-  on all of its windows together is `MD_REPLY_BUDGET_MS` below, and that is what
-  keeps a busy join from slowing the session down.
-* **`MD_REPLY_BUDGET_MS` caps what one frame may spend inside reply waits**
-  (default **two emulated frames, ~33ms**; `MD_REPLY_BUDGET_NS` and
-  `MD_REPLY_BUDGET_MS=-1` also exist for the harness and for "no cap"). The
+  on all of its windows together is `MD_REPLY_BUDGET_FRAMES` below, and at the
+  default settings **the budget is what actually decides a window, not this**
+  (2026-09-29, measured: with a 34ms ceiling and a 2-frame budget, `RecvReplies`
+  waits `min(34, budget left)`, so the budget capped the wait in **2678** windows
+  of one MKDS lobby and this ceiling never bound once; at `MD_REPLY_TIMEOUT_MS=2`
+  the reverse held - the ceiling was below the budget, it capped the wait every
+  time, and the same route closed **394** windows empty against 43, with `empty`,
+  `clientfail` and `reanchor-dropped` all climbing together from 43 to 393). The
+  ceiling still matters: it is what a window is allowed to spend *before* the
+  budget is consulted, so setting it below the frame's own slack throws away
+  replies the frame could have afforded. Keep it above the budget.
+  The line the app prints now says where the value sits in emulated frames and
+  where it came from - `link reply timeout: 34ms = 2.03 emulated frames
+  (default)` - because it used to end "(2 emulated frames at 59.826fps)" for
+  every value, so a sweep at 2ms read as two frames when it is an eighth of one.
+* **`MD_REPLY_BUDGET_FRAMES` caps what one frame may spend inside reply waits**
+  (default **2** = two emulated frames, ~33ms; negative = no cap, the same thing
+  `MD_REPLY_BUDGET_NS=-1` means in the harness). It is in *emulated frames*,
+  which is the unit the budget is stated in - it was called `MD_REPLY_BUDGET_MS`
+  while its value was read as a frame count, so a sweep at `17` bought 17 frames
+  (284ms) rather than 17ms, and `-1` bought the default rather than "no cap".
+  `tools/run_app.sh` now forwards it (it forwarded the timeout but not this, so
+  the knob could not be reached through the app at all before - the app reads
+  its environment directly, and an unforwarded variable never arrives). The
   waits above are wall-clock time spent inside an emulated frame, so leaving
   them unbounded is a feedback loop: a slower frame makes the peer's reply
   later, the longer wait makes the frame slower. Measured cost of getting this
@@ -389,7 +555,11 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   slack is reported to the game as `clientfail` the usual way. The cap announces
   itself in the log when it bites: `reply window: p1 would have waited 34ms for
   a reply, but this frame only has 12000us of slack left` - none in a healthy
-  session, and one per empty window when a game is retrying hard.
+  session, and one per empty window when a game is retrying hard. (The line
+  prints the *ceiling* it would have used, so at a 2ms ceiling it reads "would
+  have waited 2ms ... only 33000us of slack left" - there the budget was never
+  the binding constraint, which is exactly what an over-tight ceiling looks
+  like.)
 * **Each console has its own MAC.** `md_load_rom` assigns a per-slot MAC out of
   the firmware image (slot 0 keeps the firmware's, the rest get offsets - the
   same scheme melonDS's Qt frontend uses for its extra instances), because two
@@ -477,6 +647,7 @@ the diagnostic ROM:
 # a real game: skip the button-block sensors, and rule the screens to measure them
 python3 tools/coretest/frames_to_html.py --plain --grid game-captures/run
 # show only these host frames, and mark a candidate touch point
+# (this mark is MKDS's CREATE_GROUP, whose coordinates live in tools/mkds_join.py)
 python3 tools/coretest/frames_to_html.py --plain --grid \
   --only 1200,1230,1300 --mark 128,157 game-captures/run
 ```
@@ -496,19 +667,89 @@ session can be walked to an in-game multiplayer lobby and beyond. No ROM is
 shipped or required by the build; point it at one you own.
 
 ```bash
-./build-tauri/md_game_session "path/to/game.nds" --players 2 --frames 14000 \
-  --shot-dir game-captures/run --shot-every 200 \
-  --all-players --touch 600:128:68 --touch 1000:128:157@1 \
-  --touch 1400:128:68@1 --touch 1700:127:23@2 \
-  --autotap A:6500:90
+# the reference route, one session, then nothing after frame 12000
+tools/scripts/nsmb-route.sh --shot-dir game-captures/run --shot-every 200
 python3 tools/coretest/frames_to_html.py --plain game-captures/run
 ```
+
+That route is New Super Mario Bros.'s, on *this* tree and *this* save state, and
+[tools/scripts/nsmb-route.sh](./tools/scripts/nsmb-route.sh) is the **only**
+copy of it: the touch coordinates, the repeating tap, and the frame input stops
+at all live there, and it restores the save before running and passes every
+option straight through to `md_game_session`, so `FRAMES=8000`, `BIN=...` and
+`--shot-dir` still work as documented below (history.md v0.1.9aa). It is one
+copy on purpose - this route used to be written out here and again in
+`nsmb-drop-rate.sh`, and the version here was the stale one: a route timed for a
+*fresh* save's boot flow reaches the game's local-wireless entry on no other
+save, links nothing, powers no radio a second time and reports `slots on the
+bus: 00000`, `sent=0 received=0`. Any route is one-shot taps at the exact frame
+a given boot reaches a given screen, so the note in the NSMB section below
+applies to this one as much as to any script: a fresh `.sav` shifts every
+frame, and the route has to be re-timed off the first run's own log when it
+stops landing - in one place, not four.
+
+#### Routes for the other titles in `Test Roms/`
+
+Three titles were walked to their multiplayer surface for the first time on
+2026-09-29 (history.md v0.1.9ac); these are the coordinates, re-readable off the
+sheets cited there. All of them are touch coordinates on the bottom screen.
+
+**Star Fox Command.** The title ignores buttons, so skip its attract with
+`--autotap A:300:200` and then touch. Main menu: Single Player `(135, 26)`,
+Download Play `(135, 82)`, Wi-Fi Battle `(135, 137)`, Options `(135, 180)`.
+Download Play has one option, Recruitment `(135, 100)`, which opens the host
+lobby and starts transmitting.
+
+**Metroid Prime - Hunters.** The two-console route is proven end to end
+(history.md v0.1.9ad, `logs/rom_mph_join.log`):
+
+```sh
+build-tauri/md_game_session "Test Roms/Metroid Prime - Hunters (USA) (Rev 1).nds" \
+  --players 2 --frames 35000 --all-players \
+  --touchtap 128:96:9000:400 --stop-input 11500 \
+  --touch 13000:184:90 --touch 15000:134:122 --touch 17000:136:68 \
+  --touch 19000:45:71@1 --touch 24000:184:58@2 \
+  --touch 27000:123:72@2 --touch 30000:123:72@2 --touch 33000:123:72@2
+```
+
+Title `TOUCH TO START` `(128, 96)` - buttons do nothing on it; SELECT A GAME MODE,
+where Multiplayer is `(184, 90)`; the nickname notice's `check` `(134, 122)`;
+CHOOSE MULTIPLAYER TYPE, Multi-Card Play `(136, 68)`; then the two consoles part
+ways: the host's CREATE GAME is `(45, 71)` and the guest's `AVAILABLE GAMES`
+list row - `MELONDS`, 58 down, *not* the 46 an earlier guess had - is
+`(184, 58)`, with **JOIN GAME `(123, 72)`** doing the joining. The row only
+selects: the pair's stored frames step apart at frame 27000->27250, which is the
+`(123, 72)` tap, and a run that omitted it left the guest on the join screen with
+`sent=0` while the host beaconed. Allow ~3,000 frames between the row and the
+confirm.
+
+The title is the trap. It sits behind an attract loop that alternates
+cinematics with the `TOUCH TO START` card every ~1,000 frames, and *which* phase
+a given frame lands in moves with the save on the card - on the save v0.1.9ac
+left behind, every `--touch` frame measured against the previous save landed
+inside a cinematic that discards input (`slots 00000`, no second radio
+power-on). Hence the repeating `--touchtap ...:9000:400` bounded by
+`--stop-input 11500`: it lands within a few cycles and stops before it can stray
+onto the screen after. Everything past the title waits for input, so one tap per
+stage is enough.
+
+**LEGO Star Wars II** has no multiplayer mode, so there is no route to keep:
+its main menu is New Game `(132, 68)`, Load Game `(132, 102)`, Settings
+`(132, 135)`, and Settings offers only volume sliders and Credits. A running
+run of it is still useful as a negative control - the radio powers on and off
+once at boot and never again.
 
 Input options (`--tap`, `--hold`, `--autotap`, `--touch`, `--holdtouch`,
 `--touchtap`) each take an optional `@P` suffix naming which consoles to drive,
 1-based and comma separated, so a host can be driven differently from the
 consoles joining it. Touch coordinates are touch-screen pixels: 0..255 across,
 0..191 down, origin top-left.
+
+`--stop-input FRAME` ends every input scheduled to *begin* at or before FRAME at
+FRAME; an input that begins after it is left alone. It exists to separate a run's
+menu route from the thing it is measuring: the route above is a repeating tap,
+and a repeating tap otherwise runs to the end of the session, so "the route, and
+then nothing" was not expressible before (v0.1.9aa).
 
 Three settings are load-bearing, and `--serial` or a non-zero `--recv-timeout`
 will respectively crawl or hang rather than fail cleanly. Three script-writing
@@ -523,11 +764,13 @@ traps cost a day each the first time (history.md v0.1.3, re-learned 2026-09-24):
   taps - a repeating tap past a screen can walk the console somewhere else
   (MKDS's joiner tapping the group bar too long ends up creating its own
   group). One-shot coordinates only survive identical boot timing.
-* **MKDS NORMAL vs SIMPLE are one tap apart** (`(128,68)` vs `(67,145)`) and
-  the wrong one still reaches *a* lobby - a single-card one the other console
-  can never see. `(128,68)` repeats are safe on both the main menu
-  (MULTIPLAYER) and mode select (NORMAL) for every console; the joiner should
-  then only ever tap the cyan group bar `(127,23)`.
+* **MKDS NORMAL vs SIMPLE are one tap apart** (`NORMAL` vs `SIMPLE` in
+  [tools/mkds_join.py](./tools/mkds_join.py), which is the only copy of the
+  route's coordinates) and the wrong one still reaches *a* lobby - a single-card
+  one the other console can never see. Those two constants share their
+  coordinate with `MULTIPLAYER` and `DIALOG_YES` respectively, so a repeat of
+  either is safe on both the main menu and mode select for every console; the
+  joiner should then only ever tap the cyan group bar (`JOIN_GROUP`).
 
 | option | default | why |
 | --- | --- | --- |
@@ -543,6 +786,229 @@ fairly ordinary laptop, and around 6x for a single console.
 `tools/coretest` also documents a worked 2-console run of Mario Kart DS, menu
 coordinates included, in [history.md](./history.md). It is a useful starting
 point for driving any DS game into local wireless play.
+
+That same route drives the **desktop app** and not only the harness:
+[tools/mkds_join.py](./tools/mkds_join.py) starts the app through
+`tools/run_app.sh` (`MD_AUTOSTART_PLAYERS=2` plus the ROM), speaks the control
+channel, reads each console's screen between taps, and presses CUT OFF and VS on
+*the screen* - the CUT OFF patch is sampled and the tap fires when its luma
+changes - rather than on a clock. Through the app on 2026-09-29 the join, CUT
+OFF and VS all landed, both consoles ended on the same screen, and the link held
+with `cmds tx 2687 = cmds rx 2687`, `answered 2686 + canned 1 = replies sent
+2687 = collected 2683 + empty 4`, `acks 2687(+299, clientfail 4)`, `deauth
+out/in 0/0` and `slots 0x3` on both consoles - the app's counters in the
+harness's units. Captures: `game-captures/mkds-app/` (`mkds-lobby.png`,
+`mkds-after-cut-off.png`, `mkds-after-vs.png`; the window is a 2x2 grid, each
+console's top and bottom screen). It stops exactly where the harness stops - see
+"MKDS's post-VS latch" in [to-do.md](./to-do.md) - and input from the app's own
+path does not move it: A, START and a touch on each console's bottom screen left
+both framebuffers byte-identical while the log shows the input being delivered
+(`[input] frame 12524 player 2 touch -> 128,96` ... `frame 12534 player 2 touch
+released`).
+
+New Super Mario Bros. has its own worked route there too (`New Super Mario Bros.
+- two consoles link and play`), with the screens and the touch coordinates of
+every step. Read its **Re-run 2026-09-28 (v0.1.9r)** note before trusting it:
+for one day (v0.1.9f-v0.1.9q) the same command parked both consoles in the game's
+own discovery screens (`Searching for ...`, `Please Wait.`) with a flawless link
+under them, because the transport was appending its own FCS after every frame
+and so lengthening every received frame by four bytes - the route reaches a
+round again now that the FCS is written into the frame's own trailing slot, so
+the note is a warning about the *framing* and not about the route. The second
+console's `(127,160)` character tap still lands below the card it used to hit,
+and the screen sequence it walks is tabulated there. A one-shot tap is only good for the boot timing that measured
+it; prefer repeating taps (`--touchtap`) where a screen can be missed.
+
+That route also drives the **desktop app**, and does it in the harness's own
+frames: [tools/nsmb_join.py](./tools/nsmb_join.py) starts the app through
+`run_app.sh`, waits for the *frame counter* rather than a wall clock, taps both
+consoles on the same frame (one control connection per console - a single
+connection serialises the two taps ~11 frames apart), and reports every route
+frame the session had already passed. The frame rule is the whole of it: the
+route's first tap is at frame 612 and the app runs at 59.8fps, so waiting 18s for
+boot put the tap at frame 1225 and the app's *game* ~600 frames behind the
+harness's for the whole session - three runs parked that way with a flawless link
+under them (both consoles `[host]`, `rx bcast/cmd/reply/ack 1596/0/0/0`). Driven
+from the frame counter, the app's own radio timeline lands within 5 frames of the
+harness's (`wireless ON (begin #2)` at 2050 and 2735 against 2045 and 2733), and
+the two consoles hold a real session: one host, one guest, guest `cmds rx 7916
+answered 7916`, host `cmds tx 7916 acks 7916 collected 7612 empty 4`, `deauth 0`,
+`slots 0x3`, and both screens on the game's own course - at route frames
+3780/4200/5000 the captures in `game-captures/nsmb-app/` are the same frames the
+harness's own shots are (canvas mean 168, nearest harness frame the same number).
+Keep driving after the wire couples (`--stop-when-coupled` stops there): the
+harness's repeating A/CONFIRM taps until frame 11500 are what take the games from
+the lobby into the race, and stopping at the couple leaves them in the lobby.
+
+### Does one player's input reach the *other* console's picture?
+
+`tools/nsmb_join.py --restart --couple-fine` answers that at frame granularity,
+and `--no-drive --couple-fine` asks it again of a session that is already up
+(cheap: ~20s). Four phases, each four seconds, sampled **inside the page** by
+`SAMPLER_JS` - one `__mdctl.frames()` per iteration, ~70 samples/s, and only
+pairs where *both* consoles advanced exactly one emulated frame are counted, so
+the comparison is in the game's own clock rather than the sampler's:
+
+    A no input   B the guest alone holds RIGHT   C no input   D the host alone does
+
+Each phase returns a bitmask per console and screen of every pixel that moved,
+plus per-pair moved-pixel counts. The two no-input phases are the baseline, and
+the question is which pixels moved under one console's input and in *neither*
+baseline. Measured on the app's own NSMB race (2026-09-29, three runs):
+
+* the pressed console's own screens move 29,000-31,700 px (top, the whole view)
+  and ~1,900 px (bottom),
+* the **other** console's pictures move 740-1,927 px of the bottom screen (it
+  moved in all four runs) and, in three of the four, 1,000-1,700 px of its own
+  top view in a band at y 155..178 - the run where the pressed console walked
+  least is the one whose cross-effect is smallest, which is what a causal
+  effect should look like,
+* the shared map's pixels are where the bottom figure lives: the two consoles'
+  bottom screens differ by **0 px per pair**, so the bottom screen is *one*
+  picture both consoles render, and a change there is one picture moving on both.
+
+Two things about reading it. **The control gates the claim**: if the console that
+was pressed does not move its *own* picture, the state cannot answer the question
+and the run says `inconclusive` instead of reading a stray handful of pixels as
+attribution (a session ten minutes on printed `attributed ... 11 px` under a
+`> 0` test before this was a gate; the guest's own screens had moved 6 px). And
+**the state matters**: the game moves on from the race the measurement needs -
+later in the same session the guest's RIGHT stopped moving its own screen
+entirely - so an `inconclusive` result means re-run the route, not that the app
+failed. The `D` phase is what makes a *null* readable: it shows the host's own
+screen responding to its own input in the same state.
+
+### Driving the app from a shell (`tools/appctl.py`)
+
+The app carries an opt-in control channel so it can be test-driven without a
+human at the keyboard - pressing buttons, injecting input, reading the emulated
+screens, saving screenshots (history.md v0.1.8u). `tools/run_app.sh` turns it on
+by default:
+
+```sh
+MD_CONTROL_PORT=7373 tools/run_app.sh     # default; MD_CONTROL_PORT= turns it off
+```
+
+It binds `127.0.0.1` only, speaks one JSON object per line, and logs every
+command as `[control] <cmd>: <result>` in the ordinary app log so a scripted run
+and its post-mortem tell one story. **Never expose the port**: it can press
+buttons and quit the app.
+
+**The app writes the game's save file; the harness does not.** A session leaves
+the card alone until it ends, so an app run looks harmless right up to the
+moment `Test Roms/<game>.sav` comes back with a different md5 - a 40-minute
+Metroid Prime - Hunters session did exactly that (v0.1.9ae, `ffa024d5…` ->
+`96720058…`, restored from `/tmp/romtest-sav-before/`). `tools/run_app.sh` now
+pins the ROM's `.sav` to `game-captures/sav-backups/<name>.sav.before-app-<stamp>`
+before the app starts and, when the app exits, prints either `sav … unchanged
+(md5 …)` or `sav … CHANGED (md5 A -> B)` with the one `cp` that puts it back. It
+does not restore by itself - the same launcher is used to play - so a scripted
+run that needs byte-identity restores from the printed pin. The harness needs
+none of this: every `Test Roms/*.sav` survived all of its runs unchanged.
+
+```sh
+tools/appctl.py status                     # session, frame counters, link mask
+python3 tools/appctl.py ui                 # the window's own status line, active console
+tools/appctl.py see                        # both DS screens as ASCII, 128 cols
+tools/appctl.py see --player 2 --screen bottom --cols 96
+tools/appctl.py see --crop 0 60 256 20 --cols 256 --aspect 1   # read one menu line
+tools/appctl.py shot --name lobby          # logs/shots/lobby.png (all consoles, both screens)
+tools/appctl.py window --name desktop      # whole screen via spectacle, app window included
+tools/appctl.py render logs/shots/lobby.png --cols 120         # any PNG back to ASCII (no app needed)
+tools/appctl.py press a --player 1 --ms 120
+tools/appctl.py touch 128 95 --ms 150      # pen down at a DS coordinate
+tools/appctl.py index 2 && tools/appctl.py tap KeyA   # real key events, real keymap
+tools/appctl.py click '#start'             # click UI by CSS selector
+tools/appctl.py advance --player 1 --frames 300   # wait for the console to actually run
+tools/appctl.py wifiio --player 1          # what player 1's game is reading out of the block
+tools/appctl.py vary body --body "00 00 00 00"  # diagnostics: perturb one input (see below)
+tools/appctl.py script tools/scripts/example.txt  # a file of these, one per line
+```
+
+`render` is the one subcommand that reads a file and nothing else, so it runs
+with **no app and no control port** - which is the case it exists for, because
+the PNGs it reads are usually what a finished `md_game_session --shot-dir` run
+left behind. `--crop x y w h` (commas tolerated) and `--mono 140 --bright --zoom
+2` are the combination that turns an 8px DS font into something you can read:
+`--mono` thresholds, one character per pixel, `--bright` for bright ink on a dark
+panel (a DS dialog box) and the default for dark ink on a bright one (a menu).
+`tools/glyphs.py` is the next step when a word still needs to be certain - it
+splits a crop into one block per character.
+
+Two things a driver hits before it hits a game, both measured on 2026-09-28.
+Reloading the window mid-session (`eval location.reload()`, or a user pressing
+reload) is **survivable**: the Rust side and the session keep running and the UI
+comes back, but the webview stops answering for over 20 s, so the command that
+triggered the reload fails and every webview read after it used to fail too. The
+read-only webview commands (`ui`, `see`, `shot`, `text`, `bands`) are now retried
+once after 3 s, and commands that change state (`click`, `press`, `touch`, `key`)
+are deliberately not - a duplicated click is a duplicated input. They say so in
+the failure instead. Careless arguments are also sentences now rather than
+tracebacks or silent successes: `press 0xZZZZ`, `script /missing.txt`, `press` or
+`touch` with no session running, `click` on a disabled control, and `advance N`
+(the bare count, which argparse used to reject). `key Bogus` is refused with a
+sentence too, and it names what the page does act on: the digits, Tab, the peek
+key and the running session's own keymap. `key`/`index` ask the frontend's own
+`window.__mdkey`/`window.__mdselect` rather than keeping a list of their own, so
+there is no second list to drift - which is the trap that let `key Bogus`
+succeed in silence until now (history.md v0.1.9ab).
+
+`vary` is the one-input-at-a-time probe of a parked handshake (history.md
+v0.1.9k for what it was built for and v0.1.9u-v for what it measured): `body`
+replaces the body bytes the console's game reads, `off` clears it and reports the
+cumulative `applied`. Which bytes those are follows from the console - player 1's
+game reads the answers it collects, player 2's the commands it is handed - so one
+arm perturbs one input, and `applied` (read back from the probe, not from the
+caller's own arithmetic) is how a cell is known to have fired:
+
+```
+tools/appctl.py vary body --body "00 00 00 00" --player 1 --value 2000
+tools/appctl.py vary off --player 1          # cumulative applied
+```
+
+A probe set on a dead link reads `applied 0`, which is a measurement of nothing -
+check a digest line before believing a probe. Note that the control channel's
+`probe` command - the framebuffer/POWCNT1/wifi snapshot `tools/mkds_join.py` uses
+for its per-step report - is not an `appctl.py` subcommand; call it as
+`{"cmd":"probe","player":N}`.
+
+The frame ledger (`[mp] tx frame: slot N (NAME) fc=... seq=...`, the transport's
+`[link-trace] pN tx/rx`, the reply window's credit and the delivery lines) is the
+per-frame record, and it is joined **by frame identity, never by line order**,
+because a slot line and the transport line that follows it are the same frame.
+Two things it taught, both still load-bearing (history.md v0.1.9p): the ledger
+has to print the control word it is actually about to send (the no-seqno bit is
+applied after the game's copy is read, so 3439 of 8536 replies were logged
+`fc=0118` while the wire carried `fc=0918`), and a broadcast is not a separate
+path - the same `fc=0080` arrives as the peer's beacon (110B, delivered `as an MP
+client`) *and* as this console's own `melonAP` beacon (60B, `outside
+multiplayer`), and counting them together once read as the host's broadcasts
+being undelivered.
+
+Notes from building it:
+
+* **Why not xdotool or tauri-driver.** This is a Wayland session: there is no
+  `xdotool`, synthetic X11 events would depend on compositor focus, and
+  `tauri-driver` needs `webkit2gtk-driver` from apt plus a `cargo install` - and
+  would still only drive the web UI, never the emulated consoles. Tauri's own
+  `eval`/`invoke` reach the webview from any thread regardless of the display
+  server, so the channel goes through the page: `key` dispatches a real
+  `KeyboardEvent` and the frontend's own keymap/handler does the rest, which is
+  why a scripted `press a` exercises the same path a user's finger does.
+* **The screen reader matters more than the screenshot.** An agent can see a PNG
+  exactly as well as it can see a photograph - not at all, but text it can read.
+  The ASCII renderer inverts the luminance ramp on purpose (DS menus are dark
+  text on bright panels, so dense characters must mean dark pixels), and for
+  actual menu text, crop the strip and pass `--aspect 1` for one character per
+  pixel: the DS's 8-pixel font is only legible at that ratio.
+* **`status` is answered by the Rust side**, so it still reports when the webview
+  or the UI is wedged - which is exactly when a test drive wants to ask.
+* **Screenshots go next to the log**: `MD_LOG`'s directory + `/shots`, or
+  `MD_SHOTS_DIR` when set.
+* **One command per line in a script** lets a whole run - boots, waits, presses,
+  taps, screenshots - be replayed and diffed between builds. `--player` is
+  1-based everywhere in `appctl.py`; the button names are `a b select start
+  right left up down r l x y`, composable with `+`, or a raw mask in hex.
 
 ## Building the melonDS Core
 

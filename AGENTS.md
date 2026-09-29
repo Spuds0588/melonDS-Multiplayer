@@ -18,6 +18,7 @@ This document provides guidance for AI coding agents working on the melonDS Mult
 ├── to-do.md               # Development roadmap and tasks
 ├── history.md             # Project history, lessons from mgba-splitscreen
 ├── BUILD.md               # Build instructions (update as project evolves)
+├── compatibility.md       # Per-game multiplayer compatibility list + evidence
 ├── PRD-melonDS-multiplayer.md  # Product Requirements Document
 ├── LICENSE                # GNU GPL v3 (inherited from melonDS)
 ├── .github/               # GitHub workflows and configuration
@@ -59,6 +60,11 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for detailed C++ style guidelines from 
 
 ### DO:
 - **Prioritize local splitscreen over online features** — this is the core use case
+- **Stability and playability outrank emulation accuracy.** The product goal is
+  the widest game set, with 4 players, on the least hardware that can work — so a
+  measured, documented departure from stock melonDS accuracy is allowed when it
+  buys that (see the trade-off section at the top of to-do.md). Never at the cost
+  of silently losing data a game is waiting for, or of players' saves diverging
 - Use melonDS's native Wi-Fi emulation for link cable functionality (don't reinvent sync)
 - Implement per-player controls with full remapping support
 - Add view modes (grid, speaker, focus, overlay) for different setups
@@ -82,6 +88,10 @@ Refer to [to-do.md](./to-do.md) for the current development roadmap. The phases 
 3. **Phase 3**: Game Library & UX - ROM management, box art, save states, pause menu
 4. **Phase 4**: Polish & Testing - Testing with actual multiplayer games, bug fixes, performance
 5. **Phase 5**: Online Play (Optional/Future) - WebRTC for remote players if desired
+
+The current focus is at the top of [to-do.md](./to-do.md):
+["The road to a working 2, 3 and 4-player link"](./to-do.md#the-road-to-a-working-2-3-and-4-player-link).
+Per-game results live in [compatibility.md](./compatibility.md).
 
 ## Lessons from mgba-splitscreen
 

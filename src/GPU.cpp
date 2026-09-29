@@ -1378,6 +1378,11 @@ void GPU::SetVCount(u16 val, u16 mask) noexcept
     // the VCount register is 9 bits wide
     val &= mask & 0x1FF;
 
+    /* A VCOUNT write delays the line counter, so a game that writes it makes
+       that console's frame longer than the DS's 263 lines - the game's business,
+       left alone here; the MP clocks no longer inherit it (see
+       NDS::GetSharedUSClock, and history.md v0.1.9i for the 254ms it cost). */
+
     // VCount write is delayed until the next scanline
 
     // TODO: how does the 3D engine react to VCount writes while it's rendering?

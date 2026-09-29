@@ -1,0 +1,30 @@
+# Example test drive - one appctl.py command per line, '#' comments ignored.
+#
+#   tools/appctl.py script tools/scripts/example.txt
+#
+# What this does: confirms the channel, waits for the consoles to actually run
+# frames, presses START on both to get past MKDS's title screen, and takes a
+# look plus a screenshot. Extend it into a full MKDS join by watching `see`
+# after each step - the route that matters is boot -> title -> MULTIPLAYER ->
+# the group bar -> lobby, and its coordinates (MULTIPLAYER, JOIN_GROUP, ...)
+# live in tools/mkds_join.py, which owns them.
+
+ping
+status
+advance --player 1 --frames 120 --timeout 30
+sleep 500
+
+see --player 1 --screen both --cols 128
+shot --name example-boot
+
+press start --player 1 --ms 120
+press start --player 2 --ms 120
+sleep 2000
+see --player 1 --screen bottom --cols 128
+
+# Menu text is an 8px font: crop the strip that looks like text and read it one
+# character per pixel, e.g.
+#   see --player 1 --screen bottom --crop 0 60 256 20 --cols 256 --aspect 1
+
+shot --name example-after-start
+status
