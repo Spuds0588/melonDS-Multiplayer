@@ -12,7 +12,13 @@
       * the host-stamped identity shows up on screen
       * input reaches exactly one instance
       * savestates round-trip
+      * the IPC FIFO counters: a push and a pop are counted, a dropped write and
+        an empty poll are not
+      * the wifi io report: its PC-tagged register record is present and the
+        whole report still fits the control channel's fixed buffer
       * the local link: slot routing, isolation, and the wireless power-on path
+      * the link's reply path: which console an answer belongs to and where in
+        the host's buffer it lands (none of this was checked before)
 
     Run it with: build-tauri/tools/coretest/md_smoke_test <path to diag.nds>
 */
@@ -25,6 +31,7 @@
 #include <vector>
 
 #include "melonds_bridge.h"
+#include "LocalMP.h" // the link bus itself, for the reply-path checks below
 
 namespace
 {
@@ -197,8 +204,46 @@ int main(int argc, char** argv)
     md_rom_title(a, title, sizeof(title));
     check(std::strcmp(title, "MD DIAG") == 0, "ROM title reads back as 'MD DIAG'");
 
+    /* The game code is the identity a per-game profile resolves from, so it has
+       to survive the same load path the title does. The diag ROM's code is not
+       in the registry on purpose - it exercises the no-entry default path. */
+    char game_code[8] = { 0 };
+    const int code_rc = md_rom_game_code(a, game_code, sizeof(game_code));
+    check(code_rc == 0 && std::strcmp(game_code, "MDSP") == 0,
+          "ROM game code reads back as 'MDSP'");
+
     check(md_load_rom(b, rom.c_str()) == 0, "second instance loads the ROM");
     check(md_load_rom(c, rom.c_str()) == 0, "third instance loads the ROM");
+
+    /* The synthesized Download Play joiner addresses its management frames as
+       its own console (their receiver/transmitter addresses decide whether the
+       host's reply is accepted back), so the per-slot identity has to be
+       readable through the bridge and different on each console. A console
+       that has not booted a ROM has no identity yet, which is a refusal. */
+    unsigned char mac_a[6] = { 0 }, mac_b[6] = { 0 }, mac_c[6] = { 0 };
+    check(md_console_mac(a, mac_a) == 0 && md_console_mac(b, mac_b) == 0 &&
+          md_console_mac(c, mac_c) == 0,
+          "console MACs read back through the bridge");
+    check(std::memcmp(mac_a, mac_b, 6) != 0 && std::memcmp(mac_b, mac_c, 6) != 0 &&
+          std::memcmp(mac_a, mac_c, 6) != 0,
+          "console MACs differ per slot");
+    {
+        MDInstance* fresh = md_create(0, "never-booted");
+        unsigned char none[6] = { 0 };
+        check(fresh && md_console_mac(fresh, none) != 0,
+              "a console with no ROM has no MAC to hand out");
+        md_destroy(fresh);
+    }
+
+    /* The synthesized Download Play joiner attaches at the bus level and must
+       be able to notice that a game's own wireless power cycle detached it
+       again, so the attachment state is read back rather than assumed. */
+    check(md_link_attached(a) == 0,
+          "a console whose radio is off is not on the bus");
+    check(md_link_test_attach(a, 1) == 0 && md_link_attached(a) == 1,
+          "attaching at the bus level puts a console on the bus");
+    check(md_link_test_attach(a, 0) == 0 && md_link_attached(a) == 0,
+          "detaching takes it off the bus again");
 
     check(stamp_identity(a, 0, COLOUR_RED), "stamped identity into instance A");
     check(stamp_identity(b, 1, COLOUR_BLUE), "stamped identity into instance B");
@@ -226,6 +271,27 @@ int main(int argc, char** argv)
 
     check(md_stop_reason(a) == MD_STOP_NONE, "instance A never stopped (no crash)");
     check(md_stop_reason(b) == MD_STOP_NONE, "instance B never stopped (no crash)");
+
+    /* The wifi io report is read over the control channel into a fixed 64 KiB
+       buffer, and the C side reports truncation as a failure rather than as a
+       short answer - so a section that outgrows the buffer takes the whole
+       command with it. Two sections were added to it (the PC-tagged register
+       record, which is what names a driver's bring-up gate), so both the shape
+       and the fit are worth pinning here: the sections must be present and the
+       whole report, IPC trace included, must still fit the cap the control
+       channel hands it. */
+    {
+        const size_t cap = 64 * 1024;   // ctrl_wifiio's CAP (src-tauri/src/lib.rs)
+        std::vector<char> rep(cap + 1, 0);
+        const int n = md_wifi_io_report(a, rep.data(), (int)cap);
+        check(n > 0, "the wifi io report fits the control channel's buffer");
+        check(n > 0 && std::strstr(rep.data(), "register accesses in order") != nullptr,
+              "the wifi io report carries the PC-tagged register record");
+        check(n > 0 && std::strstr(rep.data(),
+                                  "registers the game wrote, last writer per offset") != nullptr,
+              "the wifi io report carries the register write table");
+        std::printf("       wifi io report: %d bytes of %zu\n", n, cap);
+    }
 
     /* The ROM keeps progress markers in RAM so a failure points at a specific
        part of the program instead of just "nothing happens". */
@@ -490,6 +556,183 @@ int main(int argc, char** argv)
     check(md_link_recv_packet(b, inbox_b, sizeof(inbox_b), nullptr) == 0,
           "a drained link returns nothing rather than blocking");
 
+    /* ---- the wire's own rewrite of a frame ------------------------------- */
+    /* A frame's trailing four bytes are the hardware's FCS slot, not the
+       sender's payload: SendPacketGeneric writes the checksum *into the frame*
+       (GBATEK's W_TXBUF_LOCn[0Ah], "the hardware generates the FCS for you"),
+       and the receiving console is handed the frame minus those bytes. That
+       rule is what the Link test's probe now arms with, and here is why it has
+       to: the old test tagged its frames with a nonce in that very slot and
+       then waited for the nonce back, so its comparison could never succeed -
+       the last word always arrived as the sender's checksum.
+
+       An all-zero four-byte body pins the value independently of this code:
+       0x2144DF1C is the CRC-32 of four zero bytes, the same number any other
+       implementation of the standard polynomial produces. */
+    {
+        unsigned char wire_in[20] = { 0 };
+        for (int i = 0; i < 16; i++) wire_in[i] = (unsigned char)(0x11 + i);
+        wire_in[12] = wire_in[13] = wire_in[14] = wire_in[15] = 0;
+
+        unsigned char wire_out[20] = { 0 };
+        const bool wrote = melonDS::LocalMP::ApplyWireFCS(wire_out, wire_in, sizeof(wire_in));
+        check(wrote, "the wire writes the hardware's FCS into a frame's trailing four bytes");
+        check(std::memcmp(wire_out, wire_in, 16) == 0,
+              "the FCS rewrite leaves the frame's own bytes - header and body - alone");
+
+        const unsigned long fcs = (unsigned long)wire_out[16] |
+                                  ((unsigned long)wire_out[17] << 8) |
+                                  ((unsigned long)wire_out[18] << 16) |
+                                  ((unsigned long)wire_out[19] << 24);
+        check(fcs == 0x2144DF1Cul,
+              "the four bytes it writes are CRC-32 over the frame's header and body");
+        check(!melonDS::LocalMP::ApplyWireFCS(wire_out, wire_in, 12),
+              "a frame with no room for an FCS slot is passed through, not rewritten");
+    }
+
+    /* ---- what the Link test measures: delivered, and read by whom --------- */
+    /* The receive half of a Link test cannot be "drain the peer and look for
+       the frame": the peer's game polls its receive slot from inside the
+       emulation every frame and wins that race whenever it is running (and its
+       read proves delivery just as well). So the bus keeps its own ledger of
+       frames handed to each console, and a probe armed on the receiver records
+       whichever consumer read the armed bytes. What follows is that instrument
+       driven through the same C calls the app button uses. */
+    {
+        const uint32_t probe_magic = 0x4D535430u; // 'MST0'
+        const uint32_t probe_nonce = 0x5A5A1234u;
+        const uint32_t probe_ts = 4321u;
+        uint32_t words[5] = { probe_magic, 0u, 1u, probe_nonce, 0u };
+        unsigned char wire[sizeof(words)] = { 0 };
+        std::memcpy(wire, words, sizeof(wire));
+
+        MDLinkStats before {};
+        md_link_stats(b, &before);
+
+        check(md_probe_arm(b, wire, sizeof(wire), probe_ts) == 0,
+              "an expectation can be armed on the receiving console");
+        check(md_link_send_packet(a, wire, sizeof(wire), probe_ts) == (int)sizeof(wire),
+              "the probe frame queues on the bus");
+
+        unsigned char seen[64] = { 0 };
+        uint64_t seen_ts = 0;
+        const int got = md_link_recv_packet(b, seen, sizeof(seen), &seen_ts);
+
+        MDProbeResult pr {};
+        check(md_probe_result(b, &pr) == 0, "the armed expectation reports its state");
+        check(pr.observed == 1 && std::string(pr.seen_by) == "drain",
+              "a frame a scripted drain reads is credited to the drain");
+        check(pr.payload_ok == 1 && pr.ts_ok == 1,
+              "the probe saw the armed bytes and the timestamp the sender queued them with");
+        check(got == (int)sizeof(wire) && std::memcmp(seen, wire, 16) == 0 && seen_ts == probe_ts,
+              "the drain reads the sender's own bytes, with the wire's FCS in the slot it owns");
+
+        MDLinkStats after {};
+        md_link_stats(b, &after);
+        check(after.packets_delivered == before.packets_delivered + 1,
+              "the bus's ledger counts the frame it handed the receiving console");
+        check(after.packets_read_drained == before.packets_read_drained + 1 &&
+                  after.packets_read_game == before.packets_read_game,
+              "the read is attributed to the drain, and the game's own count is untouched by it");
+
+        /* A frame nobody reads is still a delivery. This is the state the old
+           test could not tell from a broken bus: its health lines showed the
+           delivery ledger climbing while its drain came up empty, because the
+           games had already eaten the frames. */
+        md_probe_arm(b, wire, sizeof(wire), probe_ts);
+        MDLinkStats unread_before {};
+        md_link_stats(b, &unread_before);
+        md_link_send_packet(a, wire, sizeof(wire), probe_ts + 1);
+        MDLinkStats unread_after {};
+        md_link_stats(b, &unread_after);
+        MDProbeResult unread {};
+        md_probe_result(b, &unread);
+        check(unread_after.packets_delivered == unread_before.packets_delivered + 1 &&
+                  unread.observed == 0,
+              "a frame that reaches a console nothing is polling for is a delivery nobody has read");
+        md_link_recv_packet(b, seen, sizeof(seen), &seen_ts); // read it out, back to empty
+
+        /* The instrument must not accept a different frame because it happens
+           to arrive while an expectation is armed. */
+        uint32_t other[5] = { probe_magic, 0u, 1u, probe_nonce ^ 0xFFFFu, 0u };
+        unsigned char other_wire[sizeof(other)] = { 0 };
+        std::memcpy(other_wire, other, sizeof(other_wire));
+        md_probe_arm(b, wire, sizeof(wire), probe_ts);
+        md_link_send_packet(a, other_wire, sizeof(other_wire), probe_ts);
+        md_link_recv_packet(b, seen, sizeof(seen), &seen_ts);
+        MDProbeResult mismatch {};
+        md_probe_result(b, &mismatch);
+        check(mismatch.observed == 0,
+              "a different frame arriving under an armed expectation is not credited to it");
+
+        /* Disarming is what the test does when it gives up waiting, and it has
+           to be complete: an expectation left armed would report the *next*
+           frame as this test's. */
+        md_probe_disarm(b);
+        md_link_send_packet(a, wire, sizeof(wire), probe_ts);
+        md_link_recv_packet(b, seen, sizeof(seen), &seen_ts);
+        MDProbeResult disarmed {};
+        md_probe_result(b, &disarmed);
+        check(disarmed.armed == 0 && disarmed.observed == 0,
+              "a disarmed expectation observes nothing, whoever reads the frame");
+        check(md_probe_arm(b, wire, 4096, probe_ts) == -1,
+              "a frame too long for the expectation buffer is refused, never silently truncated");
+
+        /* Nothing of the probe's may be left in a console's queue: the frames
+           above were read out one by one, so the next console to look finds the
+           bus as empty as it left it. */
+        char scratch[64];
+        check(md_link_recv_packet(b, scratch, sizeof(scratch), nullptr) == 0,
+              "the probe frames are gone once read, not left lying in the peer's inbox");
+
+        /* Every broadcast above also reached the third console, which never
+           looked: it holds the same four frames, whole and in order, and
+           nothing else. Left there they are what the flush at the end of a
+           Link test exists to clear. */
+        int c_frames = 0;
+        while (c_frames < 16 && md_link_recv_packet(c, scratch, sizeof(scratch), nullptr) > 0)
+            c_frames++;
+        check(c_frames == 4 && md_link_recv_packet(c, scratch, sizeof(scratch), nullptr) == 0,
+              "a console that never looked holds exactly the broadcasts sent to it, and no more");
+    }
+
+    /* ---- the ledger is per session, and counts bytes as well ------------- */
+    /* A Link test that waits for the ledger to move must not be satisfied by
+       the session before it: re-powering a console's wireless starts its half
+       of the count again, the same way it starts its flight recorder again. */
+    {
+        melonDS::LocalMP ledger;
+        ledger.SetRecvTimeout(0);
+        ledger.SetReplyTimeout(0);
+        ledger.Begin(0);
+        ledger.Begin(1);
+
+        unsigned char frame[20] = { 0 };
+        ledger.SendPacket(0, frame, sizeof(frame), 1);
+        melonDS::u64 packets = 0, bytes = 0;
+        ledger.GetDelivered(1, &packets, &bytes);
+        check(packets == 1 && bytes == sizeof(frame),
+              "the ledger credits a console with the frame it was handed, and its bytes");
+        ledger.GetDelivered(0, &packets, &bytes);
+        check(packets == 0 && bytes == 0, "a console is not credited with a frame it sent itself");
+        ledger.GetDelivered(9, &packets, &bytes);
+        check(packets == 0 && bytes == 0, "a console outside the bus has no ledger at all");
+
+        /* The ledger's epoch is the bus, not the radio: a wireless power cycle
+           does not restart it, because the read counters beside it are not
+           restarted either and a line showing more reads than deliveries is a
+           contradiction, not a finding. */
+        ledger.Begin(1);
+        ledger.GetDelivered(1, &packets, &bytes);
+        check(packets == 1 && bytes == sizeof(frame),
+              "re-powering a wireless does not restart the router's own count, and it cannot fall behind the reads");
+
+        ledger.Reset();
+        ledger.GetDelivered(1, &packets, &bytes);
+        check(packets == 0 && bytes == 0,
+              "ending the bus is what restarts the ledger, together with every other count on it");
+    }
+
     /* ---- leaving the bus stops delivery --------------------------------- */
     /* Powering wireless down must both clear the connected bit and stop the
        traffic, or a console that has left the game keeps accumulating packets. */
@@ -514,6 +757,510 @@ int main(int argc, char** argv)
     md_link_send_packet(a, payload, sizeof(payload) - 1, 99);
     check(md_link_recv_packet(b, inbox_b, sizeof(inbox_b), nullptr) == 0,
           "a detached console no longer receives link traffic");
+
+    /* ---- the reply path: who answers whom -------------------------------- */
+    /* The bus's other half, and the half no check covered. A console that reads
+       a command becomes a client of the console that sent it, and its answer is
+       filed with *that* console - not with whichever console sent a command
+       last, which is all a bus with one reply queue and one process-wide host
+       record can express. These checks drive the bus class directly (its public
+       interface is the one the bridge's link calls use), so any implementation
+       of it that keeps the contract has to keep them green; the pass that made
+       each console own its inbox, host and answers is what they were written
+       for. */
+    melonDS::LocalMP bus;
+    bus.SetRecvTimeout(0);
+    bus.SetReplyTimeout(0);
+    bus.Begin(0);
+    bus.Begin(1);
+    bus.Begin(2);
+
+    unsigned char cmd[] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    check(bus.SendCmd(0, cmd, sizeof(cmd), 100) == (int)sizeof(cmd),
+          "a command handed to the bus is queued for every other console");
+
+    unsigned char got1[64] = { 0 }, got2[64] = { 0 };
+    check(bus.RecvHostPacket(1, got1, nullptr) == (int)sizeof(cmd) &&
+              std::memcmp(got1, cmd, sizeof(cmd)) == 0,
+          "client 1 reads the host's command off its own inbox");
+    check(bus.RecvHostPacket(2, got2, nullptr) == (int)sizeof(cmd) &&
+              std::memcmp(got2, cmd, sizeof(cmd)) == 0,
+          "client 2 reads the same command off its own inbox");
+    check(bus.RecvPacket(0, got1, nullptr) == 0,
+          "the host does not receive its own command back");
+
+    /* Two clients answering one round: both answers arrive in the same window,
+       each under its own AID, in its own slot of the host's buffer. */
+    unsigned char ans1[] = { 0xA1, 0xA2 };
+    unsigned char ans2[] = { 0xB1, 0xB2, 0xB3 };
+    bus.SendReply(1, ans1, sizeof(ans1), 100, 1);
+    bus.SendReply(2, ans2, sizeof(ans2), 100, 2);
+
+    unsigned char collected[15 * 1024] = { 0 };
+    check(bus.RecvReplies(0, collected, 100, 0x6) == 0x6,
+          "the host collects both clients' answers in one window");
+    check(std::memcmp(&collected[0], ans1, sizeof(ans1)) == 0,
+          "client 1's answer sits in AID 1's slot");
+    check(std::memcmp(&collected[1024], ans2, sizeof(ans2)) == 0,
+          "client 2's answer sits in AID 2's slot, not in client 1's");
+
+    melonDS::LocalMP::MPReplyDiag rdiag {};
+    bus.GetReplyDiag(0, &rdiag);
+    check(rdiag.collected == 2,
+          "the host's flight recorder counts both answers collected");
+    bus.GetReplyDiag(1, &rdiag);
+    check(rdiag.replies_written == 1,
+          "client 1's recorder counts the one answer it wrote");
+
+    /* An answer from a console that has never read a command is following
+       nobody: it has no owner and must not be filed with a host that happens to
+       be collecting. */
+    bus.Begin(3);
+    bus.SendReply(3, ans1, sizeof(ans1), 100, 1);
+    check(bus.RecvReplies(0, collected, 100, 0x8) == 0,
+          "an answer from a console following nobody is not filed with a host");
+
+    /* A client whose host leaves the bus is told, rather than left waiting for
+       a frame that cannot come. */
+    bus.SendCmd(0, cmd, sizeof(cmd), 100);
+    check(bus.RecvHostPacket(1, got1, nullptr) == (int)sizeof(cmd),
+          "client 1 is still following the host before it leaves");
+    bus.End(0);
+    check(bus.RecvHostPacket(1, got1, nullptr) == -1,
+          "a client whose host has left the bus is told so instead of waiting");
+
+    /* A new command re-anchors the answers it is willing to collect: with the
+       default one answer kept per client, a second answer that arrived before
+       the command is dropped rather than read a round late, and both are
+       counted. */
+    {
+        melonDS::LocalMP two;
+        two.SetRecvTimeout(0);
+        two.SetReplyTimeout(0);
+        two.Begin(0);
+        two.Begin(1);
+        two.SendCmd(0, cmd, sizeof(cmd), 100);
+        check(two.RecvHostPacket(1, got1, nullptr) > 0, "the client reads the first command");
+
+        unsigned char older[] = { 0x01 }, newest[] = { 0x02 };
+        two.SendReply(1, older, sizeof(older), 100, 1);
+        two.SendReply(1, newest, sizeof(newest), 100, 1);
+        two.SendCmd(0, cmd, sizeof(cmd), 200); // re-anchors: one answer per client
+
+        unsigned char one[15 * 1024] = { 0 };
+        check(two.RecvReplies(0, one, 200, 0x2) == 0x2 && one[0] == newest[0],
+              "a new command keeps the newest answer from each client, not the oldest");
+        melonDS::LocalMP::MPReplyDiag d2 {};
+        two.GetReplyDiag(0, &d2);
+        check(d2.reanchor_dropped == 1 && d2.collected == 1,
+              "the answer the re-anchor dropped is counted, the one it kept is collected");
+    }
+
+    /* A re-anchor drops surplus answers, never an answer a console has only
+       one of. Here one client answered twice (its US clock is offset, so it
+       answers a whole frame's worth of rounds in one clump) and the other
+       answered once, queued *in front of* the doubled one. The drop is a
+       prefix of the queue, so the older code took the doubled client's older
+       answer *and* the single client's only one, and the host's game was told
+       that client - which had just answered - failed. */
+    {
+        melonDS::LocalMP three;
+        three.SetRecvTimeout(0);
+        three.SetReplyTimeout(0);
+        for (int i = 0; i < 3; i++) three.Begin(i);
+        three.SendCmd(0, cmd, sizeof(cmd), 100);
+        check(three.RecvHostPacket(1, got1, nullptr) > 0 &&
+                  three.RecvHostPacket(2, got2, nullptr) > 0,
+              "both clients read the command before answering it");
+
+        unsigned char only[] = { 0x30 }, older[] = { 0x01 }, newest[] = { 0x02 };
+        three.SendReply(2, only, sizeof(only), 100, 2);   // the single answer, first in the queue
+        three.SendReply(1, older, sizeof(older), 100, 1); // then the clump
+        three.SendReply(1, newest, sizeof(newest), 100, 1);
+        three.SendCmd(0, cmd, sizeof(cmd), 200); // re-anchors: one answer per client
+
+        unsigned char slots[15 * 1024] = { 0 };
+        const auto got = three.RecvReplies(0, slots, 200, 0x6);
+        check((got & 0x6) == 0x6 && slots[1 * 1024] == only[0] && slots[0] == older[0],
+              "a client that answered once is credited even when another client's clump is queued in front of it");
+        melonDS::LocalMP::MPReplyDiag d3 {};
+        three.GetReplyDiag(0, &d3);
+        check(d3.reanchor_dropped == 0 && d3.collected == 2,
+              "nothing is dropped: the queue holds both clients' next round");
+
+        /* ... and the answer the clump had left over is the next round's, not
+           thrown away: the round it was written for still gets an answer. */
+        check(three.RecvReplies(0, slots, 200, 0x2) == 0x2 && slots[0] == newest[0],
+              "the clump's leftover answer is handed to the next round, not lost");
+        three.GetReplyDiag(0, &d3);
+        check(d3.collected == 3 && d3.reanchor_dropped == 0,
+              "both of the clump's answers reach the game, one round apart");
+    }
+
+    /* Two consoles that each host a client of their own. Each client's answer
+       has to reach the console it is following: a single process-wide "the last
+       console to send a command" cannot tell these apart and would file both
+       answers with whichever host spoke last. This is the case the per-console
+       bus exists for. */
+    {
+        melonDS::LocalMP twohosts;
+        twohosts.SetRecvTimeout(0);
+        twohosts.SetReplyTimeout(0);
+        for (int i = 0; i < 4; i++) twohosts.Begin(i);
+
+        twohosts.SendCmd(0, cmd, sizeof(cmd), 100);
+        twohosts.SendCmd(2, cmd, sizeof(cmd), 100);
+        /* Console 3 hears both commands (that is what a shared bus is) and reads
+           the one its game would act on: the second one, from its own host. */
+        check(twohosts.RecvHostPacket(1, got1, nullptr) > 0 &&
+                  twohosts.RecvHostPacket(3, got2, nullptr) > 0 &&
+                  twohosts.RecvHostPacket(3, got2, nullptr) > 0,
+              "two hosts send a command each, and each client reads the one it follows");
+
+        twohosts.SendReply(1, ans1, sizeof(ans1), 100, 1);
+        twohosts.SendReply(3, ans2, sizeof(ans2), 100, 1);
+
+        unsigned char c0[15 * 1024] = { 0 };
+        unsigned char c2[15 * 1024] = { 0 };
+        check(twohosts.RecvReplies(0, c0, 100, 0x2) == 0x2 && c0[0] == ans1[0],
+              "each client's answer is collected by the console it is following");
+        check(twohosts.RecvReplies(2, c2, 100, 0x2) == 0x2 && c2[0] == ans2[0],
+              "... and the other host is not handed a client that is not its own");
+    }
+
+    /* ---- a console that stops reading (the queues are bounded) ---------- */
+    /* A console stays attached while its game stops draining its inbox: it is
+       in a menu, its radio is on, and the other consoles keep sending. The
+       router writes into that console's own queue whether or not it reads, so
+       *this* is where the bus has to decide what a lagging console loses. What
+       it may not lose is a frame that was never sent: a writer that wraps over
+       unread bytes hands the reader its next header out of the middle of some
+       entry, and a frame stitched from two others is worse than a missing one.
+       The bound is the oldest unread frames, oldest first, said once on the
+       log - and these checks are its contract. */
+    {
+        melonDS::LocalMP lag;
+        lag.SetRecvTimeout(0);
+        lag.SetReplyTimeout(0);
+        lag.Begin(0);
+        lag.Begin(1);
+
+        const int kFrames = 2000;      // 2000 * (12 + 40) = 104 KB into a 64 KB inbox
+        unsigned char tagged[40] = { 0 };
+        for (int i = 0; i < kFrames; i++)
+        {
+            /* The frame carries its own index twice - at its head and, in
+               complement, at its tail - so a frame made of two entries, or of
+               an entry and a leftover header, fails one of the two. */
+            tagged[0] = (unsigned char)(i & 0xFF);
+            tagged[1] = (unsigned char)((i >> 8) & 0xFF);
+            tagged[34] = (unsigned char)(~tagged[0]);
+            tagged[35] = (unsigned char)(~tagged[1]);
+            lag.SendPacket(0, tagged, sizeof(tagged), (melonDS::u64)i);
+        }
+
+        int first = -1, last = -1, gotn = 0, bad = 0, gaps = 0;
+        unsigned char buf[64] = { 0 };
+        melonDS::u64 ts = 0;
+        for (;;)
+        {
+            const int got = lag.RecvPacket(1, buf, &ts);
+            if (got == 0) break;
+
+            /* Each frame carried its own index in its first two bytes, so a
+               frame that does not match the timestamp it arrived with was put
+               together by the queue rather than by the sender. */
+            if (got != (int)sizeof(tagged) || buf[0] != (unsigned char)(ts & 0xFF) ||
+                buf[1] != (unsigned char)((ts >> 8) & 0xFF) ||
+                buf[34] != (unsigned char)~buf[0] || buf[35] != (unsigned char)~buf[1])
+            {
+                bad++;
+                continue;
+            }
+
+            const int idx = (int)ts;
+            if (first < 0) first = idx;
+            if (last >= 0 && idx != last + 1) gaps++;
+            last = idx;
+            gotn++;
+        }
+
+        const unsigned long long dropped = lag.GetInboxDrops(1);
+        std::printf("       link: slow reader - read %d frames, first index %d, last %d, bad %d, gaps %d, "
+                    "dropped %llu\n", gotn, first, last, bad, gaps, dropped);
+        check(bad == 0, "a lagging console is never handed a frame assembled out of two others");
+        check(first > 0, "what it loses is the oldest unread frames, not the newest");
+        check(last == kFrames - 1, "the newest frame sent is still there to read");
+        check(gaps == 0 && gotn == kFrames - first,
+              "what it keeps is the newest contiguous run, with nothing in it but sent frames");
+        check(dropped == (unsigned long long)first,
+              "every frame it did not get back was dropped on purpose, not overwritten under it");
+    }
+
+    /* The same bound on the host's side: a client that answers faster than the
+       host opens windows must not be able to hand the host a reply stitched
+       out of two, and the answer that survives has to be the whole one the
+       client wrote. */
+    {
+        melonDS::LocalMP burst;
+        burst.SetRecvTimeout(0);
+        burst.SetReplyTimeout(0);
+        burst.Begin(0);
+        burst.Begin(1);
+        burst.SendCmd(0, cmd, sizeof(cmd), 1);
+        check(burst.RecvHostPacket(1, got1, nullptr) > 0,
+              "the client reads a command before it starts answering");
+
+        const int kAnswers = 1200;     // 1200 * (12 + 56) = 81 KB into a 64 KB answer queue
+        unsigned char answer[56] = { 0 };
+        for (int i = 0; i < kAnswers; i++)
+        {
+            /* Every byte of answer i is a running count from i, so a reply
+               that is not one whole answer fails a byte somewhere. The last
+               four bytes are left out of the pattern: that is where the link
+               writes the frame's FCS (see LocalMP::SendPacketGeneric). */
+            for (int j = 0; j < (int)sizeof(answer); j++)
+                answer[j] = (unsigned char)((i + j) & 0xFF);
+            burst.SendReply(1, answer, sizeof(answer), (melonDS::u64)i, 1);
+        }
+
+        unsigned char big[15 * 1024] = { 0 };
+        auto whole = [](const unsigned char* p)
+        {
+            for (int j = 0; j < 52; j++)
+                if (p[j] != (unsigned char)((p[0] + j) & 0xFF)) return false;
+            return true;
+        };
+        const int newest = (kAnswers - 1) & 0xFF;
+
+        const unsigned gotmask = burst.RecvReplies(0, big, (melonDS::u64)kAnswers, 0x2);
+        melonDS::LocalMP::MPReplyDiag bdiag {};
+        burst.GetReplyDiag(0, &bdiag);
+        std::printf("       link: answer burst - window mask %#05x, first answer index %d, whole %d, "
+                    "dropped to make room %llu\n", gotmask, big[0], (int)whole(big),
+                    (unsigned long long)bdiag.reanchor_dropped);
+        check(gotmask == 0x2, "the host still credits the client after a burst larger than its queue");
+        check(whole(big), "the answer it reads back is one whole answer, not two entries joined");
+
+        /* And the newest answer is the one a new command's trim keeps. */
+        burst.SendCmd(0, cmd, sizeof(cmd), (melonDS::u64)kAnswers + 1);
+        std::memset(big, 0, sizeof(big));
+        const unsigned after = burst.RecvReplies(0, big, (melonDS::u64)kAnswers + 1, 0x2);
+        check(after == 0x2 && whole(big) && big[0] == (unsigned char)newest,
+              "the newest answer survives the trim whole, and it is the client's own bytes");
+    }
+
+    /* ---- IPC FIFO counters ---------------------------------------------- */
+    /* The ARM9<->ARM7 IPC FIFO is where a DS game hands work between its two
+       CPUs, and an empty FIFO reads the same whether its last word moved a
+       frame ago or it has never carried one - the ambiguity that stalled the
+       MKDS investigation. The counters exist to break that tie, so drive a word
+       across the real IO ports (0x04000184 control, 0x04000188 send,
+       0x04100000 receive) and check each side's count moves only where it
+       should. */
+    auto ipc = [](MDInstance* inst, MDIPCStats& out)
+    {
+        std::memset(&out, 0, sizeof(out));
+        return md_get_ipc_stats(inst, &out);
+    };
+
+    MDIPCStats ipc_a {};
+    check(ipc(a, ipc_a) == 0, "IPC counters are readable");
+    check(ipc_a.arm9_sends == 0 && ipc_a.arm7_sends == 0 &&
+              ipc_a.arm9_recvs == 0 && ipc_a.arm7_recvs == 0,
+          "a console that never used the FIFO reports zero traffic");
+
+    /* The FIFOs power up disabled, so this push is dropped by the mode register
+       rather than counted: a write nobody receives is not traffic. */
+    const uint32_t ipc_word = 0xC0FFEE01u;
+    md_write_io32(a, 9, 0x04000188, ipc_word);
+    ipc(a, ipc_a);
+    check(ipc_a.arm9_sends == 0, "a push with the FIFO disabled is not counted as traffic");
+
+    md_write_io16(a, 9, 0x04000184, 0x8001); /* ARM9: enable, both sides empty */
+    md_write_io32(a, 9, 0x04000188, ipc_word);
+    ipc(a, ipc_a);
+    check(ipc_a.arm9_sends == 1, "a push with the FIFO enabled is counted once");
+    check(ipc_a.arm9_recvs == 0 && ipc_a.arm7_sends == 0 && ipc_a.arm7_recvs == 0,
+          "pushing counts only the pushing side");
+
+    MDIPCStats ipc_b {};
+    check(ipc(b, ipc_b) == 0 && ipc_b.arm9_sends == 0,
+          "IPC counters belong to one console, not to the process");
+
+    /* The receive port only pops when *that* CPU's own control register has the
+       enable bit set - the two halves are independent enables, and the ARM7's
+       is still off here, so this read peeks and must not count. */
+    uint32_t ipc_got = 0;
+    check(md_read_ram_cpu(a, 7, 0x04100000, &ipc_got, 4) == 0 && ipc_got == ipc_word,
+          "a disabled receiver still sees the word its peer pushed");
+    ipc(a, ipc_a);
+    check(ipc_a.arm7_recvs == 0, "a peek by a disabled receiver is not a receive");
+
+    md_write_io16(a, 7, 0x04000184, 0x8001); /* ARM7: enable too */
+    ipc_got = 0;
+    check(md_read_ram_cpu(a, 7, 0x04100000, &ipc_got, 4) == 0 && ipc_got == ipc_word,
+          "the ARM7 reads the pushed word off its own receive port");
+    ipc(a, ipc_a);
+    check(ipc_a.arm7_recvs == 1, "the ARM7's receive is counted at its own port");
+    check(ipc_a.arm9_sends == 1, "reading the word does not count as a second push");
+
+    /* The FIFO is a queue, not a latch: a second read must come back empty (the
+       port answers with its error flag set) and must not inflate the count. A
+       game's own poll loop reads this port far more often than words arrive. */
+    ipc_got = 0;
+    md_read_ram_cpu(a, 7, 0x04100000, &ipc_got, 4);
+    ipc(a, ipc_a);
+    check(ipc_a.arm7_recvs == 1, "reading an emptied FIFO does not count as a receive");
+    check((md_read_io16(a, 7, 0x04000184) & 0x0100u) != 0,
+          "the FIFO reads back empty to the ARM7 after the word was taken");
+
+    /* ---- the main-RAM store watch (memwatch) ---------------------------- */
+
+    /* It exists to answer "which instruction stores into this variable", which
+       nothing else here can: a writer that reaches its target through a computed
+       pointer has no literal in the code to search for. The checks below are its
+       contract - a store inside the window is named, a store outside it is not,
+       a mirror address lands in the same window, and a disarmed watch says so. */
+    {
+        char rep[4096];
+        const int cap = (int)sizeof(rep);
+
+        check(md_mem_watch(a, 0x02FFF200, 0x02FFF20F) == 0,
+              "the store watch arms on a main-RAM window");
+
+        const uint32_t word = 0x5A5A1234;
+        check(md_write_ram(a, 0x02FFF204, &word, sizeof(word)) == 0, "wrote the watched word");
+
+        /* The report prints the folded main-RAM address, not the mirror spelling
+           the caller may have used: that is the form the watch compares, and a
+           report that echoed whichever spelling was armed would make two names
+           for one byte look like two bytes. */
+        int n = md_mem_watch_report(a, rep, cap);
+        check(n > 0 && std::strstr(rep, "023FF204") != nullptr,
+              "the store watch names the address that was written");
+        check(n > 0 && std::strstr(rep, "5A5A1234") != nullptr,
+              "the store watch reports the value that was written");
+
+        /* Arming clears the hits: a report read twice must not accumulate. */
+        md_mem_watch(a, 0x02FFF210, 0x02FFF21F);
+        n = md_mem_watch_report(a, rep, cap);
+        check(n > 0 && std::strstr(rep, "0 overlapping store(s)") != nullptr,
+              "re-arming the watch drops the previous hits");
+
+        /* A store just outside the window must not be claimed, and one that
+           only *overlaps* its low edge must be: a 4-byte store at 0x02FFF20E
+           writes into 0x02FFF210's window only by its last two bytes, and the
+           2-byte store at 0x02FFF20E sits entirely below it. */
+        uint32_t off = 0;
+        md_write_ram(a, 0x02FFF20C, &off, sizeof(off));
+        n = md_mem_watch_report(a, rep, cap);
+        check(n > 0 && std::strstr(rep, "0 overlapping store(s)") != nullptr,
+              "a store that ends below the window is not claimed");
+
+        /* The ARM7 sees main RAM again at 0x02800000, and a window armed with
+           that spelling must match the same bytes. Arming there used to match
+           nothing and answer "0 stores", which reads like "nothing writes this"
+           - the one wrong answer a watch must never give. */
+        const uint32_t mirrorword = 0x11223344;
+        md_mem_watch(a, 0x027FF240, 0x027FF24F); /* the 0x027FFFFF mirror of 0x023FF240 */
+        md_write_ram(a, 0x02FFF240, &mirrorword, sizeof(mirrorword));
+        n = md_mem_watch_report(a, rep, cap);
+        check(n > 0 && std::strstr(rep, "023FF240") != nullptr,
+              "a window armed at a main-RAM mirror matches the folded address");
+
+        check(md_mem_watch_report(a, rep, 64) == -1,
+              "a report too small for its header is refused, not truncated");
+
+        /* ARM7 WRAM is watched too: its state lives at 0x03800000, invisible
+           to a main-RAM-only watch. md_write_ram_cpu as cpu 7 routes through
+           ARM7Write32, the hooked path. */
+        const uint32_t wramword = 0xA5A5A5A5;
+        check(md_mem_watch(a, 0x02003FF0, 0x02003FFF) == 0,
+              "the store watch arms on the canonical ARM7-WRAM window");
+        check(md_write_ram_cpu(a, 7, 0x03803FF4, &wramword, sizeof(wramword)) == 0,
+              "wrote the watched ARM7-WRAM word");
+        n = md_mem_watch_report(a, rep, cap);
+        check(n > 0 && std::strstr(rep, "02003FF4") != nullptr,
+              "the store watch names an ARM7-WRAM store at its folded address");
+        check(n > 0 && std::strstr(rep, "A5A5A5A5") != nullptr,
+              "the store watch reports the ARM7-WRAM value that was written");
+    }
+
+    /* ---- the per-CPU path trace (pctrace) ------------------------------- */
+
+    /* It exists to answer "which code did this CPU run on the way to a parked
+       state", which a snapshot cannot: a decision already left behind is not a
+       value anyone can read back. The checks below are its contract - arming
+       records the ARM9's own code, the report carries the ordered regions and
+       the precise tail, disarming says so, and a tiny buffer is refused. The
+       diag ROM's ARM9 runs out of main RAM at 0x02000000, so a window over it
+       must catch the running program. */
+    {
+        const size_t cap = 192 * 1024;   // ctrl_pctrace's CAP (src-tauri/src/lib.rs)
+        std::vector<char> rep(cap + 1, 0);
+
+        check(md_pc_trace(a, 0, 0x02000000, 0x02400000) == 0,
+              "the path trace arms on an ARM9 code window");
+        // Arming and disarming are published by the control thread but only
+        // applied by the CPU thread at the top of its next RunFrame, so the
+        // smoke test has to let a frame run before the state is observable.
+        run_frames(a, 4);
+
+        const int n = md_pc_trace_report(a, rep.data(), (int)cap);
+        check(n > 0, "the path trace report fits the instrument's buffer");
+
+        unsigned long long distinct = 0;
+        const char* head = std::strstr(rep.data(), "path trace");
+        if (head) std::sscanf(head, "path trace %*x..%*x: %llu", &distinct);
+        check(distinct > 0, "the path trace records the code the ARM9 ran");
+        check(n > 0 && std::strstr(rep.data(), "code regions reached, in order") != nullptr,
+              "the path trace reports the code regions in order");
+        check(n > 0 && std::strstr(rep.data(), "(pc lr cpsr r0 r1 r2 r3)") != nullptr,
+              "the path trace reports the precise tail with its registers");
+
+        md_pc_trace(a, 0, 1, 0);   // lo >= hi disarms
+        run_frames(a, 1);          // let the CPU thread apply the disarm
+        const int m = md_pc_trace_report(a, rep.data(), (int)cap);
+        check(m > 0 && std::strstr(rep.data(), "path trace: off") != nullptr,
+              "the path trace disarms to an explicit off");
+
+        check(md_pc_trace_report(a, rep.data(), 64) == -1,
+              "a pc trace report too small for its header is refused");
+    }
+
+    /* ---- the IPC readouts are per boot, not per instance ---------------- */
+
+    /* These four counters and the trace ring exist to answer what a console's
+       *own* two CPUs said to each other, and the one console that needs the
+       answer most is a Download Play child, which boots the image it just
+       downloaded by crossing NDS::Reset(). If Reset() cleared the FIFOs but
+       kept their counters, that child's numbers would still carry the firmware
+       Download Play client's traffic it booted from - so the boot would look
+       busy before it had executed an instruction, and a frontend could not
+       separate the child's own words from its predecessor's. Drive a word in,
+       cross the real boot boundary (md_reset, the same Reset() the hand-off
+       runs), and require both the counters and the report to read zero. */
+    {
+        md_write_io16(c, 9, 0x04000184, 0x8001);       /* ARM9: FIFO enabled */
+        md_write_io32(c, 9, 0x04000188, 0xC0FFEE02u);  /* ... and one word pushed */
+        MDIPCStats ipc_c {};
+        check(ipc(c, ipc_c) == 0 && ipc_c.arm9_sends == 1,
+              "the word is counted before the boot");
+
+        md_reset(c);
+
+        check(ipc(c, ipc_c) == 0 && ipc_c.arm9_sends == 0 && ipc_c.arm7_sends == 0 &&
+                  ipc_c.arm9_recvs == 0 && ipc_c.arm7_recvs == 0,
+              "booting clears the IPC traffic counters: they are since boot, not since create");
+
+        const size_t cap = 64 * 1024;
+        std::vector<char> rep(cap + 1, 0);
+        const int n = md_wifi_io_report(c, rep.data(), (int)cap);
+        check(n > 0 && std::strstr(rep.data(), "arm9->arm7 0 word(s)") != nullptr &&
+                  std::strstr(rep.data(), "arm7->arm9 0 word(s)") != nullptr,
+              "booting clears the traced FIFO words too, both directions");
+    }
 
     /* ---- shutdown ------------------------------------------------------- */
 

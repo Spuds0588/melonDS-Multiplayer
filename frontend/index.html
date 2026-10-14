@@ -157,6 +157,23 @@
       color: var(--dim);
       border-top: 1px solid #2a2e3a;
     }
+    /* Per-game section: what the loaded cartridge is, and the one switch a
+       title-specific fix is gated by. Hidden until there is an answer to show. */
+    #pergame {
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+      padding: 0.45rem 1.1rem;
+      background: #191c24;
+      border-bottom: 1px solid #2a2e3a;
+      font-size: 0.78rem;
+      color: var(--dim);
+      flex-wrap: wrap;
+    }
+    #pergame[hidden] { display: none; }
+    #pergame label { display: flex; align-items: center; gap: 0.4rem; color: var(--ink); cursor: pointer; }
+    #pergame .code { font: 0.78rem ui-monospace, monospace; color: var(--dim); }
+    #pergame .name { color: var(--ink); font-weight: 500; }
   </style>
 </head>
 <body>
@@ -182,6 +199,13 @@
     </div>
     <span class="status" id="status">bridge: not connected</span>
   </header>
+  <div id="pergame" hidden>
+    <label title="Apply the per-game behaviour for the loaded title, when one exists">
+      <input type="checkbox" id="pergame-toggle" checked />
+      Per-game fixes
+    </label>
+    <span id="pergame-detail">—</span>
+  </div>
   <main id="consoles"></main>
   <footer>
     Local splitscreen host — one emulated console per player on the native
@@ -204,13 +228,59 @@
     const el = (id) => document.getElementById(id);
     const statusEl = el("status");
     const consolesEl = el("consoles");
+    const perGameEl = el("pergame");
+    const perGameToggle = el("pergame-toggle");
+    const perGameDetail = el("pergame-detail");
+
+    // ------------------------------------------------------------------
+    // Per-game section: the loaded title's identity and the one switch that
+    // gates a title-specific fix. The backend owns both the identity (read from
+    // the ROM header) and the registry; this only renders what it reports.
+    // ------------------------------------------------------------------
+    function showPerGame(info) {
+      // info: { enabled, gameCode, profile } (profile null when no entry applies)
+      const code = (info && info.gameCode) || "";
+      const profile = info ? info.profile : null;
+      perGameToggle.checked = info ? info.enabled !== false : true;
+      if (!code) {
+        perGameDetail.textContent = "no game loaded";
+        perGameDetail.title = "";
+      } else if (!profile) {
+        perGameDetail.innerHTML =
+          `per-game: default path · <span class="code">${code}</span>`;
+        perGameDetail.title = "This title is not in the per-game registry; the link path is unchanged.";
+      } else {
+        // Order matters: the switch is shown first so flipping it is always
+        // visible, even for a title that has no fix implemented yet.
+        const state = !profile.enabled
+          ? "per-game fixes off"
+          : profile.implemented
+            ? "fix applied"
+            : "recognised, no fix implemented yet";
+        perGameDetail.innerHTML =
+          `per-game: <span class="name">${profile.name}</span>` +
+          ` <span class="code">(${profile.code})</span> · ${state}`;
+        perGameDetail.title = `${profile.fix}\n\nSource: ${profile.source}`;
+      }
+      perGameEl.hidden = false;
+    }
+
+    function showPerGameFromSession(s) {
+      showPerGame({
+        enabled: s.per_game ? s.per_game.enabled : true,
+        gameCode: s.game_code,
+        profile: s.per_game ?? null,
+      });
+    }
 
     let session = null;          // SessionInfo from the backend
     let canvases = [];           // [{wrap, top, bottom, ctxTop, ctxBottom, imgTop, imgBot, seq, frames, cursor, peeking, pen}]
     let running = false;
+    let starting = false;        // a boot is in flight (Start clicked, no session yet)
     let pumping = false;
-    let statusError = false;
-    let statusErrorAt = 0;
+    // While `performance.now()` is below this, the status line is carrying a
+    // message the poll must not overwrite (see setStatus).
+    let statusHoldUntil = 0;
 
     // Which console the keyboard + mouse drive. One set of controls (player
     // 1's keymap) drives whichever session is selected; Digit1..Digit4 (and
@@ -229,15 +299,21 @@
     // a flag: when Tab initiated the peek, releasing Tab must not clear it.
     let peekViaTab = false;
 
-    // An error status expires; it used to latch for the rest of the run over one
-    // uncaught UI error. A condition that is still true re-asserts itself every
-    // poll, so it stays up regardless (history.md v0.1.9t).
+    // A status message is held for a while before the once-a-second status poll
+    // may overwrite it. An error expires (it used to latch for the rest of the
+    // run over one uncaught UI error; a condition that is still true re-asserts
+    // itself on every poll, so it stays up regardless - history.md v0.1.9t),
+    // and a result the user asked for by pressing a button is held for longer:
+    // "link selftest PASSED" used to be replaced within a second because only
+    // the failing form was sticky, so the button looked like it did nothing
+    // whenever the link was healthy.
     const STATUS_ERROR_MS = 6000;
-    function setStatus(text, isError = false) {
+    const STATUS_RESULT_MS = 8000;
+    function setStatus(text, isError = false, holdMs = 0) {
       statusEl.textContent = text;
       statusEl.classList.toggle("error", isError);
-      statusError = isError;
-      statusErrorAt = isError ? performance.now() : 0;
+      const hold = isError ? STATUS_ERROR_MS : holdMs;
+      statusHoldUntil = hold > 0 ? performance.now() + hold : 0;
     }
 
     // ------------------------------------------------------------------
@@ -725,7 +801,12 @@
     // ------------------------------------------------------------------
 
     function syncButtons() {
-      el("start").disabled = running;
+      // `starting` counts as busy: the boot is the longest thing this UI does
+      // (four consoles take seconds), and while it ran the Start button stayed
+      // live, so a second click tore the first boot down and started over -
+      // measured 2026-09-29: two clicks, "starting session: 4 players" then a
+      // full teardown 0s later and a second boot.
+      el("start").disabled = running || starting;
       el("stop").disabled = !running;
       el("selftest").disabled = !running || !session || session.players < 2;
       el("players").disabled = running;
@@ -734,9 +815,12 @@
     }
 
     async function start() {
+      if (starting) return; // see syncButtons: one boot at a time
       if (!invoke) { setStatus("not running inside the Tauri app", true); return; }
       const romPath = el("rom").value.trim();
       if (!romPath) { setStatus("choose a ROM first", true); return; }
+      starting = true;
+      syncButtons();
       setStatus("starting consoles…");
       try {
         session = await invoke("start_session", {
@@ -745,6 +829,7 @@
         });
         buildCards(session.players);
         applyKeymapHints();
+        showPerGameFromSession(session);
         running = true;
         active = 0;
         applyLayout();
@@ -754,6 +839,11 @@
       } catch (err) {
         setStatus(String(err), true);
       }
+      // Whatever happened, the button state is derived from what is true now -
+      // never from what the caller hoped (a failed start must leave Start
+      // clickable again).
+      starting = false;
+      syncButtons();
     }
 
     async function stop() {
@@ -792,8 +882,13 @@
           const controls = groups.map((g) => `<b>${g.name}</b> ${g.keys.join(" ")}`).join(" · ");
           session._controlsHint = controls;
         }
+        // With one console there is nothing to switch to, and "keys 1-1 switch
+        // console" is nonsense to read (2026-09-29 playtest).
+        const switcher = session.players > 1
+          ? `<b>keys 1-${session.players}</b> switch console · `
+          : "";
         c.hint.innerHTML =
-          `<b>keys 1-${session.players}</b> switch console · ` +
+          switcher +
           (session._controlsHint ?? "") +
           ` · mouse = touch · <b>peek</b> (hold) / Tab`;
       });
@@ -804,6 +899,11 @@
       if (!running || !invoke) return;
       try {
         const st = await invoke("link_status");
+        // Stop can land while this call is in flight; the answer is then about
+        // a session that is already gone, and writing it said "idle · link
+        // down · " over the "session stopped" the user had just been given
+        // (measured 2026-09-29).
+        if (!running) return;
         const up = st.active ? `link up ${st.upSeconds}s` : "link down";
         const connected = st.active ? `slots 0b${st.connectedSlots.toString(2).padStart(session.players, "0")}` : "";
         // The always-on link check reports itself here: how many 10s windows
@@ -823,7 +923,7 @@
             true,
           );
           canvases.forEach((c) => (c.hint.style.color = "#ff6b6b"));
-        } else if (!statusError || performance.now() - statusErrorAt > STATUS_ERROR_MS) {
+        } else if (performance.now() > statusHoldUntil) {
           setStatus(`${running ? "running" : "idle"} · ${up} · ${connected}${linkCheck}`);
         }
         canvases.forEach((c, i) => {
@@ -863,17 +963,46 @@
             .map((r) => `p${r.player} ${r.resynced ? "resynced" : "no answer"}`)
             .join(", ");
           const busy = res.results.some((r) => r.wirelessOn);
-          setStatus(`link resync (${detail})${busy ? " - inject skipped, a game has its wireless on" : ""}`, false);
+          setStatus(
+            `link resync (${detail})${busy ? " - inject skipped, a game has its wireless on" : ""}`,
+            false,
+            STATUS_RESULT_MS,
+          );
           return;
         }
-        const ok = res.results.every((r) => r.sent && r.received && r.payloadOk);
-        const detail = res.results.map((r) => `${r.from}→${r.to} ${r.received ? (r.payloadOk ? "ok" : "corrupt") : "no reply"}`).join(", ");
-        setStatus(`link selftest ${ok ? "PASSED" : "FAILED"} (${detail})`, !ok);
+        // A direction passes when the frame reached the peer's console and was
+        // read back byte-for-byte with the timestamp it was sent with. Who read
+        // it is reported, not required: the peer's own game polls its receive
+        // slot every frame and usually wins the race against our drain, and a
+        // read by the game proves delivery exactly as well. `delivered` is the
+        // bus's own ledger, so "nothing read it" is a different finding from
+        // "never arrived" and reads differently here.
+        const verdict = (r) => {
+          if (!r.sent) return "not sent";
+          if (!r.delivered) return "never delivered";
+          if (!r.observed) return "delivered but unread";
+          if (!r.payloadOk) return "corrupt";
+          return `ok via ${r.seenBy}${r.tsOk ? "" : " (timestamp changed)"}`;
+        };
+        const ok = res.results.every((r) => r.sent && r.delivered && r.observed && r.payloadOk);
+        const detail = res.results.map((r) => `${r.from}→${r.to} ${verdict(r)}`).join(", ");
+        setStatus(`link selftest ${ok ? "PASSED" : "FAILED"} (${detail})`, !ok, STATUS_RESULT_MS);
       } catch (err) {
         setStatus(`link selftest error: ${err}`, true);
       }
     });
     el("view").addEventListener("change", () => setLayoutMode(el("view").value));
+    perGameToggle.addEventListener("change", async () => {
+      if (!invoke) return;
+      try {
+        // The backend re-resolves the profile against the loaded game code and
+        // answers with the new state, so the panel never guesses.
+        const info = await invoke("set_per_game_fix", { enabled: perGameToggle.checked });
+        showPerGame(info);
+      } catch (err) {
+        report("error", `set_per_game_fix failed: ${err}`);
+      }
+    });
     el("browse").addEventListener("click", async () => {
       if (!hasDialog) return;
       const path = await Tauri.dialog.open({
@@ -916,6 +1045,9 @@
         }
       });
       if (saved === "flip" || saved === "side") setLayoutMode(saved);
+      // The switch exists before any session does, so Settings can set it up
+      // front; the panel then updates per session from the loaded ROM.
+      invoke("per_game_state").then(showPerGame).catch(() => {});
       // Adopt an already-running session (e.g. MD_AUTOSTART_* started one
       // before this page loaded) instead of starting a second one - calling
       // start_session here would tear down and reboot the emulators.
@@ -926,6 +1058,7 @@
         el("players").value = String(info.players);
         buildCards(session.players);
         applyKeymapHints();
+        showPerGameFromSession(session);
         running = true;
         active = 0;
         applyLayout();

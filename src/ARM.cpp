@@ -616,11 +616,23 @@ void ARMv5::Execute()
 
     while (NDS.ARM9Timestamp < NDS.ARM9Target)
     {
+        /* The address of the instruction about to run, in every execution mode:
+           R[15] holds it + 8 (ARM) or + 4 (THUMB), and JumpTo/FillPipeline
+           prefetch the pending instruction from exactly R[15] minus the same
+           offset. The JIT names this same quantity `instrAddr` below and
+           enters (or compiles) a block at it, so under the JIT the tracer
+           records whole block entries - each a real guest address - while the
+           interpreter records every instruction. Guards itself off when
+           disarmed, so the cost is one predictable branch per instruction.
+           The recorded value must be this one, not R[15] itself: on the JIT
+           path a retired block may leave R[15] at a block-internal address. */
+        const u32 instrAddr = R[15] - ((CPSR & 0x20) ? 2 : 4);
+
+        if (NDS.PcTraceArmed())
+            NDS.RecordPcVisit(0, instrAddr, R[14]);
 #ifdef JIT_ENABLED
         if constexpr (mode == CPUExecuteMode::JIT)
         {
-            u32 instrAddr = R[15] - ((CPSR&0x20)?2:4);
-
             if ((instrAddr < FastBlockLookupStart || instrAddr >= (FastBlockLookupStart + FastBlockLookupSize))
                 && !NDS.JIT.SetupExecutableRegion(0, instrAddr, FastBlockLookup, FastBlockLookupStart, FastBlockLookupSize))
             {
@@ -756,11 +768,15 @@ void ARMv4::Execute()
 
     while (NDS.ARM7Timestamp < NDS.ARM7Target)
     {
+        // See the ARM9 loop: `instrAddr` is the real guest address of the
+        // instruction about to run in both the JIT and interpreter modes.
+        const u32 instrAddr = R[15] - ((CPSR & 0x20) ? 2 : 4);
+
+        if (NDS.PcTraceArmed())
+            NDS.RecordPcVisit(1, instrAddr, R[14]);
 #ifdef JIT_ENABLED
         if constexpr (mode == CPUExecuteMode::JIT)
         {
-            u32 instrAddr = R[15] - ((CPSR&0x20)?2:4);
-
             if ((instrAddr < FastBlockLookupStart || instrAddr >= (FastBlockLookupStart + FastBlockLookupSize))
                 && !NDS.JIT.SetupExecutableRegion(1, instrAddr, FastBlockLookup, FastBlockLookupStart, FastBlockLookupSize))
             {

@@ -16,6 +16,38 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
+/*
+   The local-multiplayer bus, and who owns what.
+
+   This file used to be one process-wide record - one packet FIFO every console
+   read from its own offset, one reply FIFO one (implicit) host read, one
+   LastHostID, one MPHostinst, one MPReplyBitmask nothing read - that every
+   console in the process read and wrote. With two consoles that is a bus; with
+   three it is a record in which a second client's peer and reply state has no
+   owner: which console an answer belongs to was decided by the *arrival order
+   of a shared queue*, and "the console I am following" was one value for the
+   whole process. Measured at three consoles: the host's own beacon party list
+   never grew past two names while both clients were associated, polled and
+   credited (history.md v0.1.9bg).
+
+   Now every console owns its own state (`LocalMP::Console`) and one function
+   decides what one console is told about another (`LocalMP::Route`):
+
+     * a frame a console sends goes to every attached console except the
+       sender - the air carries it to every station, which is where our job
+       stops: which frames a *station* acts on is the wireless hardware's
+       decision and stays in Wifi (address filtering, BSSID, and so on);
+     * an answer goes to the console whose command the answering console is
+       following. That is the one routing decision only the bus can make,
+       because only the bus knows who is following whom, and it is what the
+       shared reply queue could not express: it had no owner to attribute an
+       answer to, so a second client's answer was an entry in a queue whose
+       reader was whichever instance the last command came from.
+
+   The interface the frontends use is unchanged: Begin/End/Reset, the seven
+   send/receive calls, GetReplyDiag and the timeout/budget setters.
+*/
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,8 +57,6 @@
 using namespace melonDS;
 using namespace melonDS::Platform;
 
-/* Defined with the other reply-window diagnostics below, but also used by the
-   queue code above it. */
 namespace melonDS {
 static bool trace_replies();
 static int reply_keep();
@@ -38,26 +68,85 @@ static u32 mp_fcs32(const u8* frame, int len) noexcept;
 using Platform::Log;
 using Platform::LogLevel;
 
+namespace
+{
+/* ---- ring helpers ---------------------------------------------------------
+
+   Both queues are byte rings with their cursor and their length. Frames are at
+   most kMaxFrameSize and every ring is much larger than one frame, so an entry
+   never wraps more than once. One byte of every ring is left spare: `read ==
+   write` is the empty test, so a ring filled to the brim would read as empty. */
+
+u32 RingAppend(u8* ring, u32 ringlen, u32 write, const void* data, u32 len) noexcept
+{
+    if (!len) return write;
+
+    const u32 part1 = ringlen - write;
+    if (len >= part1)
+    {
+        memcpy(&ring[write], data, part1);
+        memcpy(ring, (const u8*)data + part1, len - part1);
+        return len - part1;
+    }
+
+    memcpy(&ring[write], data, len);
+    return write + len;
+}
+
+u32 RingRead(const u8* ring, u32 ringlen, u32 read, void* buf, u32 len) noexcept
+{
+    const u32 part1 = ringlen - read;
+    if (len >= part1)
+    {
+        memcpy(buf, &ring[read], part1);
+        memcpy((u8*)buf + part1, ring, len - part1);
+        return len - part1;
+    }
+
+    memcpy(buf, &ring[read], len);
+    return read + len;
+}
+
+/* One entry: the bus header, then the frame bytes the sender handed over. */
+u32 RingAppendEntry(u8* ring, u32 ringlen, u32 write,
+                    const MPPacketHeader& h, const u8* body) noexcept
+{
+    write = RingAppend(ring, ringlen, write, &h, sizeof(h));
+    return RingAppend(ring, ringlen, write, body, h.Length);
+}
+
+/* How much of the ring between `read` and `write` is holding entries. */
+u32 RingUsed(u32 ringlen, u32 read, u32 write) noexcept
+{
+    return (write + ringlen - read) % ringlen;
+}
+
+/* Move the read cursor past the oldest whole entry - header first, so the
+   entry's own length says where the next one starts. */
+u32 RingDropOldest(const u8* ring, u32 ringlen, u32 read) noexcept
+{
+    MPPacketHeader h = {};
+    const u32 body = RingRead(ring, ringlen, read, &h, sizeof(h));
+    return (body + h.Length) % ringlen;
+}
+}
+
 namespace melonDS
 {
 
 LocalMP::LocalMP() noexcept :
     MPQueueLock(Mutex_Create())
 {
-    memset(MPPacketQueue, 0, kPacketQueueSize);
-    memset(MPReplyQueue, 0, kReplyQueueSize);
-    memset(&MPStatus, 0, sizeof(MPStatus));
-    memset(PacketReadOffset, 0, sizeof(PacketReadOffset));
-    memset(ReplyReadOffset, 0, sizeof(ReplyReadOffset));
-    memset(ReplyDiag, 0, sizeof(ReplyDiag));
+    memset(Consoles, 0, sizeof(Consoles));
 
-    // prepare semaphores
-    // semaphores 0-15: regular frames; semaphore I is posted when instance I needs to process a new frame
-    // semaphores 16-31: MP replies; semaphore I is posted when instance I needs to process a new MP reply
-
-    for (int i = 0; i < 32; i++)
+    /* One receive semaphore and one answer semaphore per console: the receive
+       one counts frames routed to that console, the answer one counts answers
+       filed with it, and neither can be posted by anything but the console that
+       owns it. */
+    for (int i = 0; i < kMaxMPConsoles; i++)
     {
-        SemPool[i] = Semaphore_Create();
+        Consoles[i].frameSem = Semaphore_Create();
+        Consoles[i].answerSem = Semaphore_Create();
     }
 
     Log(LogLevel::Info, "MP comm init OK\n");
@@ -65,10 +154,12 @@ LocalMP::LocalMP() noexcept :
 
 LocalMP::~LocalMP() noexcept
 {
-    for (int i = 0; i < 32; i++)
+    for (int i = 0; i < kMaxMPConsoles; i++)
     {
-        Semaphore_Free(SemPool[i]);
-        SemPool[i] = nullptr;
+        Semaphore_Free(Consoles[i].frameSem);
+        Semaphore_Free(Consoles[i].answerSem);
+        Consoles[i].frameSem = nullptr;
+        Consoles[i].answerSem = nullptr;
     }
 
     Mutex_Free(MPQueueLock);
@@ -76,38 +167,51 @@ LocalMP::~LocalMP() noexcept
 
 void LocalMP::Begin(int inst)
 {
+    if ((inst < 0) || (inst >= kMaxMPConsoles)) return;
+
     Mutex_Lock(MPQueueLock);
-    PacketReadOffset[inst] = MPStatus.PacketWriteOffset;
-    ReplyReadOffset[inst] = MPStatus.ReplyWriteOffset;
-    Semaphore_Reset(SemPool[inst]);
-    Semaphore_Reset(SemPool[16 + inst]);
-    MPStatus.ConnectedBitmask |= (1 << inst);
+
+    Console& self = Consoles[inst];
+    self.attached = true;
+
+    /* Start from now: nothing can be queued for a console that has just come
+       back, because the router only writes to consoles that are attached. */
+    self.inboxRead = self.inboxWrite;
+    self.answerRead = self.answerWrite;
+    self.hostInst = -1;
+
+    Semaphore_Reset(self.frameSem);
+    Semaphore_Reset(self.answerSem);
 
     /* A new session for this console starts its half of the flight recorder
-       from zero, so a digest read later cannot carry the run before it. */
-    memset(&ReplyDiag[inst], 0, sizeof(ReplyDiag[inst]));
+       from zero, so a digest read later cannot carry the run before it.
+
+       The delivery ledger deliberately does *not* restart here: it is the
+       router's own count of what it handed this console, so it lives as long
+       as the counters beside it (a console's reads are not zeroed by a wireless
+       power cycle either), and `reads <= delivered` stays true across one. A
+       Link test compares the ledger before and after its own send, so a
+       private epoch would buy nothing - while a log line showing more reads
+       than deliveries reads as a contradiction. */
+    memset(&self.diag, 0, sizeof(self.diag));
 
     Mutex_Unlock(MPQueueLock);
 }
 
-void LocalMP::GetReplyDiag(int inst, MPReplyDiag* out) const noexcept
+bool LocalMP::IsAttached(int inst) const noexcept
 {
-    if (!out) return;
-    if ((inst < 0) || (inst >= 16))
-    {
-        memset(out, 0, sizeof(*out));
-        return;
-    }
-
-    Mutex_Lock(MPQueueLock);
-    *out = ReplyDiag[inst];
-    Mutex_Unlock(MPQueueLock);
+    if ((inst < 0) || (inst >= kMaxMPConsoles)) return false;
+    /* A single bool read, the same tolerance the other diagnostic reads in
+       this class have: the answer is a state, and it is re-asked every tick. */
+    return Consoles[inst].attached;
 }
 
 void LocalMP::End(int inst)
 {
+    if ((inst < 0) || (inst >= kMaxMPConsoles)) return;
+
     Mutex_Lock(MPQueueLock);
-    MPStatus.ConnectedBitmask &= ~(1 << inst);
+    Consoles[inst].attached = false;
     Mutex_Unlock(MPQueueLock);
 }
 
@@ -115,91 +219,270 @@ void LocalMP::Reset()
 {
     Mutex_Lock(MPQueueLock);
 
-    memset(&MPStatus, 0, sizeof(MPStatus));
-    memset(PacketReadOffset, 0, sizeof(PacketReadOffset));
-    memset(ReplyReadOffset, 0, sizeof(ReplyReadOffset));
-    memset(MPPacketQueue, 0, kPacketQueueSize);
-    memset(MPReplyQueue, 0, kReplyQueueSize);
-    memset(ReplyDiag, 0, sizeof(ReplyDiag));
-    LastHostID = -1;
+    for (int i = 0; i < kMaxMPConsoles; i++)
+    {
+        Console& c = Consoles[i];
+        c.attached = false;
+        c.inboxRead = 0;
+        c.inboxWrite = 0;
+        c.answerRead = 0;
+        c.answerWrite = 0;
+        c.hostInst = -1;
+        c.frames_delivered = 0;
+        c.bytes_delivered = 0;
+        memset(c.inbox, 0, kPacketQueueSize);
+        memset(c.answers, 0, kReplyQueueSize);
+        memset(&c.diag, 0, sizeof(c.diag));
+    }
 
     Mutex_Unlock(MPQueueLock);
 
     /* Semaphores are reset outside the queue lock: Begin() does the same, and
        each semaphore carries its own lock. */
-    for (int i = 0; i < 32; i++)
-        Semaphore_Reset(SemPool[i]);
+    for (int i = 0; i < kMaxMPConsoles; i++)
+    {
+        Semaphore_Reset(Consoles[i].frameSem);
+        Semaphore_Reset(Consoles[i].answerSem);
+    }
 }
 
-void LocalMP::FIFORead(int inst, int fifo, void* buf, int len) noexcept
+void LocalMP::GetReplyDiag(int inst, MPReplyDiag* out) const noexcept
 {
-    u8* data;
-
-    u32 offset, datalen;
-    if (fifo == 0)
+    if (!out) return;
+    if ((inst < 0) || (inst >= kMaxMPConsoles))
     {
-        offset = PacketReadOffset[inst];
-        data = MPPacketQueue;
-        datalen = kPacketQueueSize;
-    }
-    else
-    {
-        offset = ReplyReadOffset[inst];
-        data = MPReplyQueue;
-        datalen = kReplyQueueSize;
+        memset(out, 0, sizeof(*out));
+        return;
     }
 
-    if ((offset + len) >= datalen)
-    {
-        u32 part1 = datalen - offset;
-        memcpy(buf, &data[offset], part1);
-        memcpy(&((u8*)buf)[part1], data, len - part1);
-        offset = len - part1;
-    }
-    else
-    {
-        memcpy(buf, &data[offset], len);
-        offset += len;
-    }
-
-    if (fifo == 0) PacketReadOffset[inst] = offset;
-    else           ReplyReadOffset[inst] = offset;
+    Mutex_Lock(MPQueueLock);
+    *out = Consoles[inst].diag;
+    Mutex_Unlock(MPQueueLock);
 }
 
-void LocalMP::FIFOWrite(int inst, int fifo, void* buf, int len) noexcept
+void LocalMP::GetDelivered(int inst, u64* packets, u64* bytes) const noexcept
 {
-    u8* data;
+    if (packets) *packets = 0;
+    if (bytes) *bytes = 0;
+    if ((inst < 0) || (inst >= kMaxMPConsoles)) return;
 
-    u32 offset, datalen;
-    if (fifo == 0)
-    {
-        offset = MPStatus.PacketWriteOffset;
-        data = MPPacketQueue;
-        datalen = kPacketQueueSize;
-    }
-    else
-    {
-        offset = MPStatus.ReplyWriteOffset;
-        data = MPReplyQueue;
-        datalen = kReplyQueueSize;
-    }
-
-    if ((offset + len) >= datalen)
-    {
-        u32 part1 = datalen - offset;
-        memcpy(&data[offset], buf, part1);
-        memcpy(data, &((u8*)buf)[part1], len - part1);
-        offset = len - part1;
-    }
-    else
-    {
-        memcpy(&data[offset], buf, len);
-        offset += len;
-    }
-
-    if (fifo == 0) MPStatus.PacketWriteOffset = offset;
-    else           MPStatus.ReplyWriteOffset = offset;
+    Mutex_Lock(MPQueueLock);
+    if (packets) *packets = Consoles[inst].frames_delivered;
+    if (bytes) *bytes = Consoles[inst].bytes_delivered;
+    Mutex_Unlock(MPQueueLock);
 }
+
+u64 LocalMP::GetInboxDrops(int inst) const noexcept
+{
+    if ((inst < 0) || (inst >= kMaxMPConsoles)) return 0;
+
+    Mutex_Lock(MPQueueLock);
+    const u64 drops = Consoles[inst].frames_dropped;
+    Mutex_Unlock(MPQueueLock);
+    return drops;
+}
+
+/* --------------------------------------------------------------- the router */
+
+u32 LocalMP::QueueAppend(int owner, const char* name, u8* ring, u32 ringlen,
+                         u32& read, u32& write, const MPPacketHeader& h, const u8* body,
+                         u64& dropped) noexcept
+{
+    const u32 need = (u32)(sizeof(MPPacketHeader) + h.Length);
+    u32 went = 0;
+
+    /* Make room for this entry by dropping the *oldest* entries this console
+       has not read. It is the one bounded thing the router does to a console's
+       own state, and it is bounded in the direction that costs least: a console
+       whose game has stopped reading (its radio is on, its game is in a menu,
+       it is being written to faster than it drains) loses the frames it was
+       never going to read in time, and keeps the newest ones - the same frames
+       the air would still be carrying if it came back now.
+
+       What this replaces is the plain wrap-around write, which let the write
+       cursor run over unread bytes. The reader then took its next header out of
+       the middle of an entry: magic mismatch, `PACKET FIFO OVERFLOW`, and the
+       whole queue dropped with its cursor snapped to the writer - so a console
+       that stopped reading for a few seconds lost *everything* the others had
+       sent it in that time, whole frames included, and could be handed a frame
+       stitched out of two entries on the way there. A lagging console is not a
+       corrupted one. */
+    if (need < ringlen)
+    {
+        while ((RingUsed(ringlen, read, write) + need) >= ringlen)
+        {
+            read = RingDropOldest(ring, ringlen, read);
+            went++;
+        }
+    }
+
+    if (went)
+    {
+        const u64 before = dropped;
+        dropped += went;
+
+        /* Said once when it starts, then once per 1024 dropped, so a console
+           that lags for a minute cannot bury the log in one line per frame. */
+        if ((before == 0) || ((dropped / 1024) != (before / 1024)))
+            Log(LogLevel::Warn,
+                "%s: p%d is not keeping up - dropped its %llu oldest unread frame%s to make room "
+                "for the newest (queue %u of %u bytes, %llu dropped in all). The frames it still "
+                "holds are whole; what it loses is what it was not going to read anyway.\n",
+                name, owner, (unsigned long long)went, (went == 1) ? "" : "s",
+                (unsigned)RingUsed(ringlen, read, write), (unsigned)ringlen,
+                (unsigned long long)dropped);
+    }
+
+    write = RingAppendEntry(ring, ringlen, write, h, body);
+    return went;
+}
+
+void LocalMP::Route(int sender, u32 type, const u8* frame, int len, u64 timestamp,
+                    Platform::Semaphore** posts, int* nposts) noexcept
+{
+    const u32 kind = type & 0xFFFF;
+    const u16 aid = (u16)(type >> 16);
+
+    if ((*nposts) >= kMaxMPConsoles) return;
+
+    if (kind == 2)
+    {
+        /* An answer: it belongs to the console whose command its sender is
+           following, filed under the AID the answer was stamped with. A console
+           with no host to answer writes into nothing - it has no reader, and
+           saying so here is the whole point of the router. */
+        const int host = Consoles[sender].hostInst;
+
+        if ((host < 0) || (host == sender) || !Consoles[host].attached)
+        {
+            if (trace_replies())
+                Log(LogLevel::Debug,
+                    "reply window: p%d's answer went nowhere - it is not following any console "
+                    "that is still attached (host %d)\n", sender + 1, host);
+            return;
+        }
+
+        Console& c = Consoles[host];
+        MPPacketHeader h { 0x4946494E, (u32)sender, type, (u32)len, timestamp };
+        QueueAppend(host + 1, "answers", c.answers, kReplyQueueSize,
+                    c.answerRead, c.answerWrite, h, frame, c.diag.reanchor_dropped);
+        c.frames_delivered++;
+        c.bytes_delivered += (u64)len;
+        posts[(*nposts)++] = c.answerSem;
+        return;
+    }
+
+    /* A frame on the bus: everyone attached hears it except whoever sent it. */
+    MPPacketHeader h { 0x4946494E, (u32)sender, type, (u32)len, timestamp };
+
+    for (int i = 0; i < kMaxMPConsoles; i++)
+    {
+        if ((i == sender) || !Consoles[i].attached) continue;
+
+        Console& c = Consoles[i];
+        QueueAppend(i + 1, "inbox", c.inbox, kPacketQueueSize,
+                    c.inboxRead, c.inboxWrite, h, frame, c.frames_dropped);
+
+        /* Counted here, at the hand-over, because this is the only moment the
+           bus can say a frame reached this console: whether the console's own
+           game reads it, or a scripted drain does, or neither, comes later and
+           is a different question (see GetDelivered). */
+        c.frames_delivered++;
+        c.bytes_delivered += (u64)len;
+
+        /* A command is what makes the console it reaches a client of its
+           sender; the reader takes the host over when it reads it (see
+           RecvPacketGeneric), so the peer state follows the game's own use of
+           the frame rather than the moment it was routed. */
+        posts[(*nposts)++] = c.frameSem;
+        if (*nposts >= kMaxMPConsoles) return;
+    }
+}
+
+/* ----------------------------------------------------- answers, per console */
+
+u32 LocalMP::TrimAnswers(int inst, int keep, u32* kept_out) noexcept
+{
+    Console& self = Consoles[inst];
+
+    if (self.answerRead == self.answerWrite) return 0;
+
+    /* Walk the queue's entries without consuming them: for each, who sent it
+       and where the next one starts. */
+    struct Entry { u32 next; int sender; };
+    static constexpr u32 kMaxEntries = 1024;
+    Entry entries[kMaxEntries];
+
+    u32 n = 0;
+    for (u32 off = self.answerRead; (off != self.answerWrite) && (n < kMaxEntries); n++)
+    {
+        MPPacketHeader h = {};
+        /* `RingRead` returns the offset the header ended at - the entry's body
+           starts there, and the next entry starts `Length` past it. */
+        const u32 body = RingRead(self.answers, kReplyQueueSize, off, &h, sizeof(h));
+
+        entries[n].sender = (int)h.SenderID;
+        entries[n].next = (body + h.Length) % kReplyQueueSize;
+        off = entries[n].next;
+    }
+
+    /* What has to be dropped: for every sender, everything before its own
+       oldest of the `keep` newest entries. The cursor is a read position, so
+       only a prefix can go, and this is the smallest prefix that satisfies
+       every sender at once. */
+    u32 drop = 0;
+    for (u32 i = 0; i < n; i++)
+    {
+        u32 after = 0;
+        for (u32 j = i; j < n; j++)
+            if (entries[j].sender == entries[i].sender) after++;
+
+        if (after > (u32)keep)
+            drop = i + 1;
+    }
+
+    /* ... and a prefix that would take a sender's own last answer is not
+       allowed to: an answer that is all its sender has is not surplus, and
+       dropping it hands that console's round to its game as a failed client
+       *after* the answer arrived. One console answering twice (its US clock is
+       offset, so it answers a whole frame's worth of rounds in one clump) used
+       to cost every console queued in front of it its only answer, which the
+       host's game then reported as that client failing. The prefix shrinks
+       until every entry it takes is surplus for its own sender; `keep` of 0 is
+       stock's policy and still takes everything. */
+    while (drop > 0)
+    {
+        bool all_surplus = true;
+
+        for (u32 i = 0; i < drop && all_surplus; i++)
+        {
+            u32 total = 0;  // how many answers this sender has in the queue
+            u32 taken = 0;  // ... of which this prefix would drop
+
+            for (u32 j = 0; j < n; j++)
+                if (entries[j].sender == entries[i].sender) total++;
+            for (u32 j = 0; j < drop; j++)
+                if (entries[j].sender == entries[i].sender) taken++;
+
+            const u32 survives = ((u32)keep < total) ? (u32)keep : total;
+            if (taken > total - survives) all_surplus = false;
+        }
+
+        if (all_surplus) break;
+        drop--;
+    }
+
+    u32 cursor = self.answerRead;
+    for (u32 i = 0; i < drop; i++)
+        cursor = entries[i].next;
+    self.answerRead = cursor;
+    self.diag.reanchor_dropped += drop;
+
+    if (kept_out) *kept_out = n - drop;
+    return drop;
+}
+
+/* ------------------------------------------------------------------ sending */
 
 int LocalMP::SendPacketGeneric(int inst, u32 type, u8* packet, int len, u64 timestamp) noexcept
 {
@@ -209,21 +492,12 @@ int LocalMP::SendPacketGeneric(int inst, u32 type, u8* packet, int len, u64 time
         return 0;
     }
 
+    const u32 kind = type & 0xFFFF;
+
     Mutex_Lock(MPQueueLock);
 
-    u16 mask = MPStatus.ConnectedBitmask;
-
-    // TODO: check if the FIFO is full!
-
-    MPPacketHeader pktheader;
-    pktheader.Magic = 0x4946494E;
-    pktheader.SenderID = inst;
-    pktheader.Type = type;
-    pktheader.Length = len;
-    pktheader.Timestamp = timestamp;
-
-    type &= 0xFFFF;
-    int nfifo = (type == 2) ? 1 : 0;
+    if (kind == 2)
+        Consoles[inst].diag.replies_written++;
 
     /* The FCS (the 802.11 checksum) goes *into* the frame's own trailing four
        bytes, because that is where the hardware keeps it - not appended after
@@ -246,187 +520,62 @@ int LocalMP::SendPacketGeneric(int inst, u32 type, u8* packet, int len, u64 time
        own bytes in that slot, for the A/B. A zero-length entry is our own
        "nothing to send" marker and keeps its length of zero; a frame too short
        to hold an FCS slot is passed through unchanged. */
-    const bool with_fcs = mp_fcs() && ((len - 12) >= 4);
+    u8 fcsbuf[12 + kMaxFrameSize];
+    const u8* body = packet;
 
-    if (with_fcs)
+    /* The rule itself lives in ApplyWireFCS, because the bridge's Link-test
+       probe has to build the same frame the receiver will see (see
+       LocalMP.h). */
+    if (ApplyWireFCS(fcsbuf, packet, (size_t)len))
+        body = fcsbuf;
+
+    if (kind == 1)
     {
-        u8 fcsbuf[12 + kMaxFrameSize];
-        memcpy(fcsbuf, packet, len);
-        *(u32*)&fcsbuf[len - 4] = mp_fcs32(&fcsbuf[12], len - 4 - 12);
-        FIFOWrite(inst, nfifo, &pktheader, sizeof(pktheader));
-        FIFOWrite(inst, nfifo, fcsbuf, len);
-    }
-    else
-    {
-        FIFOWrite(inst, nfifo, &pktheader, sizeof(pktheader));
-        if (len)
-            FIFOWrite(inst, nfifo, packet, len);
-    }
+        /* A command re-anchors this console's own answer queue, which decides
+           which answers this round is allowed to see. Keeping the newest
+           `MD_REPLY_KEEP` (default 1) *per console it is asking* covers the peer
+           answering a whole frame's worth of rounds in one clump; the bound is
+           what keeps an unbounded backlog from making every window read an
+           older round first (history.md v0.1.8j, and reply_keep below for the
+           measurement). It is per peer now: the bound used to be handed out to
+           the queue as a whole (`keep x peers` entries kept, oldest dropped
+           regardless of who sent them), which is the same thing only while the
+           peers answer in turn. */
+        const int keep = stock_mp() ? 0 : reply_keep();
+        u32 kept = 0;
+        const u32 dropped = TrimAnswers(inst, keep, &kept);
+        const u32 unread = kept + dropped;
 
-    if (type == 1)
-    {
-        // NOTE: this is not guarded against, say, multiple multiplay games happening on the same machine
-        // we would need to pass the packet's SenderID through the wifi module for that
-        MPStatus.MPHostinst = inst;
-        MPStatus.MPReplyBitmask = 0;
-
-        /* Sending a command re-anchors the host's reply read offset, which
-           decides which answers this round is allowed to see. Keeping the
-           newest `MD_REPLY_KEEP` (default 1) per console the host asks covers
-           the peer answering a whole frame's worth of rounds in one clump; the
-           bound is what keeps an unbounded backlog from making every window
-           read an older round first (history.md v0.1.8j, and reply_keep above
-           for the measurement).
-
-           NOTE: this is not guarded against, say, multiple multiplay games
-           happening on the same machine - we would need to pass the packet's
-           SenderID through the wifi module for that. */
-
-        const u32 unread = (MPStatus.ReplyWriteOffset + kReplyQueueSize - ReplyReadOffset[inst])
-                           % kReplyQueueSize;
-
-        /* Read the queue's headers without consuming them, so that the entries
-           behind the write offset are known before any of them is dropped. */
-        auto peek = [this](u32 off, void* buf, u32 len) -> u32
-        {
-            if ((off + len) >= kReplyQueueSize)
-            {
-                const u32 part1 = kReplyQueueSize - off;
-                memcpy(buf, &MPReplyQueue[off], part1);
-                memcpy(&((u8*)buf)[part1], MPReplyQueue, len - part1);
-                return len - part1;
-            }
-            memcpy(buf, &MPReplyQueue[off], len);
-            return off + len;
-        };
-
-        u32 entries = 0;
-        for (u32 off = ReplyReadOffset[inst];
-             (off != MPStatus.ReplyWriteOffset) && (entries < 1024); entries++)
-        {
-            MPPacketHeader h = {};
-            off = peek(off, &h, sizeof(h));
-            off = (off + h.Length) % kReplyQueueSize;
-        }
-
-        /* Pre-fork arm (MD_STOCK_MP=1, see stock_mp above RecvHostPacket): a
-           new command drops every unread answer, which is exactly what stock's
-           single `ReplyReadOffset[inst] = MPStatus.ReplyWriteOffset;` line
-           did - the reference half of the 2026-09-28 A/B. */
-        int keep = stock_mp() ? 0 : reply_keep();
-        if (keep > 0)
-        {
-            int peers = 0;
-            for (int i = 0; i < 16; i++)
-                if ((i != inst) && (MPStatus.ConnectedBitmask & (1 << i))) peers++;
-            keep *= peers;
-        }
-        else keep = 0;
-
-        const u32 to_drop = (entries > (u32)keep) ? (entries - (u32)keep) : 0;
-
-        /* Drop the oldest entries only - keep what the rounds that just closed
-           were asking for. */
-        for (u32 i = 0; i < to_drop; i++)
-        {
-            MPPacketHeader h = {};
-            ReplyReadOffset[inst] = peek(ReplyReadOffset[inst], &h, sizeof(h));
-            ReplyReadOffset[inst] = (ReplyReadOffset[inst] + h.Length) % kReplyQueueSize;
-        }
-
-        if (trace_replies() && ((unread > 0) || (entries > 0)))
+        if (trace_replies() && (unread > 0))
             Log(LogLevel::Debug,
                 "reply window: starting a new command for p%d with %u unread %s of replies - "
                 "dropped %u, kept %u (MD_REPLY_KEEP=%d)\n",
-                inst + 1, entries, (entries == 1) ? "answer" : "answers",
-                to_drop, entries - to_drop, reply_keep());
+                inst + 1, unread, (unread == 1) ? "answer" : "answers",
+                dropped, kept, reply_keep());
 
-        ReplyDiag[inst].reanchor_dropped += to_drop;
+        /* The answers this command kept are what its reply window opens with:
+           one semaphore per surviving entry, so a window with more than one
+           answer to give still returns them all. */
+        Semaphore_Reset(Consoles[inst].answerSem);
+        if (kept)
+            Semaphore_Post(Consoles[inst].answerSem, (int)kept);
+    }
 
-        Semaphore_Reset(SemPool[16 + inst]);
-        if (entries > to_drop)
-            Semaphore_Post(SemPool[16 + inst], (int)(entries - to_drop));
-    }
-    else if (type == 2)
-    {
-        MPStatus.MPReplyBitmask |= (1 << inst);
-        ReplyDiag[inst].replies_written++;
-    }
+    Platform::Semaphore* posts[kMaxMPConsoles];
+    int nposts = 0;
+    Route(inst, type, body, len, timestamp, posts, &nposts);
 
     Mutex_Unlock(MPQueueLock);
 
-    if (type == 2)
-    {
-        Semaphore_Post(SemPool[16 +  MPStatus.MPHostinst]);
-    }
-    else
-    {
-        for (int i = 0; i < 16; i++)
-        {
-            if (mask & (1<<i))
-                Semaphore_Post(SemPool[i]);
-        }
-    }
+    for (int i = 0; i < nposts; i++)
+        Semaphore_Post(posts[i]);
 
     return len;
-}
-
-int LocalMP::RecvPacketGeneric(int inst, u8* packet, bool block, u64* timestamp) noexcept
-{
-    for (;;)
-    {
-        if (!Semaphore_TryWait(SemPool[inst], block ? RecvTimeout : 0))
-        {
-            return 0;
-        }
-
-        Mutex_Lock(MPQueueLock);
-
-        MPPacketHeader pktheader = {};
-        FIFORead(inst, 0, &pktheader, sizeof(pktheader));
-
-        if (pktheader.Magic != 0x4946494E)
-        {
-            Log(LogLevel::Warn, "PACKET FIFO OVERFLOW\n");
-            PacketReadOffset[inst] = MPStatus.PacketWriteOffset;
-            Semaphore_Reset(SemPool[inst]);
-            Mutex_Unlock(MPQueueLock);
-            return 0;
-        }
-
-        if (pktheader.SenderID == inst)
-        {
-            // skip this packet
-            PacketReadOffset[inst] += pktheader.Length;
-            if (PacketReadOffset[inst] >= kPacketQueueSize)
-                PacketReadOffset[inst] -= kPacketQueueSize;
-
-            Mutex_Unlock(MPQueueLock);
-            continue;
-        }
-
-        if (pktheader.Length)
-        {
-            FIFORead(inst, 0, packet, pktheader.Length);
-
-            if (pktheader.Type == 1)
-                LastHostID = pktheader.SenderID;
-        }
-
-        if (timestamp) *timestamp = pktheader.Timestamp;
-        Mutex_Unlock(MPQueueLock);
-        return pktheader.Length;
-    }
 }
 
 int LocalMP::SendPacket(int inst, u8* packet, int len, u64 timestamp)
 {
     return SendPacketGeneric(inst, 0, packet, len, timestamp);
-}
-
-int LocalMP::RecvPacket(int inst, u8* packet, u64* timestamp)
-{
-    return RecvPacketGeneric(inst, packet, false, timestamp);
 }
 
 int LocalMP::SendCmd(int inst, u8* packet, int len, u64 timestamp)
@@ -436,7 +585,7 @@ int LocalMP::SendCmd(int inst, u8* packet, int len, u64 timestamp)
 
 int LocalMP::SendReply(int inst, u8* packet, int len, u64 timestamp, u16 aid)
 {
-    return SendPacketGeneric(inst, 2 | (aid<<16), packet, len, timestamp);
+    return SendPacketGeneric(inst, 2 | (aid << 16), packet, len, timestamp);
 }
 
 int LocalMP::SendAck(int inst, u8* packet, int len, u64 timestamp)
@@ -556,16 +705,87 @@ static u32 mp_fcs32(const u8* frame, int len) noexcept
     return ~crc;
 }
 
+bool LocalMP::ApplyWireFCS(u8* dst, const u8* src, size_t len) noexcept
+{
+    if (!dst || !src) return false;
+    if (dst != src) memcpy(dst, src, len);
+
+    /* The CRC covers the frame's header and body, so it is read before the
+       slot that holds it is written - which is what makes applying this in
+       place safe. */
+    if (!mp_fcs() || (len < 12 + 4)) return false;
+
+    const u32 fcs = mp_fcs32(&dst[12], (int)(len - 12 - 4));
+    memcpy(&dst[len - 4], &fcs, sizeof(fcs));
+    return true;
+}
+
+/* ---------------------------------------------------------------- receiving */
+
+int LocalMP::RecvPacketGeneric(int inst, u8* packet, bool block, u64* timestamp) noexcept
+{
+    Console& self = Consoles[inst];
+
+    if (!Semaphore_TryWait(self.frameSem, block ? RecvTimeout : 0))
+        return 0;
+
+    Mutex_Lock(MPQueueLock);
+
+    /* The wakeup can outlive the entry it stood for: the router drops a
+       lagging console's oldest unread frames to make room (see QueueAppend),
+       and a count posted for one of those is still a count. Nothing to read is
+       answered as nothing rather than read from wherever the cursor happens to
+       point. */
+    if (self.inboxRead == self.inboxWrite)
+    {
+        Mutex_Unlock(MPQueueLock);
+        return 0;
+    }
+
+    MPPacketHeader pktheader = {};
+    self.inboxRead = RingRead(self.inbox, kPacketQueueSize, self.inboxRead, &pktheader, sizeof(pktheader));
+
+    if (pktheader.Magic != 0x4946494E)
+    {
+        Log(LogLevel::Warn, "PACKET FIFO OVERFLOW\n");
+        self.inboxRead = self.inboxWrite;
+        Semaphore_Reset(self.frameSem);
+        Mutex_Unlock(MPQueueLock);
+        return 0;
+    }
+
+    if (pktheader.Length)
+    {
+        self.inboxRead = RingRead(self.inbox, kPacketQueueSize, self.inboxRead, packet, pktheader.Length);
+
+        /* The frame that makes this console somebody's client is a command,
+           and this is where it learns whose it is - the same moment the game
+           does. */
+        if ((pktheader.Type & 0xFFFF) == 1)
+            self.hostInst = (int)pktheader.SenderID;
+    }
+
+    if (timestamp) *timestamp = pktheader.Timestamp;
+    Mutex_Unlock(MPQueueLock);
+    return pktheader.Length;
+}
+
+int LocalMP::RecvPacket(int inst, u8* packet, u64* timestamp)
+{
+    return RecvPacketGeneric(inst, packet, false, timestamp);
+}
+
 int LocalMP::RecvHostPacket(int inst, u8* packet, u64* timestamp)
 {
-    if (LastHostID != -1)
+    /* The console this one is following has left the bus: the game is told its
+       host is gone rather than left waiting for a frame that cannot come. */
+    const int host = Consoles[inst].hostInst;
+    if (host >= 0)
     {
-        // check if the host is still connected
-
-        u16 curinstmask = MPStatus.ConnectedBitmask;
-
-        if (!(curinstmask & (1 << LastHostID)))
-            return -1;
+        Mutex_Lock(MPQueueLock);
+        const bool gone = !Consoles[host].attached;
+        Mutex_Unlock(MPQueueLock);
+        if (gone) return -1;
     }
 
     return RecvPacketGeneric(inst, packet, true, timestamp);
@@ -573,13 +793,14 @@ int LocalMP::RecvHostPacket(int inst, u8* packet, u64* timestamp)
 
 u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
 {
-    u16 ret = 0;
-    u16 myinstmask = (1 << inst);
-    u16 curinstmask;
+    Console& self = Consoles[inst];
 
-    curinstmask = MPStatus.ConnectedBitmask;
+    u16 curinstmask = 0;
+    for (int i = 0; i < kMaxMPConsoles; i++)
+        if (Consoles[i].attached) curinstmask |= (1 << i);
 
     // if all clients have left: return early
+    const u16 myinstmask = (u16)(1 << inst);
     if ((myinstmask & curinstmask) == curinstmask)
     {
         /* The quietest way for a join to fail: the host is still sending CMD
@@ -596,9 +817,12 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
                 "reply window: not even looking for p%d's replies - the bus has no other console "
                 "attached (asked for mask %04X, connected %04X)\n",
                 inst + 1, aidmask, curinstmask);
-        ReplyDiag[inst].not_looking++;
+        self.diag.not_looking++;
         return 0;
     }
+
+    u16 ret = 0;
+    u16 heard = (u16)(1 << inst);
 
     for (;;)
     {
@@ -626,20 +850,30 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
             }
         }
 
-        if (!Semaphore_TryWait(SemPool[16+inst], waitms))
+        if (!Semaphore_TryWait(self.answerSem, waitms))
         {
             // no more replies available
             if (trace_replies())
                 Log(LogLevel::Debug, "reply window closed for p%d with collected=%04X\n",
                     inst + 1, ret);
-            if (!ret) ReplyDiag[inst].windows_empty++;
+            if (!ret) self.diag.windows_empty++;
             return ret;
         }
 
         Mutex_Lock(MPQueueLock);
 
+        /* Same as the inbox above: an answer a lagging queue dropped (see
+           QueueAppend) leaves a count behind it, and a window opened by one of
+           those is a window with nothing in it. */
+        if (self.answerRead == self.answerWrite)
+        {
+            Mutex_Unlock(MPQueueLock);
+            if (!ret) self.diag.windows_empty++;
+            return ret;
+        }
+
         MPPacketHeader pktheader = {};
-        FIFORead(inst, 1, &pktheader, sizeof(pktheader));
+        RingRead(self.answers, kReplyQueueSize, self.answerRead, &pktheader, sizeof(pktheader));
 
         if (trace_replies())
             Log(LogLevel::Debug,
@@ -652,8 +886,8 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
         if (pktheader.Magic != 0x4946494E)
         {
             Log(LogLevel::Warn, "REPLY FIFO OVERFLOW\n");
-            ReplyReadOffset[inst] = MPStatus.ReplyWriteOffset;
-            Semaphore_Reset(SemPool[16 + inst]);
+            self.answerRead = self.answerWrite;
+            Semaphore_Reset(self.answerSem);
             Mutex_Unlock(MPQueueLock);
             return 0;
         }
@@ -662,11 +896,16 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
            kReplyStaleWindow). MD_STOCK_MP=1 restores stock's. */
         const u64 stalewindow = stock_mp() ? 32 : kReplyStaleWindow;
 
+        /* The entry is consumed either way - the cursor moves by its length -
+           but only an answer that survives both tests below reaches the game. */
+        const u32 entrylen = (u32)(sizeof(MPPacketHeader) + pktheader.Length);
+        self.answerRead = (self.answerRead + entrylen) % kReplyQueueSize;
+
         if ((pktheader.SenderID == inst) || // packet we sent out (shouldn't happen, but hey)
             (pktheader.Timestamp + stalewindow < timestamp)) // stale packet
         {
             if (pktheader.SenderID != inst)
-                ReplyDiag[inst].stale_dropped++;
+                self.diag.stale_dropped++;
 
             if (trace_replies() && pktheader.SenderID != inst)
                 Log(LogLevel::Warn,
@@ -674,11 +913,6 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
 (sender p%d, window %llu) - the client answered and the host could not use it\n",
                     (long long)(timestamp - pktheader.Timestamp), pktheader.SenderID + 1,
                     (unsigned long long)kReplyStaleWindow);
-
-            // skip this packet
-            ReplyReadOffset[inst] += pktheader.Length;
-            if (ReplyReadOffset[inst] >= kReplyQueueSize)
-                ReplyReadOffset[inst] -= kReplyQueueSize;
 
             Mutex_Unlock(MPQueueLock);
             continue;
@@ -690,7 +924,7 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
            guest answering every round and the host's acks still reporting it
            as failed - so the two are counted apart. */
         if (!pktheader.Length)
-            ReplyDiag[inst].collected_blank++;
+            self.diag.collected_blank++;
 
         if (pktheader.Length)
         {
@@ -714,9 +948,11 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
                 continue;
             }
 
-            FIFORead(inst, 1, &packets[(aid-1)*1024], pktheader.Length);
+            self.answerRead = RingRead(self.answers, kReplyQueueSize,
+                                       (self.answerRead + kReplyQueueSize - pktheader.Length) % kReplyQueueSize,
+                                       &packets[(aid-1)*1024], pktheader.Length);
             ret |= (1 << aid);
-            ReplyDiag[inst].collected++;
+            self.diag.collected++;
 
             if (trace_replies())
             {
@@ -758,8 +994,8 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
             }
         }
 
-        myinstmask |= (1 << pktheader.SenderID);
-        if (((myinstmask & curinstmask) == curinstmask) ||
+        heard |= (u16)(1 << pktheader.SenderID);
+        if (((heard & curinstmask) == curinstmask) ||
             ((ret & aidmask) == aidmask))
         {
             // all the clients have sent their reply
@@ -778,4 +1014,3 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
 }
 
 }
-

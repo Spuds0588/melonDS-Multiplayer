@@ -83,9 +83,52 @@ int md_jit_enabled(MDInstance* inst);
    tools/mkdiagrom) before the first frame. */
 int md_write_ram(MDInstance* inst, uint32_t addr, const void* data, size_t len);
 
+/* The same write on either CPU's own address space (cpu 9 = ARM9, 7 = ARM7),
+   the write half of md_read_ram_cpu. A diagnostic poke into ARM7 state - a
+   variable that gates an ARM7->ARM9 post - is the case this exists for; an
+   ARM9 write cannot reach the ARM7's WRAM or the game's ARM7 image. */
+int md_write_ram_cpu(MDInstance* inst, int cpu, uint32_t addr, const void* data, size_t len);
+
 /* Reads back main RAM (addr, len must be multiples of 4). Handy for diagnostics
    and for tests that watch a ROM's progress markers. */
 int md_read_ram(MDInstance* inst, uint32_t addr, void* out, size_t len);
+
+/* The same read on either CPU's own address space (cpu 9 = ARM9, 7 = ARM7).
+   The two spaces do not overlap: the ARM7's WRAM and the game's own ARM7 image
+   at 0x06000000 are invisible to an ARM9 read, so a question about what the
+   ARM7 side is doing needs this rather than md_read_ram. */
+int md_read_ram_cpu(MDInstance* inst, int cpu, uint32_t addr, void* out, size_t len);
+
+/* IPC FIFO traffic between this console's two CPUs, counted since boot at the
+   instant a word moves: pushes at each side's IPCFIFOSEND write, pops at each
+   side's IPCFIFORECV read.
+
+   This exists because the levels cannot answer the question. MKDS's ARM9s park
+   in a blocking message dequeue while both FIFOs read empty and enabled
+   (IPCFIFOCNT 0x8501), and an empty FIFO looks identical whether the channel
+   has never carried a word or carried its last one a frame ago. Counts tell
+   those apart, and the frame at which each side's count stops rising is exactly
+   "which side went quiet". */
+typedef struct MDIPCStats
+{
+    uint64_t arm9_sends;   /* words the ARM9 pushed into the FIFO */
+    uint64_t arm7_sends;   /* words the ARM7 pushed into the FIFO */
+    uint64_t arm9_recvs;   /* words the ARM9 popped out of the FIFO */
+    uint64_t arm7_recvs;   /* words the ARM7 popped out of the FIFO */
+} MDIPCStats;
+
+/* Fills in out with this console's IPC FIFO counters. Returns 0 on success. */
+int md_get_ipc_stats(MDInstance* inst, MDIPCStats* out);
+
+/* One CPU's whole register file (r0..r15, r15 = the program counter) into a
+   caller-provided array of 16 words. Returns 0 on success.
+
+   This exists because a program counter names a *loop*, not a *waiter*: MKDS's
+   two ARM9s sit at one address inside the SDK's retry dequeue, which is the code
+   the game is in, not the game function that is waiting. r13 says where that
+   function's frame is (so the return addresses on it can be read back with
+   md_read_ram_cpu), and r14 is its innermost return address. */
+int md_get_regs(MDInstance* inst, int cpu, uint32_t* out16);
 
 /* What this console's own software has been reading out of the wireless block,
    as text: every wifi register halfword it has taken (a count and the last
@@ -99,6 +142,25 @@ int md_read_ram(MDInstance* inst, uint32_t addr, void* out, size_t len);
    most `cap` bytes including the terminator and returns the length written,
    or -1 if `cap` is too small for even the header. */
 int md_wifi_io_report(MDInstance* inst, char* out, int cap);
+
+/* Debug: arm a main-RAM store watch (see NDS::SetMemWatch) and read it back.
+   `lo`/`hi` are the inclusive window (0x02000000..0x023FFFFF); `lo > hi`
+   disarms. Arming clears the hits. `md_mem_watch_report` writes the hits as
+   text and returns the length, or -1 when the buffer is too small. It answers
+   "which instruction wrote this variable", which is otherwise unanswerable when
+   the writer reaches it through a computed pointer. Only the interpreter routes
+   every store through it, so a watch is meaningful with the JIT off. */
+int md_mem_watch(MDInstance* inst, uint32_t lo, uint32_t hi);
+int md_mem_watch_report(MDInstance* inst, char* out, int cap);
+
+/* Debug: trace one CPU's own code path over a window `[lo, hi)` (see
+   NDS::SetPcTrace). `cpu` is 0 for the ARM9 and 1 for the ARM7; `lo >= hi`
+   disarms. Arming clears the record and keeps the last N first-visit PCs with
+   the frame each landed on, which names the code a console executed on the way
+   to a parked state - the decision a snapshot cannot show. Only the
+   interpreter runs the hook, so a trace is meaningful with the JIT off. */
+int md_pc_trace(MDInstance* inst, int cpu, uint32_t lo, uint32_t hi);
+int md_pc_trace_report(MDInstance* inst, char* out, int cap);
 
 /* The parked-handshake probe (see Wifi::SetMPProbe): kind 1 replaces the body
    bytes the console's game reads with `body` for `value` deliveries, kind 0
@@ -222,7 +284,7 @@ typedef struct MDLinkStats
     uint32_t begin_count;      /* times this console powered wireless on */
     uint32_t end_count;        /* times it powered wireless off */
     uint64_t packets_sent;     /* wireless frames this console transmitted */
-    uint64_t packets_received; /* frames it accepted from other consoles */
+    uint64_t packets_received; /* frames a consumer read out of its inbox */
     uint64_t bytes_sent;
     /* Only counts client-side and broadcast frames. A host collects its
        clients' replies through LocalMP::RecvReplies, which returns a bitmask of
@@ -230,6 +292,26 @@ typedef struct MDLinkStats
        layer never learns how many bytes arrived that way. Read this as a lower
        bound; use the sender's bytes_sent for the true figure. */
     uint64_t bytes_received;
+    /* --- v3: the receive total, attributed ---
+
+       `packets_received` is a sum over *consumers*, and before v3 nobody could
+       say which consumer: the game reading its own receive slot and a scripted
+       drain (md_link_recv_packet) incremented the same counter. On 2026-09-30
+       that ambiguity let an app Link test read a healthy bus as FAILED - its
+       drains collected nothing because the consoles' own games had already
+       consumed the frames, and the growth it should have trusted was theirs.
+       Now: packets_read_game / packets_read_drained split that total by who
+       read the frame, and packets_delivered is the *bus's* own ledger (counted
+       by LocalMP::Route at the hand-over, before any consumer can touch it).
+       A frame can therefore be: delivered and read by the game, delivered and
+       read by a drain, or delivered and never read - three different
+       situations one number used to hide. */
+    uint64_t packets_delivered;      /* frames the router handed this console */
+    uint64_t bytes_delivered;
+    uint64_t packets_read_game;      /* frames its own game read out of them */
+    uint64_t bytes_read_game;
+    uint64_t packets_read_drained;   /* frames a scripted drain read out of them */
+    uint64_t bytes_read_drained;
     /* --- v2: per-kind split (LocalMP packet types 0-3) --- */
     uint64_t rx_broadcast;     /* type 0: MP frames pulled off the packet FIFO */
     uint64_t rx_cmd;           /* type 1: host command frames */
@@ -247,8 +329,65 @@ typedef struct MDLinkStats
     uint64_t epoch_us;
 } MDLinkStats;
 
+/* Attach (on!=0) or detach this console to the link bus for a Link test,
+   touching no emulated hardware and no connected-mask bit.
+
+   The button used to power each console's wireless on - through the same ARM7
+   registers the game's own WiFi driver uses - to get the console onto the bus,
+   and power it off again afterwards. With a game running that is a hair
+   trigger: MPH sitting on its menu with its radio off *is* a game running, and
+   after one such test the two consoles never raised their radios again (three
+   walk attempts over three minutes, against 17 seconds for the same walk with
+   no test in front of it, measured 2026-09-30). Verifying the *bus* needs the
+   bus, not the radio: a frame is routed to a console whose bus attachment is
+   set, which is exactly what this sets. The mask the health line prints and
+   the selftest's own gate reads is deliberately untouched - it reports what
+   the games' radios are doing, and a test must not appear in it. Returns 0 on
+   success, -1 when there is no bus or the console has no slot. */
+int md_link_test_attach(MDInstance* inst, int on);
+
 /* Fills in out with this console's link state. Returns 0 on success. */
 int md_link_stats(MDInstance* inst, MDLinkStats* out);
+
+/* The struct's field order, proven rather than hoped: writes the struct into
+   `out` with every field set to a distinct number (its position in this
+   declaration, starting at 0) and returns its size, or 0 when `out` is too
+   small. A reader in another language checks each of its own fields against
+   the number this side put in *that name*: a field moved, added or dropped
+   then shows up as a named mismatch instead of as a number that quietly means
+   something else. Hand-mirroring this struct in Rust has already produced
+   exactly that once (2026-09-30, v0.1.9bo: the Link test read the drain's
+   count as the bus's delivery ledger and reported a healthy bus broken). */
+uint64_t md_link_stats_canary(uint8_t* out, size_t cap);
+
+/* ---- one-shot Link-test probe --------------------------------------------
+
+   The receive half of a Link test used to be "send a tagged frame, then drain
+   the peer's inbox", which is a race the peer's own game wins: it polls from
+   inside the emulation every frame, while a drain only runs between frames. So
+   a test could send a frame that the bus delivered perfectly, watch the drain
+   come up empty, and report the link broken (measured 2026-09-30 in two
+   states). Arm the expectation on the *receiver* instead, send, then ask what
+   happened: `packets_delivered` says the bus handed it over, and the probe says
+   whether some consumer read those exact bytes back. */
+typedef struct MDProbeResult
+{
+    uint32_t armed;        /* the expectation is (still) in place */
+    uint32_t observed;     /* a consumer read a frame carrying this tag */
+    uint32_t payload_ok;   /* the bytes are exactly the ones that were armed */
+    uint32_t ts_ok;        /* ... and the timestamp the sender queued it with */
+    char     seen_by[12];  /* "game" or "drain" (empty when unobserved) */
+} MDProbeResult;
+
+/* Arms (or clears) this console's expectation: `expect` is the frame body the
+   sender will queue, `ts` the timestamp it will be queued with. The wire's own
+   trailing-four-byte FCS is applied here (LocalMP::ApplyWireFCS), so the
+   expectation is the frame a consumer on this console would read - the same
+   transform the send path applies - rather than the bytes as handed over. */
+int md_probe_arm(MDInstance* inst, const void* expect, size_t len, uint64_t ts);
+void md_probe_disarm(MDInstance* inst);
+/* Reports the expectation's state. Returns 0 on success. */
+int md_probe_result(MDInstance* inst, MDProbeResult* out);
 
 /* Everything the multiplayer flight recorder knows about one console
    (Wifi::MPDiag + LocalMP::MPReplyDiag), in one struct.
@@ -372,11 +511,83 @@ void md_tag_current_thread(const char* tag);
 int md_link_send_packet(MDInstance* inst, const void* data, size_t len, uint64_t timestamp);
 int md_link_recv_packet(MDInstance* inst, void* out, size_t cap, uint64_t* timestamp);
 
+/* Send an *answer* rather than a broadcast: the bus files it in the answer
+   queue of the console this one is following, keyed by `aid`, which is exactly
+   where a host's reply window (LocalMP::RecvReplies, reached through
+   Platform::MP_RecvReplies) looks for a client's reply. `md_link_send_packet`
+   cannot reach that queue - it goes out on the broadcast receive path - which
+   is why a synthesized client that answered with it was never collected and
+   the host's ack reported it as failed every round. `aid` is the AID the host
+   assigned in its association response, low nibble (1..15); 0 is refused by
+   the receiver as unusable (it would file 1KB before the buffer). */
+int md_link_send_reply(MDInstance* inst, const void* data, size_t len, uint64_t timestamp, uint16_t aid);
+
+/* Boot a single-card Download Play child image on this console: write its
+   header/ARM9/ARM7 segments to the destinations the host's RSA frame stated,
+   set the RAM boot indicator to the DS-Download-Play value, tune the radio to
+   `channel`, and point both CPUs at the entrypoints. This is the "jump to
+   entrypoints" half of GBATEK's post-transfer step; the caller (the joiner)
+   deliberately sends no reason-3 deauthentication (see the handoff's own
+   comment). `image` is the streamed packet payloads concatenated in packet
+   order, so the segments are `header_size`, then `arm9_size`, then
+   `arm7_size`, back to back.
+
+   `session` is what the client negotiated with the host while it was
+   downloading, and it is carried into the boot on purpose: a real client comes
+   out of a single-card transfer still tuned to the host's channel, still
+   associated with the host's BSSID, and still holding the AID the host granted
+   it, because all three live in the wireless block and the jump into the
+   downloaded image does not undo them. This emulator's boot is a whole-console
+   reset, so without them the child comes up as a stranger to the host it was
+   just talking to - the shape measured in logs/v9dpsession_finding.txt.
+
+   Returns 0 on success, -1 when the image does not fit the stated load map or
+   there is no session. */
+typedef struct MDDPSession {
+    uint32_t channel;        /* the host's own channel, off its beacon (0 = untuned) */
+    uint8_t  host_bssid[6];  /* the host's own BSSID: the station associated with */
+    uint32_t aid;            /* the AID the host granted this console (0 = none) */
+    uint32_t host_serial;    /* the beacon's game serial (0040xxxx), little-endian */
+    uint32_t host_token;     /* the two stream bytes after the serial, low halfword */
+    uint32_t host_capability;/* beacon capability, verbatim */
+    uint32_t host_interval;  /* beacon interval, verbatim */
+    uint32_t host_rate_mask; /* 1/2-Mbit rate bitmask off the beacon's rate bytes */
+    uint32_t host_beacon_size;/* handoff beacon-size field, computed off the DD tag */
+} MDDPSession;
+
+int md_dp_boot(MDInstance* inst, const void* image, size_t len,
+               uint32_t header_dest, uint32_t header_size,
+               uint32_t arm9_dest, uint32_t arm9_size, uint32_t arm9_entry,
+               uint32_t arm7_dest, uint32_t arm7_temp, uint32_t arm7_size,
+               uint32_t arm7_entry, const MDDPSession* session);
+
+/* This console's own wireless MAC (6 bytes), as the bridge assigned it at ROM
+   load (see apply_console_mac). The synthesized single-card Download Play
+   joiner addresses its management frames from this identity, so the host's
+   answer comes back to a console that exists on the bus, and the joiner's own
+   receive path recognises the reply as addressed to it. Returns -1 when no
+   console has booted yet. */
+int md_console_mac(MDInstance* inst, unsigned char* out6);
+
+/* Whether this console is on the bus right now (1/0; -1 when there is no bus).
+   A console whose radio is off is not attached and the router writes it
+   nothing, so a reader that attaches at the bus level (md_link_test_attach)
+   has to be able to notice that a game's own wireless power cycle detached it
+   again. */
+int md_link_attached(MDInstance* inst);
+
 /* -------------------------------------------------------------- diagnostics */
 
 const char* md_last_error(MDInstance* inst);
 /* ROM internal title (12 chars max) or "" when no cart is inserted. */
 int md_rom_title(MDInstance* inst, char* out, size_t cap);
+/* ROM game code: the four ASCII bytes at header offset 0x0C ("AMCE" for Mario
+   Kart DS, "A2DE" for New Super Mario Bros., ...), the cartridge's own
+   identity. Returns -1 and an empty string when no cart is inserted. This is
+   what the host resolves a per-game profile from; it is deliberately a plain
+   code and not a decision, so the registry and its policy stay in one place
+   (src-tauri/src/game_profile.rs). */
+int md_rom_game_code(MDInstance* inst, char* out, size_t cap);
 /* Zero-based index of the frame currently being displayed. */
 uint32_t md_frame_counter(MDInstance* inst);
 /* Non-zero once the emulated console asked to stop (crash/power off). */

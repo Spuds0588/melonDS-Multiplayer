@@ -509,15 +509,27 @@ static void trace_frame(const char* dir, int slot, const char* kind, u64 timesta
     const u16 framectl = (framelen >= 2) ? *(const u16*)&frame[0] : 0;
     const u16 seq = (framelen >= 24) ? *(const u16*)&frame[22] : 0;
 
-    /* The body of every *new* command a game sends, one line per sequence
+    /* The MP payload of every *new* command a game sends, one line per sequence
        number: retries repeat the same seqno, so this stays small while showing
-       exactly what one game asks of the other. This is the missing half of the
-       2026-09-25 MKDS investigation - the transport is at reference quality
-       (v0.1.8q), the guest's game answers every poll from one frozen template
-       and then leaves after ~4.3s, and whether the commands' *content* is what
-       its game expects is the open question. MP commands only (`fc=0228`); a
+       exactly what one game asks of the other. MP commands only (`fc=0228`); a
        new seqno during multiplayer is one line, everything else stays off the
-       log. */
+       log.
+
+       The payload starts at `frame[24]`, right after the 24-byte 802.11 header,
+       and the wire owns the frame's last four bytes: `LocalMP::ApplyWireFCS`
+       writes the CRC there and the receiver's own game-programmed
+       `W_RX_LEN_CROP` removes them before the frame is handed to its game. So
+       the game's payload - exactly what the peer's game is handed - is
+       `frame[24 .. framelen-5]`.
+
+       This used to be printed as `frame[28 .. framelen-1]`, which is the same
+       length but the wrong bytes: it dropped the payload's own 4-byte MP header
+       and kept the wire's FCS slot, so a whole ten-step "state walk" in MKDS's
+       post-CUT-OFF log lived inside the wire's slot and three passes of analysis
+       read protocol state out of a region no game ever sees (history.md
+       v0.1.9bv). The length is deliberately unchanged, so every tool that
+       parses `body[N]` keeps working and only the bytes they describe are
+       corrected. */
     if (framelen >= 30 && (framectl & 0x00FF) == 0x28 && (framectl & 0x0300) == 0x0200)
     {
         static u16 lastcmdseq = 0xFFFF;
@@ -532,7 +544,7 @@ static void trace_frame(const char* dir, int slot, const char* kind, u64 timesta
             {
                 const int n = (bodylen > 18) ? 18 : bodylen;
                 for (int i = 0; i < n; i++)
-                    snprintf(&body[i * 3], 4, "%02X ", frame[28 + i]);
+                    snprintf(&body[i * 3], 4, "%02X ", frame[24 + i]);
                 body[n * 3 - 1] = 0;
             }
             std::fprintf(stderr, "[link-trace] cmd body seq=%04X slot=%d body[%d]=%s\n",
@@ -618,6 +630,10 @@ int MP_RecvPacket(u8* data, u64* timestamp, void* userdata)
     md::note_poll(userdata, got > 0);
     if (got > 0)
     {
+        /* This is the console's own game polling its receive slot, and it is
+           the consumer a scripted drain loses to: tell any armed Link-test
+           probe what was just read, before the frame is handed on. */
+        md::probe_observe(userdata, "game", data, (size_t)got, timestamp ? *timestamp : 0);
         md::note_packet_received_kind(userdata, 0, got);
         trace_frame("rx", slot, "bcast", timestamp ? *timestamp : 0, data, got);
     }

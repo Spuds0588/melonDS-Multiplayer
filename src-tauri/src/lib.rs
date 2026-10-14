@@ -13,6 +13,14 @@
 
 #![allow(non_snake_case)] // lib name is melondSMultiplayer_lib by config
 
+// Per-game identity and the fix registry a title-specific patch attaches to
+// (the one owner of "which game is loaded and what do we do differently").
+mod game_profile;
+// The synthesized client half of single-card Download Play. Present only for a
+// title whose profile says `download_play`; on every other title it does not
+// exist, so its link path is unchanged.
+mod dp_joiner;
+
 use parking_lot::{Condvar, Mutex, RwLock};
 use tauri::Manager;
 use serde::{Deserialize, Serialize};
@@ -60,6 +68,79 @@ struct MDInstance {
     _private: [u8; 0],
 }
 
+/// One armed Link-test expectation, as melonds_bridge.h reports it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MDProbeResult {
+    armed: u32,
+    observed: u32,
+    payload_ok: u32,
+    ts_ok: u32,
+    seen_by: [i8; 12],
+}
+
+impl Default for MDProbeResult {
+    fn default() -> Self {
+        MDProbeResult { armed: 0, observed: 0, payload_ok: 0, ts_ok: 0, seen_by: [0; 12] }
+    }
+}
+
+/// Names the first field whose canary value does not match this side's mirror
+/// of MDLinkStats, or None when the whole struct lines up.
+///
+/// This exists because a hand-written mirror of a 24-field struct in a second
+/// language fails *quietly*: on 2026-09-30 the v3 fields were inserted in the
+/// wrong place on this side, so `packets_delivered` here read the C struct's
+/// `packets_read_game` and the Link test called a healthy bus broken with every
+/// number in the log looking perfectly plausible. The canary catches that at
+/// session start, by name.
+fn stats_layout_mismatch(c: &MDLinkStats) -> Option<&'static str> {
+    macro_rules! chk {
+        ($idx:expr, $name:ident) => {
+            if c.$name != $idx {
+                return Some(stringify!($name));
+            }
+        };
+    }
+    chk!(0, connected);
+    chk!(1, begin_count);
+    chk!(2, end_count);
+    chk!(3, packets_sent);
+    chk!(4, packets_received);
+    chk!(5, bytes_sent);
+    chk!(6, bytes_received);
+    chk!(7, packets_delivered);
+    chk!(8, bytes_delivered);
+    chk!(9, packets_read_game);
+    chk!(10, bytes_read_game);
+    chk!(11, packets_read_drained);
+    chk!(12, bytes_read_drained);
+    chk!(13, rx_broadcast);
+    chk!(14, rx_cmd);
+    chk!(15, rx_reply);
+    chk!(16, rx_ack);
+    chk!(17, rx_polls);
+    chk!(18, tx_cmd);
+    chk!(19, tx_reply);
+    chk!(20, tx_ack);
+    chk!(21, rx_empty_polls);
+    chk!(22, last_rx_us);
+    chk!(23, epoch_us);
+    None
+}
+
+impl MDProbeResult {
+    fn seen_by_str(&self) -> String {
+        let bytes: Vec<u8> = self
+            .seen_by
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| *c as u8)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct MDLinkStats {
@@ -70,6 +151,14 @@ struct MDLinkStats {
     packets_received: u64,
     bytes_sent: u64,
     bytes_received: u64,
+    // v3 receive attribution (melonds_bridge.h): the bus's own delivery ledger
+    // and the same total split by which consumer read the frame.
+    packets_delivered: u64,
+    bytes_delivered: u64,
+    packets_read_game: u64,
+    bytes_read_game: u64,
+    packets_read_drained: u64,
+    bytes_read_drained: u64,
     // v2 per-kind split (melonds_bridge.h):
     rx_broadcast: u64,
     rx_cmd: u64,
@@ -82,6 +171,18 @@ struct MDLinkStats {
     rx_empty_polls: u64,
     last_rx_us: u64,
     epoch_us: u64,
+}
+
+/// IPC FIFO traffic between one console's two CPUs (md_get_ipc_stats in
+/// melonds_bridge.h). Counted where the words move, because an empty FIFO looks
+/// the same whether the channel was never used or is merely idle.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct MDIPCStats {
+    arm9_sends: u64,
+    arm7_sends: u64,
+    arm9_recvs: u64,
+    arm7_recvs: u64,
 }
 
 /// The multiplayer flight recorder (md_link_mp_digest in melonds_bridge.h):
@@ -150,8 +251,37 @@ extern "C" {
     fn md_destroy(inst: *mut MDInstance);
     fn md_load_rom(inst: *mut MDInstance, rom_path: *const i8) -> i32;
     fn md_rom_title(inst: *mut MDInstance, out: *mut i8, cap: usize) -> i32;
+    fn md_rom_game_code(inst: *mut MDInstance, out: *mut i8, cap: usize) -> i32;
     fn md_set_jit(inst: *mut MDInstance, enabled: i32) -> i32;
     fn md_write_ram(inst: *mut MDInstance, addr: u32, data: *const u8, len: usize) -> i32;
+    // The read side of the same call. Declared for the `mem` control command,
+    // which is the instrument every pass since v0.1.9y has named: without it
+    // "the game is waiting on something" can only be inferred from a picture,
+    // and a parked game and a busy one look the same from there.
+    fn md_read_ram(inst: *mut MDInstance, addr: u32, out: *mut u8, len: usize) -> i32;
+    // The same read on either CPU's own address space (cpu 9 = ARM9, 7 = ARM7).
+    // The ARM7's WRAM and the game's own ARM7 image are invisible to an ARM9
+    // read, which is why "what is the ARM7 side doing" had no instrument until
+    // 2026-09-29.
+    fn md_read_ram_cpu(
+        inst: *mut MDInstance,
+        cpu: i32,
+        addr: u32,
+        out: *mut u8,
+        len: usize,
+    ) -> i32;
+    // The write half of md_read_ram_cpu, for the `poke` control command. A
+    // read can show that a branch's exit condition is false; only changing the
+    // value it tests can show that the branch is what holds the CPU - and when
+    // that value lives in the ARM7's own space, an ARM9 write cannot reach it.
+    fn md_write_ram_cpu(
+        inst: *mut MDInstance,
+        cpu: i32,
+        addr: u32,
+        data: *const u8,
+        len: usize,
+    ) -> i32;
+    fn md_get_ipc_stats(inst: *mut MDInstance, out: *mut MDIPCStats) -> i32;
     fn md_set_buttons(inst: *mut MDInstance, mask: u32);
     fn md_touch(inst: *mut MDInstance, x: i32, y: i32);
     fn md_release_touch(inst: *mut MDInstance);
@@ -166,6 +296,10 @@ extern "C" {
     // code or just producing frames?" check. Read-only, so sampling them from
     // another thread is no different from md_link_stats.
     fn md_get_pc(inst: *mut MDInstance, cpu: i32) -> u32;
+    // One CPU's whole register file, for the question a bare program counter
+    // cannot answer: which of the game's own functions is waiting in the loop
+    // the PC points into (r13 locates its frame, r14 its innermost return).
+    fn md_get_regs(inst: *mut MDInstance, cpu: i32, out16: *mut u32) -> i32;
     fn md_console_asleep(inst: *mut MDInstance) -> i32;
     fn md_stop_reason(inst: *mut MDInstance) -> i32;
     fn md_last_error(inst: *mut MDInstance) -> *const i8;
@@ -176,12 +310,26 @@ extern "C" {
     fn md_link_set_recv_timeout(ms: i32);
     fn md_link_set_reply_timeout(ms: i32);
     fn md_link_set_reply_budget(inst: *mut MDInstance, budget_ns: i64);
+    // Bus attach/detach for a Link test, without touching the game's wireless
+    // hardware (see melonds_bridge.h).
+    fn md_link_test_attach(inst: *mut MDInstance, on: i32) -> i32;
     fn md_link_stats(inst: *mut MDInstance, out: *mut MDLinkStats) -> i32;
+    fn md_link_stats_canary(out: *mut u8, cap: usize) -> u64;
+    fn md_probe_arm(inst: *mut MDInstance, expect: *const u8, len: usize, ts: u64) -> i32;
+    fn md_probe_disarm(inst: *mut MDInstance);
+    fn md_probe_result(inst: *mut MDInstance, out: *mut MDProbeResult) -> i32;
     fn md_link_mp_digest(inst: *mut MDInstance, out: *mut MDMPDigest) -> i32;
     fn md_link_mp_digest_size() -> u64;
     fn md_link_resync(inst: *mut MDInstance);
     fn md_link_connected_mask() -> u32;
     fn md_link_send_packet(inst: *mut MDInstance, data: *const u8, len: usize, timestamp: u64) -> i32;
+    fn md_link_send_reply(
+        inst: *mut MDInstance,
+        data: *const u8,
+        len: usize,
+        timestamp: u64,
+        aid: u16,
+    ) -> i32;
     // Returns the byte count, 0 when nothing is queued. Declared `int` in
     // melonds_bridge.h, so it MUST be read as i32 here: this used to be
     // declared `usize`, which left the upper half of the return register
@@ -189,9 +337,12 @@ extern "C" {
     // toss (the send side was always declared i32, which is why sends looked
     // reliable while receives looked flaky).
     fn md_link_recv_packet(inst: *mut MDInstance, out: *mut u8, cap: usize, timestamp: *mut u64) -> i32;
-    fn md_write_io16(inst: *mut MDInstance, cpu: i32, addr: u32, value: u16) -> i32;
     fn md_read_io16(inst: *mut MDInstance, cpu: i32, addr: u32) -> u16;
     fn md_wifi_io_report(inst: *mut MDInstance, out: *mut i8, cap: i32) -> i32;
+    fn md_mem_watch(inst: *mut MDInstance, lo: u32, hi: u32) -> i32;
+    fn md_mem_watch_report(inst: *mut MDInstance, out: *mut i8, cap: i32) -> i32;
+    fn md_pc_trace(inst: *mut MDInstance, cpu: i32, lo: u32, hi: u32) -> i32;
+    fn md_pc_trace_report(inst: *mut MDInstance, out: *mut i8, cap: i32) -> i32;
     fn md_link_mp_vary(
         inst: *mut MDInstance,
         kind: i32,
@@ -204,6 +355,71 @@ extern "C" {
     ) -> i32;
     fn md_read_gpu(inst: *mut MDInstance, addr: u32) -> u32;
     fn md_link_slot(inst: *mut MDInstance) -> i32;
+    // This console's own wireless MAC. The Download Play joiner addresses its
+    // management frames from it, so the host's answer comes back to a console
+    // that exists on the bus.
+    fn md_console_mac(inst: *mut MDInstance, out: *mut u8) -> i32;
+    fn md_link_attached(inst: *mut MDInstance) -> i32;
+    // Boot a single-card Download Play child image on this console: write the
+    // header/ARM9/ARM7 segments to the RSA destinations, set the DS-Download-
+    // Play boot indicator, carry the negotiated session into the console's radio
+    // state, and point both CPUs at the entrypoints. The joiner's terminal state
+    // (the assembled image) is the input; this is what makes the download play.
+    // Returns 0 on success.
+    fn md_dp_boot(
+        inst: *mut MDInstance,
+        image: *const u8,
+        len: usize,
+        header_dest: u32,
+        header_size: u32,
+        arm9_dest: u32,
+        arm9_size: u32,
+        arm9_entry: u32,
+        arm7_dest: u32,
+        arm7_temp: u32,
+        arm7_size: u32,
+        arm7_entry: u32,
+        session: *const MDDPSession,
+    ) -> i32;
+}
+
+/// The C side of a Download Play session: `MDDPSession` in
+/// `src/frontend/tauri/melonds_bridge.h`. `#[repr(C)]` with the fields in the
+/// header's own order, so the two declarations cannot drift apart silently -
+/// the padding after `host_bssid` is the compiler's on both sides, and the
+/// struct is only ever read, never written, by the core.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct MDDPSession {
+    channel: u32,
+    host_bssid: [u8; 6],
+    aid: u32,
+    // Beacon serial/token/capability/interval/rate-mask/beacon-size, in that
+    // order: field semantics live on `dp_joiner::Session`, offsets on
+    // `DownloadPlayBootInfo`. u32s throughout so no padding can drift against
+    // the C header's matching uint32_ts.
+    host_serial: u32,
+    host_token: u32,
+    host_capability: u32,
+    host_interval: u32,
+    host_rate_mask: u32,
+    host_beacon_size: u32,
+}
+
+impl From<&dp_joiner::Session> for MDDPSession {
+    fn from(s: &dp_joiner::Session) -> Self {
+        MDDPSession {
+            channel: u32::from(s.channel),
+            host_bssid: s.bssid,
+            aid: u32::from(s.aid),
+            host_serial: u32::from_le_bytes(s.serial),
+            host_token: u32::from(s.token[0]) | (u32::from(s.token[1]) << 8),
+            host_capability: u32::from(s.capability),
+            host_interval: u32::from(s.interval),
+            host_rate_mask: u32::from(s.rate_mask),
+            host_beacon_size: u32::from(s.beacon_size),
+        }
+    }
 }
 
 /// Hex for a frame body, clamped to the 16 bytes the digest carries.
@@ -323,8 +539,15 @@ fn mp_digest_lines(p: usize, d: &MDMPDigest, prev: &MDMPDigest) -> Vec<String> {
             out.join(" ")
         }
     };
+    // `W_IF`/`W_IE`, not `IF`/`IE`: these are the *wireless block's* registers,
+    // and on a line that already prints `arm7 IME ... IE7 ...` a bare `IF`/`IE`
+    // reads as the CPU's own pair. It was read that way on 2026-09-29 - a parked
+    // console's `IE 0000` was taken for "this CPU can never be woken" when the
+    // ARM9's real registers were IME 1 / IE 0009 (read through `mem`), i.e.
+    // awake and taking vblank the whole time. The name is the whole fix: a
+    // label that cannot be mistaken for another register cannot mislead.
     let irq = format!(
-        "mp p{} irq: cpu line {}(+{}) · raised {} · acked {} · IF {:04X} IE {:04X} pending {:04X}",
+        "mp p{} irq: cpu line {}(+{}) · raised {} · acked {} · W_IF {:04X} W_IE {:04X} pending {:04X}",
         p + 1,
         d.irq_cpu_line,
         d64(d.irq_cpu_line, prev.irq_cpu_line),
@@ -442,9 +665,43 @@ enum LinkOp {
         ts: u64,
         reply: std::sync::mpsc::Sender<i32>,
     },
+    /// Send an *answer* on this console's slot, filed in the answer queue of
+    /// the console it is following and keyed by `aid` - the path a host's reply
+    /// window reads (see md_link_send_reply). Replies with the queued byte
+    /// count (>0 sent, 0 refused).
+    SendReply {
+        data: Vec<u8>,
+        ts: u64,
+        aid: u16,
+        reply: std::sync::mpsc::Sender<i32>,
+    },
     /// Drain everything currently queued for this console, oldest first.
     Drain {
         reply: std::sync::mpsc::Sender<Vec<(Vec<u8>, u64)>>,
+    },
+    /// One turn of the Download Play joiner, run *inside* this console's own
+    /// turn: read the inbox, advance the client state machine, and send whatever
+    /// it decided - all before this console's next frame. This is the whole
+    /// reason the variant exists: an answer sent as its own op is only serviced
+    /// at the next turn, one frame after the host opened the window that wanted
+    /// it, which is what left Super Mario 64 DS's host empty on 2,522 of 2,535
+    /// addressed rounds. The state rides in and stays there (the turn is its
+    /// only writer), so `State` has one owner and the schedule has one place.
+    JoinerTurn {
+        state: Arc<std::sync::Mutex<dp_joiner::State>>,
+        dp: Arc<dp_joiner::DownloadPlayJoiner>,
+        reply: std::sync::mpsc::Sender<()>,
+    },
+    /// Boot a completed Download Play child image on this console. Carries the
+    /// assembled image (sent once) and runs on the driver thread like every
+    /// other op, so the memory writes and the CPU jump land at a frame boundary.
+    BootDownloaded {
+        image: Vec<u8>,
+        info: dp_joiner::BootInfo,
+        /// The session the client negotiated with the host (channel, the host's
+        /// BSSID, and the AID it was granted). See `dp_joiner::Session`.
+        session: MDDPSession,
+        reply: std::sync::mpsc::Sender<bool>,
     },
 }
 
@@ -460,12 +717,6 @@ struct Instance {
     buttons: AtomicU64,
     /// Pen state while down: (touching, x, y) in touch-screen pixels.
     touch: Mutex<(bool, i32, i32)>,
-    /// Wireless power request for the link selftest: -1 none, 0 off, 1 on.
-    /// Applied by the console's own run loop (emulated state is only touched
-    /// by its driver thread); the selftest polls wireless_applied.
-    wireless_req: AtomicI32,
-    /// Last request value the run loop applied, -1 = nothing yet.
-    wireless_applied: AtomicI32,
     /// Link operations waiting for the driver thread (see LinkOp).
     link_ops: Mutex<Vec<LinkOp>>,
 }
@@ -484,24 +735,67 @@ impl Instance {
                 };
                 let _ = reply.send(queued);
             }
+            LinkOp::SendReply { data, ts, aid, reply } => {
+                let queued = unsafe {
+                    md_link_send_reply(self.ptr, data.as_ptr(), data.len(), ts, aid)
+                };
+                let _ = reply.send(queued);
+            }
             LinkOp::Drain { reply } => {
                 // Bounded per turn: a probe wants "what is queued right now",
                 // not an unbounded sweep that could starve the frame.
-                let mut out: Vec<(Vec<u8>, u64)> = Vec::new();
-                let mut buf = [0u8; 2048];
-                let mut out_ts = 0u64;
-                while out.len() < 32 {
-                    let n = unsafe {
-                        md_link_recv_packet(self.ptr, buf.as_mut_ptr(), buf.len(), &mut out_ts)
-                    };
-                    if n <= 0 {
-                        break;
-                    }
-                    out.push((buf[..(n as usize).min(buf.len())].to_vec(), out_ts));
-                }
+                let out = DriverTurnBus { ptr: self.ptr }.drain_now();
                 let _ = reply.send(out);
             }
+            LinkOp::JoinerTurn { state, dp, reply } => {
+                // One bus for the whole turn, talking to the bridge directly:
+                // the drain and every send it earns happen here, on this thread,
+                // before the console's next frame.
+                let bus = DriverTurnBus { ptr: self.ptr };
+                if let Ok(mut st) = state.lock() {
+                    dp_joiner::step(&bus, &dp, &mut st, std::time::Instant::now());
+                }
+                let _ = reply.send(());
+            }
+            LinkOp::BootDownloaded { image, info, session, reply } => {
+                let ok = unsafe {
+                    md_dp_boot(
+                        self.ptr,
+                        image.as_ptr(),
+                        image.len(),
+                        info.header_dest,
+                        info.header_size,
+                        info.arm9_dest,
+                        info.arm9_size,
+                        info.arm9_entry,
+                        info.arm7_dest,
+                        info.arm7_temp,
+                        info.arm7_size,
+                        info.arm7_entry,
+                        &session,
+                    ) == 0
+                };
+                let _ = reply.send(ok);
+            }
         }
+    }
+
+    /// Hand the completed image to the driver thread to boot. Returns false when
+    /// the driver did not answer in time or the bridge refused the image.
+    fn link_boot_now(
+        &self,
+        image: &[u8],
+        info: &dp_joiner::BootInfo,
+        session: &dp_joiner::Session,
+    ) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.link_ops.lock().push(LinkOp::BootDownloaded {
+            image: image.to_vec(),
+            info: *info,
+            session: MDDPSession::from(session),
+            reply: tx,
+        });
+        rx.recv_timeout(LINK_OP_TIMEOUT).unwrap_or(false)
     }
 
     /// Service every op that arrived since the last frame. Driver thread only.
@@ -544,6 +838,27 @@ impl Instance {
         }
     }
 
+    /// Queued byte count for an answer from this console, or None when the
+    /// driver did not answer. Unlike `link_send_now` the frame does not go out
+    /// on the bus's broadcast path: it is filed in the following console's
+    /// answer queue under `aid`, where a host's reply window reads it.
+    fn link_send_reply_now(&self, data: &[u8], ts: u64, aid: u16, what: &str) -> Option<i32> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.link_ops.lock().push(LinkOp::SendReply {
+            data: data.to_vec(),
+            ts,
+            aid,
+            reply: tx,
+        });
+        match rx.recv_timeout(LINK_OP_TIMEOUT) {
+            Ok(queued) => Some(queued),
+            Err(_) => {
+                log::warn!("{what}: console driver did not answer a reply send request");
+                None
+            }
+        }
+    }
+
     /// Everything queued for this console right now, or None when the driver
     /// did not answer.
     fn link_drain_now(&self, what: &str) -> Option<Vec<(Vec<u8>, u64)>> {
@@ -556,6 +871,174 @@ impl Instance {
                 None
             }
         }
+    }
+}
+
+/// The Download Play joiner's bus as seen *from inside a console's own turn*.
+/// Every call goes straight to the bridge on whichever thread is running this
+/// turn - the console's driver thread - so a command drained and the answer it
+/// earns happen in the same frame, and the answer is in the host's reply queue
+/// before its next window opens. That is the difference this type exists for:
+/// the queue-based `InstanceJoinerBus` below can only hand work to the driver
+/// thread, so its answer always landed one frame late.
+///
+/// Driver thread only: it holds a raw instance pointer and blocks on nothing.
+struct DriverTurnBus {
+    ptr: *mut MDInstance,
+}
+
+unsafe impl Send for DriverTurnBus {}
+unsafe impl Sync for DriverTurnBus {}
+
+impl DriverTurnBus {
+    /// Everything queued for this console right now, oldest first. Bounded per
+    /// turn: a turn wants "what is queued now", not an unbounded sweep that
+    /// could starve the frame.
+    fn drain_now(&self) -> Vec<(Vec<u8>, u64)> {
+        let mut out: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut buf = [0u8; 2048];
+        let mut ts = 0u64;
+        while out.len() < 32 {
+            let n = unsafe { md_link_recv_packet(self.ptr, buf.as_mut_ptr(), buf.len(), &mut ts) };
+            if n <= 0 {
+                break;
+            }
+            out.push((buf[..(n as usize).min(buf.len())].to_vec(), ts));
+        }
+        out
+    }
+}
+
+impl dp_joiner::JoinerBus for DriverTurnBus {
+    fn drain(&self) -> Option<Vec<(Vec<u8>, u64)>> {
+        Some(self.drain_now())
+    }
+
+    fn send(&self, data: &[u8], ts: u64) -> Option<i32> {
+        Some(unsafe { md_link_send_packet(self.ptr, data.as_ptr(), data.len(), ts) })
+    }
+
+    fn send_reply(&self, data: &[u8], ts: u64, aid: u16) -> Option<i32> {
+        Some(unsafe { md_link_send_reply(self.ptr, data.as_ptr(), data.len(), ts, aid) })
+    }
+
+    fn own_mac(&self) -> Option<[u8; 6]> {
+        let mut mac = [0u8; 6];
+        if unsafe { md_console_mac(self.ptr, mac.as_mut_ptr()) } == 0 {
+            Some(mac)
+        } else {
+            None
+        }
+    }
+
+    fn wireless_on(&self) -> bool {
+        let mut stats = MDLinkStats::default();
+        unsafe { md_link_stats(self.ptr, &mut stats) };
+        stats.begin_count > stats.end_count
+    }
+
+    fn set_receiving(&self, on: bool) -> bool {
+        unsafe { md_link_test_attach(self.ptr, if on { 1 } else { 0 }) == 0 }
+    }
+
+    fn receiving(&self) -> bool {
+        unsafe { md_link_attached(self.ptr) == 1 }
+    }
+
+    fn handoff(&self, image: &[u8], info: &dp_joiner::BootInfo, session: &dp_joiner::Session) -> bool {
+        let session = MDDPSession::from(session);
+        unsafe {
+            md_dp_boot(
+                self.ptr,
+                image.as_ptr(),
+                image.len(),
+                info.header_dest,
+                info.header_size,
+                info.arm9_dest,
+                info.arm9_size,
+                info.arm9_entry,
+                info.arm7_dest,
+                info.arm7_temp,
+                info.arm7_size,
+                info.arm7_entry,
+                &session,
+            ) == 0
+        }
+    }
+}
+
+/// The Download Play joiner's view of one console's bus from *another* thread.
+/// It is only a relay: `turn` hands the whole turn to the console's driver
+/// thread (see `DriverTurnBus`), because the joiner's work has to happen inside
+/// the console's own frame to be in time. The one thing read directly is this
+/// console's own MAC, which is fixed at boot.
+struct InstanceJoinerBus {
+    inst: Arc<Instance>,
+}
+
+impl dp_joiner::JoinerBus for InstanceJoinerBus {
+    fn drain(&self) -> Option<Vec<(Vec<u8>, u64)>> {
+        self.inst.link_drain_now("download-play joiner")
+    }
+
+    fn send(&self, data: &[u8], ts: u64) -> Option<i32> {
+        self.inst.link_send_now(data, ts, "download-play joiner")
+    }
+
+    fn send_reply(&self, data: &[u8], ts: u64, aid: u16) -> Option<i32> {
+        self.inst.link_send_reply_now(data, ts, aid, "download-play joiner")
+    }
+
+
+    fn own_mac(&self) -> Option<[u8; 6]> {
+        let mut mac = [0u8; 6];
+        if unsafe { md_console_mac(self.inst.ptr, mac.as_mut_ptr()) } == 0 {
+            Some(mac)
+        } else {
+            None
+        }
+    }
+
+    fn wireless_on(&self) -> bool {
+        let mut stats = MDLinkStats::default();
+        unsafe { md_link_stats(self.inst.ptr, &mut stats) };
+        stats.begin_count > stats.end_count
+    }
+
+    fn set_receiving(&self, on: bool) -> bool {
+        // Attach at the bus, never by powering the game's radio: the client is
+        // a console whose game is not in multiplayer (see md_link_test_attach).
+        unsafe { md_link_test_attach(self.inst.ptr, if on { 1 } else { 0 }) == 0 }
+    }
+
+    fn receiving(&self) -> bool {
+        unsafe { md_link_attached(self.inst.ptr) == 1 }
+    }
+
+    /// The whole turn, handed to the console's driver thread in one op. `now`
+    /// is not passed through: the turn is stamped where it runs, so the reply
+    /// schedule and the clock it is measured against share one home.
+    fn turn(
+        &self,
+        dp: &Arc<dp_joiner::DownloadPlayJoiner>,
+        st: &Arc<std::sync::Mutex<dp_joiner::State>>,
+        _now: std::time::Instant,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.inst.link_ops.lock().push(LinkOp::JoinerTurn {
+            state: st.clone(),
+            dp: dp.clone(),
+            reply: tx,
+        });
+        if rx.recv_timeout(LINK_OP_TIMEOUT).is_err() {
+            log::warn!("download-play joiner: console driver did not answer a joiner turn");
+        }
+    }
+
+    /// Booting the image edits CPU state and RAM, so it belongs on the driver
+    /// thread too - relay it like a turn rather than writing from here.
+    fn handoff(&self, image: &[u8], info: &dp_joiner::BootInfo, session: &dp_joiner::Session) -> bool {
+        self.inst.link_boot_now(image, info, session)
     }
 }
 
@@ -641,6 +1124,34 @@ impl FrameBuf {
 /// display gesture, not an emulated button, and must never collide with a
 /// game binding. It still ships as per-player data so the frontend hints can
 /// label it and the remapper can move it like any other binding.
+/// Consecutive stalled windows after which the health watchdog resyncs a
+/// console's bus state (its FIFO read offset and receive semaphores).
+///
+/// The cure is real - the historic freeze it was built for came after ~10s of
+/// continuous STALL - but a console that is *waiting for a peer to finish
+/// associating* looks identical window for window, and kicking it then discards
+/// the very replies it goes on to miss: the 2026-09-25 MKDS join was kicked
+/// 1.45s after the peer's radio came up, the host's next six acks said
+/// `clientfail=0002`, and the client deauthenticated. **Metroid Prime - Hunters
+/// four-console multi-card reproduces it exactly** (2026-09-29): kick #1 fires
+/// 265ms after the host forms its group (`+161.244s`, frame 8655, right on the
+/// host's `wireless ON (begin #3)`), and both guests that were mid-join
+/// deauthenticate (reason `0003`) 7.8s later at frame 9068.
+///
+/// Override with `MD_KICK_AFTER_WINDOWS` to sweep without a rebuild; `0`
+/// disables the kick entirely, which is what a route that has to bring three
+/// guests in at once needs while the policy is being decided.
+fn kick_after_windows() -> u32 {
+    static KICK_AFTER_WINDOWS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *KICK_AFTER_WINDOWS.get_or_init(|| {
+        std::env::var("MD_KICK_AFTER_WINDOWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(2)
+    })
+}
+
+
 fn default_flip_key(player: usize) -> &'static str {
     // Peek applies to whichever session the keyboard currently controls
     // (digits 1-4 switch it in the frontend), so every player gets the same
@@ -678,6 +1189,13 @@ struct SessionInfo {
     players: usize,
     rom: String,
     title: String,
+    /// The loaded cartridge's 4-byte game code ("AMCE", ...), or "" when the
+    /// ROM carries none. The identity a per-game profile is resolved from.
+    game_code: String,
+    /// The per-game profile for the loaded title, with the Settings switch
+    /// folded in: `None` when the game code is not in the registry, in which
+    /// case the link path is unchanged.
+    per_game: Option<game_profile::GameProfile>,
     jit: bool,
     keymaps: Vec<Vec<(String, u32)>>,
     /// Per-player hold-to-peek key for the touch screen (frontend-display only).
@@ -688,6 +1206,10 @@ struct Session {
     players: usize,
     rom: PathBuf,
     title: String,
+    /// The cartridge game code read once at load. Owned by the session so the
+    /// per-game profile can be re-resolved when the Settings switch is flipped
+    /// without touching the running consoles.
+    game_code: String,
     jit: bool,
     keymaps: Vec<Vec<(String, u32)>>,
     flip_keys: Vec<String>,
@@ -702,12 +1224,29 @@ struct Session {
     threads: Vec<JoinHandle<()>>,
     health: Option<JoinHandle<()>>,
     linkmon: Option<JoinHandle<()>>,
+    /// The synthesized single-card Download Play joiner, present only for a
+    /// title whose profile says `download_play`. `None` on every other title,
+    /// where nothing about the link path changes.
+    dp: Option<Arc<dp_joiner::DownloadPlayJoiner>>,
+    dp_thread: Option<JoinHandle<()>>,
     started_at: std::time::Instant,
 }
 
-#[derive(Default)]
 pub struct AppState {
     session: RwLock<Option<Arc<Session>>>,
+    /// The Settings switch for per-game fixes: the one gate a game-specific
+    /// patch reads. It lives on the app (not a session) so flipping it does not
+    /// restart emulation and the next session inherits it. Default on.
+    per_game_fixes: AtomicBool,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        AppState {
+            session: RwLock::new(None),
+            per_game_fixes: AtomicBool::new(true),
+        }
+    }
 }
 
 impl Drop for Session {
@@ -732,6 +1271,9 @@ impl Drop for Session {
             let _ = t.join();
         }
         if let Some(t) = self.linkmon.take() {
+            let _ = t.join();
+        }
+        if let Some(t) = self.dp_thread.take() {
             let _ = t.join();
         }
         log::info!("session teardown: watcher threads joined, destroying consoles");
@@ -771,6 +1313,35 @@ fn start_session_inner(
 
     unsafe {
         md_link_init();
+
+        // Prove the link-stats struct agrees field by field before any of its
+        // numbers are believed: `delivered` beside a `rx` that only grew on the
+        // drain side is exactly where a mis-mirrored field hides.
+        {
+            // u64 words, not bytes: the canary is read back as MDLinkStats, so
+            // the buffer has to carry the struct's own alignment.
+            let mut words = vec![0u64; std::mem::size_of::<MDLinkStats>() / 8];
+            let c_size = md_link_stats_canary(words.as_mut_ptr().cast::<u8>(), words.len() * 8);
+            let rust_size = std::mem::size_of::<MDLinkStats>() as u64;
+            // Already inside the session's own unsafe block.
+            let canary: &MDLinkStats = &*(words.as_ptr().cast::<MDLinkStats>());
+            if c_size != rust_size {
+                log::error!(
+                    "link stats struct MISMATCH: C says {} bytes, Rust says {} - every link number will be wrong until md_link_stats is fixed in both places",
+                    c_size,
+                    rust_size
+                );
+            } else if let Some(field) = stats_layout_mismatch(canary) {
+                log::error!(
+                    "link stats struct FIELD MISMATCH at `{field}`: the Rust mirror of MDLinkStats no longer matches melonds_bridge.h - that field, and every one after it, now means something else"
+                );
+            } else {
+                log::info!(
+                    "link stats struct: {} bytes, every field in the place the other language keeps it",
+                    c_size
+                );
+            }
+        }
 
         // Prove the digest structs agree before any of their numbers are
         // believed. A layout mismatch would not crash - it would just make the
@@ -877,6 +1448,18 @@ fn start_session_inner(
                 "link reply budget: {frames_of_slack} emulated frame(s) of wall clock per frame for a whole console's reply waits"
             );
         }
+
+        // The stall kick tears a peer's join handshake when the host is simply
+        // waiting for it to associate (see kick_after_windows), so say which
+        // arm a run is in without having to infer it from the absence of a log
+        // line: "never" is a policy, not a missing feature.
+        log::info!(
+            "link stall kick: {}",
+            match kick_after_windows() {
+                0 => "disabled (MD_KICK_AFTER_WINDOWS=0) - a stalled console is never resynced".to_string(),
+                n => format!("after {n} stalled window(s) ({})", if std::env::var("MD_KICK_AFTER_WINDOWS").is_ok() { "MD_KICK_AFTER_WINDOWS" } else { "default" }),
+            }
+        );
     }
 
     let n = players as usize;
@@ -899,8 +1482,6 @@ fn start_session_inner(
             ptr,
             buttons: AtomicU64::new(0),
             touch: Mutex::new((false, 0, 0)),
-            wireless_req: AtomicI32::new(-1),
-            wireless_applied: AtomicI32::new(-1),
             link_ops: Mutex::new(Vec::new()),
         }));
     }
@@ -948,6 +1529,17 @@ fn start_session_inner(
     }
 
     let title = read_title(&instances[0]);
+    let game_code = read_game_code(&instances[0]);
+    // Resolve once, here, so the profile is fixed for the session and the log
+    // carries the same answer the Settings panel shows. No registry entry means
+    // `None` and the default path, unchanged.
+    let per_game = game_profile::resolve(&game_code, state.per_game_fixes.load(Ordering::SeqCst));
+    log::info!(
+        "loaded game: {} (code {}) - {}",
+        if title.is_empty() { "?" } else { &title },
+        if game_code.is_empty() { "????" } else { &game_code },
+        game_profile::describe(per_game.as_ref()),
+    );
 
     let keymaps: Vec<Vec<(String, u32)>> = (0..n)
         .map(|p| default_keymap(p).into_iter().map(|(k, b)| (k.into(), b)).collect())
@@ -1038,6 +1630,16 @@ fn start_session_inner(
                     rx_cmd: u64,
                     rx_rep: u64,
                     rx_ack: u64,
+                    // The receive total, attributed (melonds_bridge.h v3):
+                    // frames this console's own game read, frames a scripted
+                    // drain read (the Link test, the link monitor), and frames
+                    // the router handed the console whether or not anyone read
+                    // them. `rx` is the sum of the first two, so a console
+                    // whose rx climbs while its game reads nothing is a console
+                    // a host-side probe has been draining.
+                    rx_game: u64,
+                    rx_drained: u64,
+                    delivered: u64,
                     rx_polls: u64,
                     rx_empty: u64,
                     tx_cmd: u64,
@@ -1158,6 +1760,9 @@ fn start_session_inner(
                             last_beat_frame,
                             tx: stats.packets_sent,
                             rx: stats.packets_received,
+                            rx_game: stats.packets_read_game,
+                            rx_drained: stats.packets_read_drained,
+                            delivered: stats.packets_delivered,
                             tx_bytes: stats.bytes_sent,
                             rx_bytes: stats.bytes_received,
                             rx_bcast: stats.rx_broadcast,
@@ -1181,9 +1786,16 @@ fn start_session_inner(
                         let d_tx_bytes = snap.tx_bytes.wrapping_sub(p.tx_bytes);
                         let d_rx_bytes = snap.rx_bytes.wrapping_sub(p.rx_bytes);
                         let d_polls = snap.rx_polls.wrapping_sub(p.rx_polls);
+                        let d_rx_game = snap.rx_game.wrapping_sub(p.rx_game);
+                        let d_delivered = snap.delivered.wrapping_sub(p.delivered);
                         // Wireless is "on" between a begin and its matching end.
                         let wireless_on = stats.begin_count > stats.end_count;
-                        let rx_active = d_rx > 0;
+                        // "Active" means a game accepted a packet, which is what
+                        // the stall clock beside it measures: a host-side drain
+                        // (the Link test, the link monitor) reads packets too,
+                        // and counting those as traffic would hide the stall it
+                        // was sent to find.
+                        let rx_active = d_rx_game > 0;
                         // Seconds since this console last accepted a packet:
                         // the stall clock. epoch_us <= last_rx_us holds once
                         // anything has been received.
@@ -1221,15 +1833,18 @@ fn start_session_inner(
                         // The historic cure it was built for came after ~10s of
                         // continuous STALL, so two windows keeps that cure and
                         // stops interrupting handshakes.
-                        const KICK_AFTER_WINDOWS: u32 = 2;
+                        // 0 = never kick (MD_KICK_AFTER_WINDOWS=0), which is the
+                        // arm a multi-guest join needs: see kick_after_windows.
+                        let kick_after_windows: u32 = kick_after_windows();
                         if state == "LINK STALL" {
                             stall_windows[i] = stall_windows[i].saturating_add(1);
                         } else {
                             stall_windows[i] = 0;
                         }
 
-                        let kick_due = stall_windows[i] >= KICK_AFTER_WINDOWS
-                            && stall_windows[i] <= KICK_AFTER_WINDOWS + 2;
+                        let kick_due = kick_after_windows > 0
+                            && stall_windows[i] >= kick_after_windows
+                            && stall_windows[i] <= kick_after_windows + 2;
                         if kick_due && snap.connected.count_ones() > 1 {
                             // Kicked through the driver thread: this used to
                             // call straight into the bus, mutating the very
@@ -1242,18 +1857,26 @@ fn start_session_inner(
                                     "p{} stalled with peers on the bus for {} windows - resynced its bus state (kick #{})",
                                     i + 1,
                                     stall_windows[i],
-                                    stall_windows[i] - KICK_AFTER_WINDOWS + 1
+                                    stall_windows[i] - kick_after_windows + 1
                                 );
                             }
                         } else if state == "LINK STALL" && verbose {
                             // Attribution: a stall we deliberately did NOT kick,
                             // so a later failure cannot be blamed on a kick that
-                            // never happened.
+                            // never happened - and which arm left it alone, since
+                            // "the kick is off" and "this console already had its
+                            // one kick" are different runs to compare.
                             log::info!(
-                                "p{} stalled (window {}/{}) - below the kick threshold, left alone",
+                                "p{} stalled (window {}) - left alone ({})",
                                 i + 1,
                                 stall_windows[i],
-                                KICK_AFTER_WINDOWS
+                                if kick_after_windows == 0 {
+                                    "stall kick disabled (MD_KICK_AFTER_WINDOWS=0)".to_string()
+                                } else {
+                                    format!(
+                                        "at, or past, the {kick_after_windows}-window threshold, which fires only once"
+                                    )
+                                }
                             );
                         }
                         // A live game moves the PC on essentially every one of
@@ -1291,7 +1914,7 @@ fn start_session_inner(
                         };
 
                         log::info!(
-                            "health p{}: {} · frames {}(+{}) · picture {}(+{}) · tx {}(+{}, {}B(+{})) · rx {}(+{}, {}B(+{})) · slots 0x{:x} · wifi on/off {}/{} · pc {}/{}",
+                            "health p{}: {} · frames {}(+{}) · picture {}(+{}) · tx {}(+{}, {}B(+{})) · rx {}(+{}, {}B(+{})) [game {}(+{}), drain {}] · delivered {}(+{}) · slots 0x{:x} · wifi on/off {}/{} · pc {}/{}",
                             i + 1,
                             state,
                             snap.frames,
@@ -1306,6 +1929,11 @@ fn start_session_inner(
                             d_rx,
                             snap.rx_bytes,
                             d_rx_bytes,
+                            snap.rx_game,
+                            d_rx_game,
+                            snap.rx_drained,
+                            snap.delivered,
+                            d_delivered,
                             snap.connected,
                             snap.begin,
                             snap.end,
@@ -1377,10 +2005,46 @@ fn start_session_inner(
         Arc::clone(&monitor),
     );
 
+    // The synthesized single-card Download Play joiner. Present only for a
+    // title whose profile says `download_play` (and only when there is a peer
+    // to be the host), so every other title's link path is untouched; within
+    // that title it is armed by the same Settings switch as every other
+    // per-game behavior (GameProfile::download_play_joiner).
+    let (dp, dp_thread) = match per_game.as_ref().filter(|p| p.download_play && n >= 2) {
+        None => (None, None),
+        Some(profile) => {
+            let joiner = n - 1;
+            let dp = Arc::new(dp_joiner::DownloadPlayJoiner::new(
+                profile.download_play_joiner(),
+                joiner,
+            ));
+            let bus: Arc<dyn dp_joiner::JoinerBus> = Arc::new(InstanceJoinerBus {
+                inst: Arc::clone(&instances[joiner]),
+            });
+            log::info!(
+                "download-play joiner: console {} is the synthesized client, {}",
+                joiner + 1,
+                if profile.download_play_joiner() {
+                    "armed - it will answer a host's beacon with auth + assoc"
+                } else {
+                    "disarmed (per-game fixes off)"
+                }
+            );
+            let stop = Arc::clone(&stop);
+            let d = Arc::clone(&dp);
+            let handle = std::thread::Builder::new()
+                .name("dpjoiner".into())
+                .spawn(move || dp_joiner::run(bus, stop, d))
+                .expect("spawn download-play joiner");
+            (Some(dp), Some(handle))
+        }
+    };
+
     let session = Arc::new(Session {
         players: n,
         rom: rom.clone(),
         title,
+        game_code,
         jit,
         keymaps,
         flip_keys,
@@ -1392,6 +2056,8 @@ fn start_session_inner(
         threads,
         health: Some(health),
         linkmon: Some(linkmon),
+        dp,
+        dp_thread,
         started_at: std::time::Instant::now(),
     });
 
@@ -1401,6 +2067,8 @@ fn start_session_inner(
         players: n,
         rom: rom.display().to_string(),
         title: session.title.clone(),
+        game_code: session.game_code.clone(),
+        per_game,
         jit,
         keymaps: session.keymaps.clone(),
         flip_keys: session.flip_keys.clone(),
@@ -1415,6 +2083,19 @@ fn read_title(inst: &Instance) -> String {
     }
     let bytes: Vec<u8> = buf.iter().take_while(|b| **b != 0).map(|b| *b as u8).collect();
     String::from_utf8_lossy(&bytes).trim_end().to_string()
+}
+
+/// The loaded cartridge's 4-byte game code, verbatim ("AMCE", "A2DE", ...).
+/// Empty when no cart carries one. Kept untrimmed: the code is fixed-width, so a
+/// trailing space is part of it and not padding to strip.
+fn read_game_code(inst: &Instance) -> String {
+    let mut buf = [0i8; 8];
+    let rc = unsafe { md_rom_game_code(inst.ptr, buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    let bytes: Vec<u8> = buf.iter().take_while(|b| **b != 0).map(|b| *b as u8).collect();
+    String::from_utf8_lossy(&bytes).to_string()
 }/// Per-frame lockstep across consoles, with peer-death detection.
 ///
 /// std::sync::Barrier has no timeout: if one console leaves the loop (the game
@@ -1534,19 +2215,6 @@ fn run_loop(
         // effects. Nothing else may touch this console's bus state.
         inst.service_link_ops();
 
-        // Selftest-originated wireless power requests are applied here, on the
-        // thread that owns this console: wireless power is ARM7 state
-        // (PowerControl7 + W_PowerUS), and the core's callback is what puts
-        // the console on the link bus under its slot - see smoke_test.cpp.
-        let req = inst.wireless_req.swap(-1, Ordering::SeqCst);
-        if req >= 0 {
-            unsafe {
-                md_write_io16(inst.ptr, 7, 0x04000304, if req == 1 { 0x0002 } else { 0x0000 });
-                md_write_io16(inst.ptr, 7, 0x04800036, if req == 1 { 0x0000 } else { 0x0001 });
-            }
-            inst.wireless_applied.store(req, Ordering::SeqCst);
-        }
-
         // Apply this console's whole input state every frame - the same rule
         // the harness learned the hard way (one-shot taps left buttons held).
         let buttons = inst.buttons.load(Ordering::Relaxed) as u32;
@@ -1652,9 +2320,15 @@ fn try_autostart(app: &tauri::AppHandle) {
         log::warn!("MD_AUTOSTART_PLAYERS set but no MD_AUTOSTART_ROM; skipping autostart");
         return;
     };
-    log::info!("autostart: {players} player(s), rom {rom}");
+    // MD_NOJIT=1 runs the autostarted consoles on the ARM interpreter. The
+    // JIT reports `R[15]` as the start of the block an instruction ended up in,
+    // so a hook that records the writer of a register or a buffer (the wifi io
+    // recorder's `pc=` fields) needs this to name the instruction rather than
+    // the block. The coretest harness has the same switch as `--no-jit`.
+    let jit = !matches!(std::env::var("MD_NOJIT").as_deref(), Ok(v) if !v.is_empty() && v != "0");
+    log::info!("autostart: {players} player(s), rom {rom}, jit={jit}");
     let state = app.state::<AppState>();
-    match start_session_inner(&state, players, rom, true) {
+    match start_session_inner(&state, players, rom, jit) {
         Ok(info) => {
             log::info!(
                 "autostart ok: {} player(s), title '{}'",
@@ -1680,8 +2354,8 @@ fn try_autostart(app: &tauri::AppHandle) {
                 });
             } else {
                 log::info!(
-                    "autostart: automatic link selftest left off (it pokes the game's \
-                     wireless hardware; set MD_AUTOSTART_SELFTEST=1 to run it)"
+                    "autostart: automatic link selftest left off (it puts test frames on \
+                     the consoles' bus; set MD_AUTOSTART_SELFTEST=1 to run it)"
                 );
             }
         }
@@ -1700,14 +2374,146 @@ fn stop_session(state: tauri::State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn session_info(state: tauri::State<'_, AppState>) -> Result<Option<SessionInfo>, String> {
+    let enabled = state.per_game_fixes.load(Ordering::SeqCst);
     Ok(state.session.read().as_ref().map(|s| SessionInfo {
         players: s.players,
         rom: s.rom.display().to_string(),
         title: s.title.clone(),
+        game_code: s.game_code.clone(),
+        per_game: game_profile::resolve(&s.game_code, enabled),
         jit: s.jit,
         keymaps: s.keymaps.clone(),
         flip_keys: s.flip_keys.clone(),
     }))
+}
+
+/// The per-game answer for the app: the switch, the loaded game code, and the
+/// profile it resolves to. One shape for both the read and the toggle, so the
+/// UI never sees two different representations of the same state.
+fn per_game_payload(state: &AppState, enabled: bool) -> serde_json::Value {
+    let current = state.session.read();
+    let (code, profile) = match current.as_ref() {
+        Some(s) => (s.game_code.clone(), game_profile::resolve(&s.game_code, enabled)),
+        None => (String::new(), None),
+    };
+    serde_json::json!({
+        "enabled": enabled,
+        "gameCode": code,
+        "profile": profile,
+        "description": game_profile::describe(profile.as_ref()),
+    })
+}
+
+/// Read the per-game-fix switch and the profile it currently resolves to.
+/// Answers without a session too, so Settings can show the switch before any
+/// ROM is loaded.
+#[tauri::command]
+fn per_game_state(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let enabled = state.per_game_fixes.load(Ordering::SeqCst);
+    Ok(per_game_payload(&state, enabled))
+}
+
+/// Flip the per-game-fix switch. The profile is re-resolved against the loaded
+/// game code and returned, so a caller sees the new answer without restarting.
+#[tauri::command]
+fn set_per_game_fix(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    state.per_game_fixes.store(enabled, Ordering::SeqCst);
+    let payload = per_game_payload(&state, enabled);
+    // The switch is the one gate a per-game behavior reads, so it has to reach
+    // a running session's joiner too, not just the next session's resolution.
+    if let Some(session) = state.session.read().as_ref() {
+        if let Some(dp) = session.dp.as_ref() {
+            let on = game_profile::resolve(&session.game_code, enabled)
+                .map(|p| p.download_play_joiner())
+                .unwrap_or(false);
+            if dp.is_armed() != on {
+                dp.set_armed(on);
+                log::info!(
+                    "per-game fix switch {} the download-play joiner",
+                    if on { "arms" } else { "disarms" }
+                );
+            }
+        }
+    }
+    log::info!(
+        "per-game fixes {} - {}",
+        if enabled { "on" } else { "off" },
+        payload["description"].as_str().unwrap_or(""),
+    );
+    Ok(payload)
+}
+
+/// The synthesized Download Play joiner's own state, as a value: whether this
+/// title has one, whether it is armed, and every frame it has sent or seen.
+/// A disarmed joiner reads all-zero here, and that is the gate's proof - the
+/// off arm is "zero bus operations", not "no visible change".
+fn dp_state(session: &Session) -> serde_json::Value {
+    use dp_joiner::Counters;
+    match session.dp.as_ref() {
+        None => serde_json::json!({
+            "present": false,
+            "note": "this title has no download-play joiner (only a profile with download_play gets one)",
+        }),
+        Some(dp) => {
+            let Counters {
+                beacons,
+                auth_sent,
+                auth_recv,
+                assoc_sent,
+                assoc_recv,
+                replies_sent,
+                host_frames,
+                deauths,
+                last_deauth_reason,
+                last_auth_status,
+                last_assoc_status,
+                last_assoc_aid,
+                commands_recv,
+                last_command,
+                last_cmd_slave_flags,
+                acks_recv,
+                replies_collected,
+                image_packets,
+                image_bytes,
+                image_next,
+                image_total_bytes,
+                transfer,
+                radio_hold,
+            } = &dp.counters;
+            serde_json::json!({
+                "present": true,
+                "armed": dp.is_armed(),
+                "booted": dp.is_booted(),
+                "radioHold": radio_hold.load(Ordering::SeqCst),
+                "transfer": dp_joiner::transfer_name(transfer.load(Ordering::SeqCst)),
+                "joiner": dp.joiner.load(Ordering::SeqCst) + 1,
+                "beacons": beacons.load(Ordering::SeqCst),
+                "authSent": auth_sent.load(Ordering::SeqCst),
+                "authRecv": auth_recv.load(Ordering::SeqCst),
+                "assocSent": assoc_sent.load(Ordering::SeqCst),
+                "assocRecv": assoc_recv.load(Ordering::SeqCst),
+                "repliesSent": replies_sent.load(Ordering::SeqCst),
+                "hostFrames": host_frames.load(Ordering::SeqCst),
+                "deauths": deauths.load(Ordering::SeqCst),
+                "lastDeauthReason": last_deauth_reason.load(Ordering::SeqCst),
+                "lastAuthStatus": last_auth_status.load(Ordering::SeqCst),
+                "lastAssocStatus": last_assoc_status.load(Ordering::SeqCst),
+                "lastAssocAid": last_assoc_aid.load(Ordering::SeqCst),
+                "commandsRecv": commands_recv.load(Ordering::SeqCst),
+                "lastCommand": last_command.load(Ordering::SeqCst),
+                "lastCmdSlaveFlags": last_cmd_slave_flags.load(Ordering::SeqCst),
+                "acksRecv": acks_recv.load(Ordering::SeqCst),
+                "repliesCollected": replies_collected.load(Ordering::SeqCst),
+                "imagePackets": image_packets.load(Ordering::SeqCst),
+                "imageBytes": image_bytes.load(Ordering::SeqCst),
+                "imageNext": image_next.load(Ordering::SeqCst),
+                "imageTotalBytes": image_total_bytes.load(Ordering::SeqCst),
+            })
+        }
+    }
 }
 
 /// Frame request. The response is raw bytes: per player, an 8-byte little-endian
@@ -1824,13 +2630,110 @@ fn link_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, S
     }))
 }
 
-/// Host-side link selftest: power every console's wireless on, then broadcast
-/// a tagged packet from every console to every peer (full mesh) and check each
-/// arrives intact, timestamp included. Uses the same primitive the emulated
-/// WiFi hardware calls into, so a pass proves slot routing and the LocalMP
-/// queues work inside the app - not just in the C++ smoke test. Runs only on
-/// demand (button / verification runs): firing packets while a real game is
-/// mid-handshake could confuse it.
+/// What one directed link probe saw. `delivered` is the bus's own ledger (the
+/// router handed the frame to the receiving console) and `observed`/
+/// `payload_ok` say which consumer read it back and whether the bytes were the
+/// ones the wire carried.
+struct ProbeOutcome {
+    sent: bool,
+    delivered: bool,
+    observed: bool,
+    payload_ok: bool,
+    ts_ok: bool,
+    seen_by: String,
+}
+
+/// One directed verification over the shared bus: arm an expectation on the
+/// receiver, send from the sender, then ask what happened to the frame.
+///
+/// Why it is not "send, then drain the peer's inbox and look for the bytes":
+/// the peer's own game polls its receive slot from inside the emulation every
+/// frame, so it wins that race whenever it is polling - and its read is just as
+/// much a proof of delivery as a drain's. Measured 2026-09-30 on the app: the
+/// Link test drained nothing in two states while every console's delivery
+/// ledger was climbing, because the games had already consumed the frames. The
+/// ledger is where a delivery can be attributed; the armed expectation is how
+/// the payload is checked whichever consumer did the reading.
+///
+/// The expectation is the frame *as the wire leaves it*: `md_probe_arm`
+/// applies the same trailing-FCS transform the send path does. Arming it with
+/// the sender's bytes instead is what made the old button report FAILED on a
+/// healthy bus - it waited for a nonce the wire had already overwritten with a
+/// checksum, in every state, while its own health lines showed the traffic.
+fn probe_direction(
+    from: &Arc<Instance>,
+    to: &Arc<Instance>,
+    payload: &[u32],
+    ts: u64,
+    wait: Duration,
+) -> ProbeOutcome {
+    let wire = words_to_bytes(payload);
+    let mut out = ProbeOutcome {
+        sent: false,
+        delivered: false,
+        observed: false,
+        payload_ok: false,
+        ts_ok: false,
+        seen_by: String::new(),
+    };
+
+    let before = link_delivered(to);
+
+    // Refuses (rather than silently passing) a payload bigger than the probe's
+    // own expectation buffer.
+    if unsafe { md_probe_arm(to.ptr, wire.as_ptr(), wire.len(), ts) } != 0 {
+        return out;
+    }
+
+    out.sent = from
+        .link_send_now(&wire, ts, "link probe")
+        .map(|queued| queued > 0)
+        .unwrap_or(false);
+
+    if out.sent {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let mut pr = MDProbeResult::default();
+            if unsafe { md_probe_result(to.ptr, &mut pr) } == 0 && pr.observed != 0 {
+                out.observed = true;
+                out.payload_ok = pr.payload_ok != 0;
+                out.ts_ok = pr.ts_ok != 0;
+                out.seen_by = pr.seen_by_str();
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            // No consumer has taken it yet, so be one: a frame the receiving
+            // console is not polling for is still a delivery, and reading it
+            // here is what proves its payload rather than leaving it queued.
+            let _ = to.link_drain_now("link probe");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    out.delivered = link_delivered(to) > before;
+    unsafe { md_probe_disarm(to.ptr) };
+    out
+}
+
+/// The bus's delivery count for one console: frames the router handed it,
+/// whether or not its game ever asked for them.
+fn link_delivered(inst: &Arc<Instance>) -> u64 {
+    let mut stats = MDLinkStats::default();
+    unsafe { md_link_stats(inst.ptr, &mut stats) };
+    stats.packets_delivered
+}
+
+/// Host-side link selftest: attach every console to the bus (at the bus, never
+/// by powering the game's radio - see md_link_test_attach), then verify one
+/// packet from every console to every peer (full mesh) - delivered to the peer
+/// and read back with the bytes and timestamp the sender queued. Uses the same
+/// primitive the emulated WiFi hardware calls into, so a pass proves slot
+/// routing and the LocalMP queues work inside the app - not just in the C++
+/// smoke test. Runs only on demand (button / verification runs), and while a
+/// game has its wireless on it does the safe half instead (see the resync path
+/// below): a test frame inside a live lobby is foreign traffic.
 fn link_selftest_inner(state: &AppState) -> Result<serde_json::Value, String> {
     let current = state.session.read();
     let Some(session) = current.as_ref() else {
@@ -1872,35 +2775,16 @@ fn link_selftest_inner(state: &AppState) -> Result<serde_json::Value, String> {
     // Wireless power-on, exactly as the smoke test does it: an ARM7 register
     // write, then wait for the core's callback to put each console on the bus
     // (its connected bit appears in md_link_connected_mask).
-    let power_on = |inst: &Arc<Instance>| -> Result<(), String> {
-        inst.wireless_applied.store(-1, Ordering::SeqCst);
-        inst.wireless_req.store(1, Ordering::SeqCst);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while inst.wireless_applied.load(Ordering::SeqCst) != 1 {
-            if std::time::Instant::now() > deadline {
-                return Err("console never applied wireless power-on (run loop stalled?)".into());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        Ok(())
-    };
+    // Attach every console to the bus for the duration, at the bus itself:
+    // no ARM7 register writes, and no bit in md_link_connected_mask. The
+    // console's radio and the game's own driver are left exactly as they were.
+    // This is the half the button used to do by powering each console's
+    // wireless on and off under the game's own WiFi driver, which left a
+    // running game unable to bring its radio up again (see md_link_test_attach).
     for inst in &session.instances {
-        power_on(inst)?;
-    }
-
-    let wait_on_bus = |inst: &Arc<Instance>| -> Result<(), String> {
-        let slot = unsafe { md_link_slot(inst.ptr) };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while unsafe { md_link_connected_mask() } & (1 << slot) == 0 {
-            if std::time::Instant::now() > deadline {
-                return Err(format!("slot {slot} never joined the bus"));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        if unsafe { md_link_test_attach(inst.ptr, 1) } != 0 {
+            return Err("the link bus is not up".into());
         }
-        Ok(())
-    };
-    for inst in &session.instances {
-        wait_on_bus(inst)?;
     }
 
     const MAGIC: u32 = 0x4D535430; // 'MST0'
@@ -1915,79 +2799,48 @@ fn link_selftest_inner(state: &AppState) -> Result<serde_json::Value, String> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0);
-            let payload: [u32; 4] = [MAGIC, from as u32, to as u32, nonce];
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
 
-            // Both halves of the round trip run on the owning consoles' driver
-            // threads (see LinkOp): a probe that reaches into a live console's
-            // bus state from here is what made the old selftest unreliable.
-            // Send reports the queued byte count: > 0 means the bus took it
-            // (0 = refused, e.g. slot not attached).
-            let wire = words_to_bytes(&payload);
-            let sent = from_inst
-                .link_send_now(&wire, ts, "link selftest")
-                .map(|queued| queued > 0)
-                .unwrap_or(false);
+            // The frame's identity lives in its first four words, and its last
+            // word is the wire's own FCS slot - so the nonce goes in the body
+            // (word four), which the wire carries through untouched, and the
+            // trailing word is left for SendPacketGeneric/ApplyWireFCS to fill.
+            // A 20-byte frame is also below the core's 12+24 minimum, which is
+            // what keeps the peer's game from logging or acting on a probe.
+            let payload: [u32; 5] = [MAGIC, from as u32, to as u32, nonce, 0];
+            let out = probe_direction(from_inst, to_inst, &payload, ts, Duration::from_millis(400));
 
-            // The bus is broadcast: every console sees every packet, and
-            // earlier pairs' packets may still be queued in this receiver's
-            // FIFO. Drain until we find OUR packet (magic + nonce), which both
-            // proves delivery and flushes the stale ones in one pass.
-            let mut received = false;
-            let mut payload_ok = false;
-            if sent {
-                let deadline = std::time::Instant::now() + Duration::from_millis(400);
-                while std::time::Instant::now() < deadline {
-                    let Some(packets) = to_inst.link_drain_now("link selftest") else {
-                        break;
-                    };
-                    for (bytes, packet_ts) in packets {
-                        if bytes.len() != std::mem::size_of::<[u32; 4]>() {
-                            continue;
-                        }
-                        let got: [u32; 4] =
-                            unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) };
-                        if got[0] == MAGIC && got[3] == nonce {
-                            received = true;
-                            payload_ok = got == payload && packet_ts == ts;
-                            break;
-                        }
-                        // not ours: a stale or peer packet, keep draining
-                    }
-                    if received {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
             results.push(serde_json::json!({
-            "from": from + 1,
-            "to": to + 1,
-            "sent": sent,
-            "received": received,
-            "payloadOk": payload_ok,
-        }));
+                "from": from + 1,
+                "to": to + 1,
+                "sent": out.sent,
+                "delivered": out.delivered,
+                "observed": out.observed,
+                "payloadOk": out.payload_ok,
+                "tsOk": out.ts_ok,
+                "seenBy": out.seen_by,
+            }));
         }
     }
 
-    // Leave the machines as we found them: the diag ROM never touches
-    // wireless, so power it back off through the same run-loop channel. Then
-    // flush every console - drain what is queued, then re-anchor the read
-    // offset - because a test frame that outlives the test is a foreign frame
-    // lying in wait for whatever the game does next, which is exactly how one
-    // of these turned up inside an MKDS lobby minutes later.
-    for inst in &session.instances {
-        inst.wireless_applied.store(-1, Ordering::SeqCst);
-        inst.wireless_req.store(0, Ordering::SeqCst);
-    }
+    // Leave the machines as we found them: the consoles come off the test
+    // attachment, and then every one is flushed - drain what is queued, then
+    // re-anchor the read offset - because a test frame that outlives the test
+    // is a foreign frame lying in wait for whatever the game does next, which
+    // is exactly how one of these turned up inside an MKDS lobby minutes
+    // later. Detaching after the flush also means the frames are read while
+    // this console is still on the bus, rather than left for its game.
     for inst in &session.instances {
         let _ = inst.link_drain_now("link selftest flush");
     }
     for inst in &session.instances {
         let _ = inst.link_resync_now("link selftest flush");
+    }
+    for inst in &session.instances {
+        unsafe { md_link_test_attach(inst.ptr, 0) };
     }
 
     Ok(serde_json::json!({ "mode": "inject", "injected": true, "results": results }))
@@ -1997,9 +2850,10 @@ fn link_selftest_inner(state: &AppState) -> Result<serde_json::Value, String> {
 /// running". Every 10s, when at least two consoles have their wireless on
 /// (they are in a multiplayer menu or session) but NO console accepted any
 /// packet over the last window, it fires one probe packet and expects it on
-/// the next console. Delivered = the bus works; undelivered = the same
-/// drifted-FIFO/semaphore state a manual "Link test" click cured, so both
-/// consoles get the resync kick. Constraints honored on purpose:
+/// the next console. Delivered and read back intact = the bus works;
+/// undelivered = the same drifted-FIFO/semaphore state a manual "Link test"
+/// click cured, so both consoles get the resync kick. Constraints honored on
+/// purpose:
 /// - never probe while game traffic flows (a probe interleaves with the
 ///   game's own packets and the probe read shares the console's FIFO),
 /// - never probe when wireless is off (the packet would sit unread and the
@@ -2028,7 +2882,11 @@ fn spawn_link_monitor(
 
                 // Window classification. Real traffic is the strongest possible
                 // proof - packets crossed the bus and a game accepted them - so
-                // a window with traffic needs no probe at all.
+                // a window with traffic needs no probe at all. The counter that
+                // decides this is the *game* read half, not the total: a probe
+                // of our own is a drain, and counting drains here would let one
+                // probe make the next window look like traffic and silence the
+                // verifier for good (the reason the receive total is split).
                 let mut game_active = false;
                 let mut wireless_on = false;
                 for (i, inst) in insts.iter().enumerate() {
@@ -2037,10 +2895,10 @@ fn spawn_link_monitor(
                     if stats.begin_count > stats.end_count {
                         wireless_on = true;
                     }
-                    if stats.packets_received > last_rx[i] {
+                    if stats.packets_read_game > last_rx[i] {
                         game_active = true;
                     }
-                    last_rx[i] = stats.packets_received;
+                    last_rx[i] = stats.packets_read_game;
                 }
                 if game_active {
                     monitor.verified.fetch_add(1, Ordering::SeqCst);
@@ -2052,33 +2910,39 @@ fn spawn_link_monitor(
                 }
 
                 // Optional probe (MD_LINK_PROBE=1). Runs only in a window with
-                // no game traffic, and sends/receives through the consoles'
-                // own driver threads like everything else here.
+                // no game traffic, and sends/observes through the consoles'
+                // own driver threads like everything else here. Same instrument
+                // as the button: the delivery ledger says the frame reached the
+                // peer, the armed expectation says its bytes did too. Matching
+                // a drain's payload against the sender's bytes (what this used
+                // to do) can never succeed - the wire rewrites the frame's
+                // trailing word with its FCS - and so reported every probe as
+                // undelivered.
                 let nonce = now_ms() as u32 | 1;
-                let payload: [u32; 4] = [0x4D535430 /* 'MST0' */, 0, 1, nonce];
-                let wire = words_to_bytes(&payload);
-                let ts = now_ms();
-                let sent = insts[0]
-                    .link_send_now(&wire, ts, "link monitor")
-                    .map(|queued| queued > 0)
-                    .unwrap_or(false);
-                let mut ok = false;
-                if sent {
-                    let deadline = std::time::Instant::now() + Duration::from_millis(300);
-                    while std::time::Instant::now() < deadline {
-                        match insts[1].link_drain_now("link monitor") {
-                            Some(packets) => {
-                                if packets.iter().any(|(bytes, _)| *bytes == wire) {
-                                    ok = true;
-                                    break;
-                                }
-                            }
-                            None => break,
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
+                let payload: [u32; 5] = [0x4D535430 /* 'MST0' */, 0, 1, nonce, 0];
+                let probe = probe_direction(
+                    &insts[0],
+                    &insts[1],
+                    &payload,
+                    now_ms(),
+                    Duration::from_millis(300),
+                );
+                let ok = probe.sent && probe.delivered && probe.observed && probe.payload_ok;
+                if !ok {
+                    log::warn!(
+                        "link monitor: bus probe p1->p2 sent={} delivered={} observed={} (by {}) payloadOk={} - resyncing both consoles",
+                        probe.sent,
+                        probe.delivered,
+                        probe.observed,
+                        if probe.seen_by.is_empty() { "nobody" } else { &probe.seen_by },
+                        probe.payload_ok,
+                    );
                 }
                 if ok {
+                    log::info!(
+                        "link monitor: bus probe p1->p2 delivered and read back intact by {} - the bus works with no game talking",
+                        if probe.seen_by.is_empty() { "nobody" } else { &probe.seen_by },
+                    );
                     monitor.verified.fetch_add(1, Ordering::SeqCst);
                     monitor.last_ok_ms.store(now_ms(), Ordering::SeqCst);
                 } else {
@@ -2747,12 +3611,20 @@ window.__mdctl = window.__mdctl || {};
   };
   D.click = function (sel) {
     const e = document.querySelector(sel);
-    if (!e) return 'not found: ' + sel;
+    // A click that cannot happen *throws*, the way `key` already does for a key
+    // this page cannot act on, so a caller can tell it apart from one that
+    // happened. It used to return the message and exit 0, which left the exact
+    // trap every route in this project has fallen into: a scripted step that did
+    // nothing looks exactly like one that worked (2026-09-30 playtest - `click
+    // '#nope'` and `click '#selftest'` on an idle app both read as success).
+    if (!e) throw new Error('not found: ' + sel);
     // A disabled control ignores the click entirely, so reporting success for
     // one is a lie the driver cannot detect: `click #selftest` on an idle app
     // (the button is disabled when nothing runs) read as "clicked #selftest"
     // and nothing happened (2026-09-28 playtest).
-    if (e.disabled) return 'disabled: ' + sel + ' (nothing to click - is a session running?)';
+    if (e.disabled) {
+      throw new Error('disabled: ' + sel + ' (nothing to click - is a session running?)');
+    }
     e.click();
     return 'clicked ' + sel;
   };
@@ -2812,9 +3684,17 @@ fn ctrl_eval(app: &tauri::AppHandle, body: &str, timeout: Duration) -> Result<St
     // cannot report its own error. The timeout path below asks the window a
     // trivial question to tell that apart from a window that is gone or busy,
     // instead of blaming the window for the caller's typo.
+    //
+    // `data` must always be a *string*. `JSON.stringify(undefined)` returns
+    // undefined, so an expression whose value is `undefined` used to arrive as
+    // no key at all - Tauri rejected the invoke with "invalid args `data` for
+    // command `md_ctrl_report`" (an unhandled rejection, so an ERROR line in the
+    // log) and the reply never came, which turned an ordinary query into the
+    // full timeout under a message blaming the window. Found by driving the
+    // app's own empty state as a user (2026-09-30).
     let js = format!(
-        "{prelude}(async function(){{try{{const v=await ({body});window.__TAURI__.core.invoke('md_ctrl_report',{{id:{id},data:(typeof v==='string')?v:JSON.stringify(v)}});}}\
-         catch(e){{window.__TAURI__.core.invoke('md_ctrl_report',{{id:{id},data:'__ERR__ '+((e&&e.message)?e.message:String(e))}});}}}})().catch(function(){{}});",
+        "{prelude}(async function(){{try{{const v=await ({body});window.__TAURI__.core.invoke('md_ctrl_report',{{id:{id},data:(typeof v==='string')?v:((JSON.stringify(v)===undefined)?String(v):JSON.stringify(v))}});}}\
+         catch(e){{window.__TAURI__.core.invoke('md_ctrl_report',{{id:{id},data:'__ERR__ '+((e&&e.message)?e.message:String(e))}}).catch(function(){{}});}}}})().catch(function(){{}});",
         body = body,
         id = id,
         prelude = CTRL_PRELUDE
@@ -2940,13 +3820,19 @@ fn ctrl_status(app: &tauri::AppHandle) -> serde_json::Value {
         let buf = fb.lock();
         frames.push(serde_json::json!({ "player": i + 1, "seq": buf.seq }));
     }
+    let enabled = state.per_game_fixes.load(Ordering::SeqCst);
+    let per_game = game_profile::resolve(&session.game_code, enabled);
     serde_json::json!({
         "active": true,
         "players": session.players,
         "rom": session.rom.display().to_string(),
         "title": session.title.clone(),
+        "game_code": session.game_code.clone(),
+        "per_game": per_game,
+        "per_game_desc": game_profile::describe(per_game.as_ref()),
         "elapsed_s": session.started_at.elapsed().as_secs(),
         "link_mask": unsafe { md_link_connected_mask() },
+        "dp": dp_state(session),
         "frames": frames,
     })
 }
@@ -2994,6 +3880,151 @@ fn screen_stats(px: *const u32) -> serde_json::Value {
 /// GPU_Soft.cpp), or a 2D unit disabled in `POWCNT1` (unit A black, unit B
 /// white). Comparing the framebuffer against the copy says whether our path is
 /// faithful; the registers say what the console was asked to display.
+/// A hex address with or without `0x`/`0X`, the way a caller writes one on a
+/// command line (`02000000`, `0x2000000`).
+fn ctrl_parse_hex(s: &str) -> Option<u32> {
+    let t = s.trim();
+    let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    u32::from_str_radix(t, 16).ok()
+}
+
+/// Read a console's main RAM through the bridge's `md_read_ram`, which takes a
+/// 4-byte-aligned address and length. Answers the bytes and the ARM9's own
+/// 32-bit words, so a caller can read a game's variables rather than argue
+/// about its pictures.
+fn ctrl_mem(
+    app: &tauri::AppHandle,
+    player: usize,
+    addr: u32,
+    len: usize,
+    cpu: i32,
+) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let current = state.session.read();
+    let session = current.as_ref().ok_or("no session")?;
+    let inst = session
+        .instances
+        .get(player)
+        .ok_or_else(|| format!("player {} is not running", player + 1))?;
+
+    if len == 0 || len > 4096 {
+        return Err(format!("len must be 4..=4096 bytes, got {len}"));
+    }
+    if (addr & 3) != 0 || (len & 3) != 0 {
+        return Err(
+            "addr and len must be multiples of 4: the bridge reads whole words".into(),
+        );
+    }
+    if cpu != 7 && cpu != 9 {
+        return Err(format!("cpu must be 9 (ARM9, the default) or 7 (ARM7), got {cpu}"));
+    }
+
+    let mut buf = vec![0u8; len];
+    // The ARM9 path is the established one, so it keeps its own call rather than
+    // being routed through the two-CPU entry point.
+    let rc = unsafe {
+        if cpu == 7 {
+            md_read_ram_cpu(inst.ptr, cpu, addr, buf.as_mut_ptr(), len)
+        } else {
+            md_read_ram(inst.ptr, addr, buf.as_mut_ptr(), len)
+        }
+    };
+    if rc != 0 {
+        let err = unsafe { md_last_error(inst.ptr) };
+        let msg = if err.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        return Err(format!("md_read_ram_cpu failed ({rc}): {msg}"));
+    }
+
+    let hex = buf
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let words = buf
+        .chunks_exact(4)
+        .map(|c| format!("{:08X}", u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .collect::<Vec<_>>();
+
+    Ok(serde_json::json!({
+        "player": player + 1,
+        "cpu": cpu,
+        "addr": format!("{addr:08X}"),
+        "len": len,
+        "hex": hex,
+        "words": words,
+    }))
+}
+
+/// Write a console's main RAM through the bridge's `md_write_ram`, then answer
+/// the bytes as they now stand (the same shape `ctrl_mem` answers).
+///
+/// This exists because "the game is waiting for X" is a claim about a *value*,
+/// and the only way to settle it is to change the value and watch the console
+/// move: a read-only instrument can show that a poll's exit condition is false
+/// but never that the poll is what holds the console. The bridge has had the
+/// write half since the identity-stamp block (see melonds_bridge.h), this just
+/// puts it on the same channel as the read. Diagnostics only, 4-byte words.
+fn ctrl_poke(
+    app: &tauri::AppHandle,
+    player: usize,
+    addr: u32,
+    words: &[u32],
+    cpu: i32,
+) -> Result<serde_json::Value, String> {
+    if words.is_empty() || words.len() > 1024 {
+        return Err(format!("poke needs 1..=1024 words, got {}", words.len()));
+    }
+    if (addr & 3) != 0 {
+        return Err("poke's addr must be a multiple of 4: the bridge writes whole words".into());
+    }
+    if cpu != 7 && cpu != 9 {
+        return Err(format!("poke's cpu must be 9 (ARM9, the default) or 7 (ARM7), got {cpu}"));
+    }
+    let mut buf = Vec::with_capacity(words.len() * 4);
+    for w in words {
+        buf.extend_from_slice(&w.to_le_bytes());
+    }
+
+    let state = app.state::<AppState>();
+    let current = state.session.read();
+    let session = current.as_ref().ok_or("no session")?;
+    let inst = session
+        .instances
+        .get(player)
+        .ok_or_else(|| format!("player {} is not running", player + 1))?;
+
+    let rc = unsafe {
+        if cpu == 7 {
+            md_write_ram_cpu(inst.ptr, cpu, addr, buf.as_ptr().cast(), buf.len())
+        } else {
+            md_write_ram(inst.ptr, addr, buf.as_ptr().cast(), buf.len())
+        }
+    };
+    if rc != 0 {
+        let err = unsafe { md_last_error(inst.ptr) };
+        let msg = if err.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        return Err(format!("write failed ({rc}): {msg}"));
+    }
+    drop(current);
+
+    // Read it back rather than echo the request: what the console's bus kept can
+    // differ from what was asked for, and that difference is the interesting
+    // part. The read-back is on the same CPU's space as the write.
+    ctrl_mem(app, player, addr, buf.len(), cpu)
+}
+
 fn ctrl_probe(app: &tauri::AppHandle, player: usize) -> Result<serde_json::Value, String> {
     let state = app.state::<AppState>();
     let current = state.session.read();
@@ -3034,6 +4065,23 @@ fn ctrl_probe(app: &tauri::AppHandle, player: usize) -> Result<serde_json::Value
         )
     };
 
+    // The program counters, read on demand. The five-second digest carries
+    // them too, and five seconds is the wrong resolution for the question the
+    // parked game asks - "is the CPU stuck in this loop, or visiting it?" - so
+    // a caller can sample them as fast as it can talk.
+    let pc9 = unsafe { md_get_pc(inst.ptr, 9) };
+    let pc7 = unsafe { md_get_pc(inst.ptr, 7) };
+
+    let mut regs9 = [0u32; 16];
+    let mut regs7 = [0u32; 16];
+    unsafe {
+        md_get_regs(inst.ptr, 9, regs9.as_mut_ptr());
+        md_get_regs(inst.ptr, 7, regs7.as_mut_ptr());
+    }
+    let hex_regs = |r: &[u32; 16]| -> Vec<String> {
+        r.iter().map(|v| format!("{v:08X}")).collect()
+    };
+
     // The interrupt level, from the same flight recorder the health thread
     // prints: the per-source wifi raise/ack counters and the wifi register
     // snapshot taken at export time, plus the two program counters. A black
@@ -3041,6 +4089,13 @@ fn ctrl_probe(app: &tauri::AppHandle, player: usize) -> Result<serde_json::Value
     // and this is where that shows as numbers instead of an inference.
     let mut wifi = MDMPDigest::default();
     unsafe { md_link_mp_digest(inst.ptr, &mut wifi) };
+
+    // The link's own ledger for this console, beside the game's: frames the bus
+    // handed it, how many of those its own game read, how many a scripted drain
+    // read. The health line prints the same three every five seconds; a timeline
+    // across a deauth needs them at whatever rate the caller can talk.
+    let mut link = MDLinkStats::default();
+    unsafe { md_link_stats(inst.ptr, &mut link) };
     let irq_list = |arr: &[u64; 16]| -> String {
         let mut out = Vec::new();
         for (i, v) in arr.iter().enumerate() {
@@ -3051,9 +4106,23 @@ fn ctrl_probe(app: &tauri::AppHandle, player: usize) -> Result<serde_json::Value
         if out.is_empty() { "none".to_string() } else { out.join(" ") }
     };
 
-    // The wifi IRQ is ARM7 IRQ_Wifi (bit 23), so it lives in the high halfword
-    // of the ARM7's IE/IF; IME says whether that CPU can take interrupts at all.
+    // The wifi IRQ is ARM7 `IRQ_Wifi`, which is bit 24 - `Wifi.cpp` raises it
+    // with `NDS.SetIRQ(1, IRQ_Wifi)` and `NDS::SetIRQ` sets `IF[1] |= 1 << irq` -
+    // so it is bit 8 of the high halfword, NOT bit 7. (Bit 23 is `IRQ_SPI`: this
+    // read `& 0x80` until 2026-09-29 and reported the wifi interrupt as disabled
+    // on both consoles while `IE7 0104` had it enabled.) IME says whether that
+    // CPU can take interrupts at all.
+    const IRQ_WIFI_IE7: u16 = 1 << (24 - 16);
     let ie7_hi = unsafe { md_read_io16(inst.ptr, 7, 0x0400_0212) };
+
+    // The ARM9's own interrupt registers, read at this instant rather than from
+    // the digest's snapshot. The digest's `IF`/`IE` fields are not these
+    // registers (2026-09-29: they read `IE 0000` while IME was 1 and IE was
+    // 0x04000009), so a caller asking "can this CPU be woken?" needs the real
+    // ones: IME at 0x04000208, IE at 0x04000210, IF at 0x04000214.
+    let ime9 = unsafe { md_read_io16(inst.ptr, 9, 0x0400_0208) };
+    let ie9 = unsafe { md_read_io16(inst.ptr, 9, 0x0400_0210) };
+    let if9 = unsafe { md_read_io16(inst.ptr, 9, 0x0400_0214) };
     let if7_hi = unsafe { md_read_io16(inst.ptr, 7, 0x0400_0216) };
 
     // Built as its own value rather than inline: serde_json's `json!` expands
@@ -3065,9 +4134,12 @@ fn ctrl_probe(app: &tauri::AppHandle, player: usize) -> Result<serde_json::Value
         "raised": irq_list(&wifi.irq_raised),
         "acked": irq_list(&wifi.irq_acked),
         "arms": wifi.arms,
+        "aids_set": wifi.aids_set,
         "answered": wifi.answers_sent,
         "canned": wifi.answers_canned,
+        "answers_blank": wifi.answers_blank,
         "cmds_rx": wifi.cmds_rx,
+        "cmds_rx_dup": wifi.cmds_rx_dup,
         "cmds_tx": wifi.cmds_tx,
         "w_if": format!("{:04X}", wifi.w_if),
         "w_ie": format!("{:04X}", wifi.w_ie),
@@ -3075,8 +4147,8 @@ fn ctrl_probe(app: &tauri::AppHandle, player: usize) -> Result<serde_json::Value
         "arm7_ime": format!("{:04X}", unsafe { md_read_io16(inst.ptr, 7, 0x0400_0208) }),
         "arm7_ie7": format!("{ie7_hi:04X}"),
         "arm7_if7": format!("{if7_hi:04X}"),
-        "wifi_ie_bit": ie7_hi & 0x80 != 0,
-        "wifi_if_bit": if7_hi & 0x80 != 0,
+        "wifi_ie_bit": ie7_hi & IRQ_WIFI_IE7 != 0,
+        "wifi_if_bit": if7_hi & IRQ_WIFI_IE7 != 0,
         "us_cntl": format!("{} / {}", wifi.w_uscntcnt, wifi.w_uscmpcnt),
         "us_at": format!("{:X} / {:X}", wifi.uscounter, wifi.uscompare),
         "beacon_irq14_blocked": wifi.block_beacon_irq14 != 0,
@@ -3090,12 +4162,101 @@ fn ctrl_probe(app: &tauri::AppHandle, player: usize) -> Result<serde_json::Value
         "powertx": format!("{:04X}", wifi.w_powertx),
     });
 
+    // The two bodies the games are exchanging *as of this sample*: the last
+    // command frame this console saw (`cmd_*` - its own command on the host, the
+    // command handed to its game on the client) and the last answer a client
+    // armed (`answer_*`). The five-second digest prints the same bytes, and five
+    // seconds is the wrong resolution for the question v0.1.9aq left open: how
+    // long after CUT OFF does the host's game commit to its cut-off state, and
+    // does the client follow it before it gives up? That window is 8-97 emulated
+    // frames wide, so a caller has to be able to sample as fast as it can talk.
+    let body_hex = |b: &[u8; 16], n: u16| -> String {
+        let n = (n as usize).min(b.len());
+        b[..n].iter().map(|v| format!("{v:02X}")).collect::<Vec<_>>().join(" ")
+    };
+    let link_json = serde_json::json!({
+        "delivered": link.packets_delivered,
+        "delivered_bytes": link.bytes_delivered,
+        "read_game": link.packets_read_game,
+        "read_drain": link.packets_read_drained,
+        "received": link.packets_received,
+        "sent": link.packets_sent,
+        "begin": link.begin_count,
+        "end": link.end_count,
+        "polls": link.rx_polls,
+        "empty_polls": link.rx_empty_polls,
+    });
+    let mp_json = serde_json::json!({
+        "cmd_seq": format!("{:04X}", wifi.last_cmd_seq),
+        "cmd_len": wifi.last_cmd_len,
+        "cmd_body": body_hex(&wifi.last_cmd_body, wifi.last_cmd_len),
+        "answer_len": wifi.last_answer_len,
+        "answer_body": body_hex(&wifi.last_answer_body, wifi.last_answer_len),
+        "cmd_us": wifi.last_cmd_us,
+        "answer_us": wifi.last_answer_us,
+        "deauth_out": wifi.deauth_sent,
+        "deauth_in": wifi.deauth_recv,
+        "deauth_reason": format!("{:04X}", wifi.last_deauth_reason),
+        "collected": wifi.replies_collected,
+        "empty": wifi.windows_empty,
+        "reanchor_dropped": wifi.reanchor_dropped,
+        "clientfail": wifi.acks_client_fail,
+        "cmds_tx": wifi.cmds_tx,
+        "cmds_rx": wifi.cmds_rx,
+        /* The rest of the reply queue's own ledger. The per-second log line
+           carries these as one digest per health window; a caller reading
+           `probe` gets them at *this* instant and next to this console's frame
+           counter, which is what a timeline across a deauth needs - "the guest
+           answered every round and the host's game was told it failed" is only
+           visible when the two sides' counters can be put on one clock. */
+        "reply_written": wifi.replies_written,
+        "reply_blank": wifi.replies_blank,
+        "stale": wifi.stale_dropped,
+        "not_looking": wifi.not_looking,
+        "acks": wifi.acks_sent,
+        "cmds_tx_dup": wifi.cmds_tx_dup,
+        "last_ack_clientfail": format!("{:04X}", wifi.last_ack_clientfail),
+    });
+
+    // What has actually crossed the ARM9<->ARM7 IPC FIFO since boot. The FIFO
+    // levels are empty at rest whether nothing was ever sent or the last word
+    // was read a frame ago, so only the counts can say which side has gone
+    // quiet - and the frame at which a count stops rising names that side.
+    let mut ipc = MDIPCStats::default();
+    unsafe { md_get_ipc_stats(inst.ptr, &mut ipc) };
+    let ipc_json = serde_json::json!({
+        "arm9_sends": ipc.arm9_sends,
+        "arm7_sends": ipc.arm7_sends,
+        "arm9_recvs": ipc.arm9_recvs,
+        "arm7_recvs": ipc.arm7_recvs,
+        // Each CPU's own IPCFIFOCNT: bit 15 = the FIFO is enabled, bit 10 = it
+        // will interrupt on a received word, bit 8 = nothing left to receive,
+        // bit 0 = nothing left to send. 0x8501 is "enabled, armed, both empty".
+        "fifocnt9": format!("{:04X}", unsafe { md_read_io16(inst.ptr, 9, 0x0400_0184) }),
+        "fifocnt7": format!("{:04X}", unsafe { md_read_io16(inst.ptr, 7, 0x0400_0184) }),
+        "sync9": format!("{:04X}", unsafe { md_read_io16(inst.ptr, 9, 0x0400_0180) }),
+        "sync7": format!("{:04X}", unsafe { md_read_io16(inst.ptr, 7, 0x0400_0180) }),
+    });
+
     Ok(serde_json::json!({
         "player": player + 1,
         "frames": unsafe { md_frame_counter(inst.ptr) },
         "asleep": unsafe { md_console_asleep(inst.ptr) } != 0,
-        "pc9": format!("{:08X}", unsafe { md_get_pc(inst.ptr, 9) }),
-        "pc7": format!("{:08X}", unsafe { md_get_pc(inst.ptr, 7) }),
+        "pc9": format!("{pc9:08X}"),
+        "pc7": format!("{pc7:08X}"),
+        // r0..r15 for each CPU. r13 is the frame of whichever game function is
+        // waiting, r14 its innermost return address.
+        "regs9": hex_regs(&regs9),
+        "regs7": hex_regs(&regs7),
+        "sp9": format!("{:08X}", regs9[13]),
+        "lr9": format!("{:08X}", regs9[14]),
+        "sp7": format!("{:08X}", regs7[13]),
+        "lr7": format!("{:08X}", regs7[14]),
+        "arm9_can_take_irq": ime9 != 0,
+        "arm9_ime": format!("{ime9:04X}"),
+        "arm9_ie": format!("{ie9:04X}"),
+        "arm9_if": format!("{if9:04X}"),
+        "arm9_vblank_pending": (if9 & ie9 & 1) != 0,
         "powcnt1": format!("{powcnt1:04X}"),
         "screens_enabled": powcnt1 & 1 != 0,
         "engine_a": powcnt1 & (1 << 1) != 0,
@@ -3107,6 +4268,9 @@ fn ctrl_probe(app: &tauri::AppHandle, player: usize) -> Result<serde_json::Value
         "bright_b": format!("{:04X}", reg16(0x0400_106C)),
         "vcount": reg16(0x0400_0006) & 0x1FF,
         "wifi": wifi_json,
+        "ipc": ipc_json,
+        "mp": mp_json,
+        "link": link_json,
         "framebuffer": live,
         "copy": copy,
     }))
@@ -3140,6 +4304,97 @@ fn ctrl_wifi_io(app: &tauri::AppHandle, player: usize) -> Result<String, String>
     let n = unsafe { md_wifi_io_report(inst.ptr, buf.as_mut_ptr(), CAP as i32) };
     if n < 0 {
         return Err("the wifi io report did not fit its buffer".to_string());
+    }
+    let bytes: Vec<u8> = buf[..n as usize].iter().map(|b| *b as u8).collect();
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Which instruction stores into a watched span of a console's own main RAM.
+///
+/// The blind spot this closes: a live variable whose writer reaches it through a
+/// computed pointer has no literal to search the code for, so reading the code
+/// cannot find it and perturbing the data cannot either. Recording the stores
+/// themselves answers it directly. `lo`/`hi` are the inclusive window as a hex
+/// pair, and `lo > hi` (or `off`) disarms it - arming clears the hits, and the
+/// first 64 overlapping stores are kept, because the writer wanted runs first.
+/// The JIT writes main RAM on its fast path, so a watch only sees the whole
+/// story on the interpreter (start a session with `MD_NOJIT=1`).
+fn ctrl_memwatch(
+    app: &tauri::AppHandle,
+    player: usize,
+    lo: Option<u32>,
+    hi: Option<u32>,
+) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let current = state.session.read();
+    let session = current.as_ref().ok_or("no session")?;
+    let inst = session
+        .instances
+        .get(player)
+        .ok_or_else(|| format!("player {} is not running", player + 1))?;
+
+    if let (Some(lo), Some(hi)) = (lo, hi) {
+        if unsafe { md_mem_watch(inst.ptr, lo, hi) } != 0 {
+            return Err("md_mem_watch failed".to_string());
+        }
+    }
+
+    const CAP: usize = 64 * 1024;
+    let mut buf = vec![0i8; CAP];
+    let n = unsafe { md_mem_watch_report(inst.ptr, buf.as_mut_ptr(), CAP as i32) };
+    if n < 0 {
+        return Err("the memwatch report did not fit its buffer".to_string());
+    }
+    let bytes: Vec<u8> = buf[..n as usize].iter().map(|b| *b as u8).collect();
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The code path one CPU ran over a window, read back in order.
+///
+/// The store watch names the instruction that wrote a variable; this names the
+/// instructions the CPU executed, in the order it first executed them. A
+/// downloaded image that boots, does its wireless bring-up and then declines a
+/// session has left that decision behind by the time anything is parked, so a
+/// snapshot cannot show it - this answers "which code did it run on the way",
+/// which is where a give-up branch lives. `cpu` is 9 or 7 (default 9), `lo`/`hi`
+/// are hex and arm it, and `off` or a missing window reports without arming. It
+/// only sees everything on the interpreter (start a session with MD_NOJIT=1).
+fn ctrl_pctrace(
+    app: &tauri::AppHandle,
+    player: usize,
+    cpu: i32,
+    arm: Option<(u32, u32)>,
+) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let current = state.session.read();
+    let session = current.as_ref().ok_or("no session")?;
+    let inst = session
+        .instances
+        .get(player)
+        .ok_or_else(|| format!("player {} is not running", player + 1))?;
+
+    let cpu_arg = if cpu == 7 { 1 } else { 0 };
+    /* Only touch the trace when the caller asked to change it: a report with no
+       window must read the path, not disarm the trace it is about to print.
+       (Measured: the first version disarmed on every report and printed the
+       child's whole post-boot window as "off".) */
+    if let Some((lo, hi)) = arm {
+        if unsafe { md_pc_trace(inst.ptr, cpu_arg, lo, hi) } != 0 {
+            return Err("md_pc_trace failed".to_string());
+        }
+        // SetPcTrace only publishes a request; the CPU thread applies it at the
+        // top of its next RunFrame. Give it a few frames so this one command can
+        // arm *and* read back a live trace, instead of reporting the state it
+        // just replaced. The control channel runs on its own thread, so this
+        // sleep does not hold up emulation.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    const CAP: usize = 256 * 1024;
+    let mut buf = vec![0i8; CAP];
+    let n = unsafe { md_pc_trace_report(inst.ptr, buf.as_mut_ptr(), CAP as i32) };
+    if n < 0 {
+        return Err("the pc trace report did not fit its buffer".to_string());
     }
     let bytes: Vec<u8> = buf[..n as usize].iter().map(|b| *b as u8).collect();
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -3391,12 +4646,213 @@ fn ctrl_dispatch(app: &tauri::AppHandle, line: &str) -> serde_json::Value {
             },
             Err(e) => failed(e),
         },
+        // The memory read the roadmap has named since v0.1.9y: a game's own
+        // state, in numbers, instead of an inference from its picture. `addr`
+        // is hex (with or without 0x) and both it and `len` are multiples of 4,
+        // which is what the bridge reads.
+        "mem" => {
+            let player = match ctrl_json_player(&req) {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let addr = match arg_str("addr").as_deref().map(ctrl_parse_hex) {
+                Some(Some(v)) => v,
+                Some(None) => {
+                    return failed(format!(
+                        "mem needs a hex 'addr' (e.g. \"02000000\"); got {:?}",
+                        arg_str("addr")
+                    ))
+                }
+                None => return failed("mem needs an 'addr' (hex, e.g. \"02000000\")".into()),
+            };
+            let len = req.get("len").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+            // Which CPU's address space to read. 9 is the default because every
+            // caller before 2026-09-29 meant the ARM9's main RAM; 7 is what the
+            // ARM7 side needs (WRAM at 0x03800000, the game's ARM7 image at
+            // 0x06000000), which an ARM9 read cannot see at all.
+            let cpu = match req.get("cpu") {
+                None => 9,
+                Some(v) => match v.as_i64() {
+                    Some(n) if n == 7 || n == 9 => n as i32,
+                    other => {
+                        return failed(format!(
+                            "mem's 'cpu' must be 9 (ARM9, the default) or 7 (ARM7); got {other:?}"
+                        ))
+                    }
+                },
+            };
+            match ctrl_mem(app, player as usize, addr, len, cpu) {
+                Ok(v) => reply(v),
+                Err(e) => failed(e),
+            }
+        }
+        // The write half of `mem`: change a console's own variable and watch it
+        // react. `words` is a list of hex 32-bit words, written from one address
+        // upward; the answer lists them back one per address in the same order,
+        // so a read and a poke of the same address print the same way.
+        "poke" => {
+            let player = match ctrl_json_player(&req) {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let addr = match arg_str("addr").as_deref().map(ctrl_parse_hex) {
+                Some(Some(v)) => v,
+                Some(None) => {
+                    return failed(format!(
+                        "poke needs a hex 'addr' (e.g. \"021732AC\"); got {:?}",
+                        arg_str("addr")
+                    ))
+                }
+                None => return failed("poke needs an 'addr' (hex, e.g. \"021732AC\")".into()),
+            };
+            let words_arg = arg_str("words").unwrap_or_default();
+            let mut words = Vec::new();
+            for tok in words_arg.split(|c: char| c == ' ' || c == ',' || c == '_' || c == '\t') {
+                if tok.is_empty() {
+                    continue;
+                }
+                match ctrl_parse_hex(tok) {
+                    Some(v) => words.push(v),
+                    None => {
+                        return failed(format!(
+                            "poke's 'words' must be hex 32-bit words (e.g. \"0000003E 00000000\"); got '{tok}'"
+                        ))
+                    }
+                }
+            }
+            if words.is_empty() {
+                return failed("poke needs 'words': hex 32-bit words, e.g. \"0000003E\"".into());
+            }
+            // Which CPU's address space to write, the same shape as `mem`'s
+            // `cpu`: 9 is the default (every caller before 2026-09-29 meant
+            // the ARM9's main RAM); 7 is the ARM7's own space, which is where
+            // a variable that gates an ARM7->ARM9 post lives.
+            let cpu = match req.get("cpu") {
+                None => 9,
+                Some(v) => match v.as_i64() {
+                    Some(n) if n == 7 || n == 9 => n as i32,
+                    other => {
+                        return failed(format!(
+                            "poke's 'cpu' must be 9 (ARM9, the default) or 7 (ARM7); got {other:?}"
+                        ))
+                    }
+                },
+            };
+            match ctrl_poke(app, player as usize, addr, &words, cpu) {
+                Ok(v) => reply(v),
+                Err(e) => failed(e),
+            }
+        }
         "wifiio" => match ctrl_json_player(&req) {
             Ok(player) => match ctrl_wifi_io(app, player as usize) {
                 Ok(v) => reply(serde_json::json!(v)),
                 Err(e) => failed(e),
             },
             Err(e) => failed(e),
+        },
+        // The store watch: arm it on a span of a console's own main RAM and read
+        // back the instructions that wrote into it, newest state first. `lo` and
+        // `hi` are hex and both are needed to arm; `off` or no window reports
+        // without arming. It is a debug instrument for a variable whose writer
+        // is only reachable through a computed pointer.
+        "memwatch" => {
+            let player = match ctrl_json_player(&req) {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let lo_arg = arg_str("lo");
+            let hi_arg = arg_str("hi");
+            let armed = !matches!(lo_arg.as_deref(), None | Some("off"))
+                && !matches!(hi_arg.as_deref(), None | Some("off"));
+            let (lo, hi) = if armed {
+                match (
+                    lo_arg.as_deref().and_then(ctrl_parse_hex),
+                    hi_arg.as_deref().and_then(ctrl_parse_hex),
+                ) {
+                    (Some(lo), Some(hi)) => (Some(lo), Some(hi)),
+                    _ => {
+                        return failed(format!(
+                            "memwatch needs hex 'lo' and 'hi' (e.g. \"023722E0\" \"023722E3\"); \
+                             got lo={lo_arg:?} hi={hi_arg:?}"
+                        ))
+                    }
+                }
+            } else {
+                (None, None)
+            };
+            match ctrl_memwatch(app, player as usize, lo, hi) {
+                Ok(v) => reply(serde_json::json!(v)),
+                Err(e) => failed(e),
+            }
+        }
+        // The path trace: arm a first-visit PC recorder on one CPU's window and
+        // read back the ordered code path it ran. `cpu` is 9 or 7 (default 9);
+        // `lo`/`hi` are hex and arm it; `off` or no window reports without
+        // arming. It is the instrument for "which code did the console run", a
+        // question a parked snapshot cannot answer.
+        "pctrace" => {
+            let player = match ctrl_json_player(&req) {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let cpu = req.get("cpu").and_then(|v| v.as_i64()).unwrap_or(9) as i32;
+            let lo_arg = arg_str("lo");
+            let hi_arg = arg_str("hi");
+            let off = req.get("off").and_then(|v| v.as_bool()).unwrap_or(false)
+                || matches!(lo_arg.as_deref(), Some("off"))
+                || matches!(hi_arg.as_deref(), Some("off"));
+            // `off` disarms explicitly; a window arms; neither just reports.
+            let arm = if off {
+                Some((1u32, 0u32))
+            } else if !matches!(lo_arg.as_deref(), None | Some("off"))
+                && !matches!(hi_arg.as_deref(), None | Some("off"))
+            {
+                match (
+                    lo_arg.as_deref().and_then(ctrl_parse_hex),
+                    hi_arg.as_deref().and_then(ctrl_parse_hex),
+                ) {
+                    (Some(lo), Some(hi)) => Some((lo, hi)),
+                    _ => {
+                        return failed(format!(
+                            "pctrace needs hex 'lo' and 'hi' (e.g. \"02000000\" \"02400000\"); \
+                             got lo={lo_arg:?} hi={hi_arg:?}"
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+            match ctrl_pctrace(app, player as usize, cpu, arm) {
+                Ok(v) => reply(serde_json::json!(v)),
+                Err(e) => failed(e),
+            }
+        }
+        // The synthesized Download Play joiner: its counters, and (with
+        // `player`) which console acts as the client. Arming is the Settings
+        // switch, not this command - see set_per_game_fix - so this is read-only
+        // apart from moving the client console.
+        "dpjoiner" => {
+            let state = app.state::<AppState>();
+            let current = state.session.read();
+            match current.as_ref() {
+                None => failed("no session running".into()),
+                Some(session) => {
+                    if let Some(dp) = session.dp.as_ref() {
+                        if let Some(p) = req.get("player").and_then(|v| v.as_u64()) {
+                            if (p as usize) < session.players {
+                                dp.joiner.store(p as usize, Ordering::SeqCst);
+                            } else {
+                                return failed(format!(
+                                    "player {} is not running (1..{})",
+                                    p + 1,
+                                    session.players
+                                ));
+                            }
+                        }
+                    }
+                    reply(dp_state(session))
+                }
+            }
         },
         // The one-input probe of the parked handshake: `body` replaces the body
         // bytes the console's game reads with the given hex, `off` clears it and
@@ -3530,7 +4986,7 @@ fn ctrl_dispatch(app: &tauri::AppHandle, line: &str) -> serde_json::Value {
             Err(e) => failed(e),
         },
         other => failed(format!(
-            "unknown command '{other}' (ping, status, ui, eval, key, index, click, input, press, touch, untouch, see, shot, text, sleep, quit)"
+            "unknown command '{other}' (ping, status, ui, eval, key, index, click, input, press, touch, untouch, see, shot, text, sleep, quit, probe, mem, poke, wifiio, memwatch, pctrace, vary, dpjoiner)"
         )),
     };
 
@@ -3644,6 +5100,8 @@ pub fn run() {
             start_session,
             stop_session,
             session_info,
+            per_game_state,
+            set_per_game_fix,
             get_frames,
             set_input,
             link_status,
@@ -3683,7 +5141,7 @@ pub fn run() {
 
     // Window and exit events are the difference between "the user closed it"
     // and "it died": a clean close leaves a line here, a crash leaves none.
-    app.run(|_app, event| match event {
+    app.run(|app, event| match event {
         tauri::RunEvent::WindowEvent { label, event, .. } => match event {
             tauri::WindowEvent::CloseRequested { .. } => {
                 log::warn!("window '{label}': close requested")
@@ -3692,7 +5150,23 @@ pub fn run() {
             _ => {}
         },
         tauri::RunEvent::ExitRequested { .. } => log::warn!("exit requested"),
-        tauri::RunEvent::Exit => log::warn!("event loop exiting - process ending normally"),
+        tauri::RunEvent::Exit => {
+            // Stop the session here instead of leaving it to a `Drop` that this
+            // path may never reach. The console threads have to be joined
+            // before the process frees the link bus: one still inside
+            // `md_run_frame` calls `Platform::MP_SendReply` on a bus that is
+            // already gone, which is a call through 0x0 (`bt`: MP_SendReply ->
+            // 0x0, from the run-loop thread). Measured on 2026-09-29: three
+            // core dumps out of three quits with a *live* group, none out of
+            // three with a group whose game had turned its own radio off - the
+            // correlation that made it look like a link defect rather than a
+            // teardown-order one (history.md v0.1.9aq). `Exit` is the last event
+            // on every exit path, so the window's close button and `quit_app`
+            // are both covered by this one place.
+            let state = app.state::<AppState>();
+            *state.session.write() = None;
+            log::warn!("event loop exiting - process ending normally");
+        }
         _ => {}
     });
 }

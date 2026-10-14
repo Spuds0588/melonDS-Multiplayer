@@ -22,6 +22,7 @@
 #include <memory>
 #include <string>
 #include <optional>
+#include <atomic>
 #include <functional>
 
 #include "Platform.h"
@@ -411,6 +412,76 @@ public: // TODO: Encapsulate the rest of these members
     void SetupDirectBoot(const std::string& romname);
     virtual void SetupDirectBoot();
 
+    /// The load map of a single-card Download Play child image, as the host's
+    /// RSA signature frame states it (GBATEK, DS Download Play): the two
+    /// entrypoints at `00h`/`04h`, and the header/ARM9/ARM7 destinations and
+    /// sizes at `0Ch`/`14h`, `1Ch`/`24h` and `2Ch`/`34h`. The image buffer is
+    /// the host's packet payloads concatenated in packet order, so its three
+    /// segments are these lengths back to back.
+    struct DownloadPlayBootInfo
+    {
+        u32 ARM9Entry;
+        u32 ARM7Entry;
+        u32 HeaderDest;
+        u32 HeaderSize;
+        u32 ARM9Dest;
+        u32 ARM9Size;
+        u32 ARM7Dest;
+        /// The ARM7's temp staging address (`2Ch`); a real client writes the
+        /// ARM7 image here for the ARM9's SHA1 pass before relocating it. Zero
+        /// or equal to ARM7Dest means no separate staging copy.
+        u32 ARM7Temp;
+        u32 ARM7Size;
+        /// The channel the host's beacon advertised. A downloaded child does
+        /// not scan for one (it was already tuned to the host's when the image
+        /// arrived), so the boot keeps this on its radio - see
+        /// Wifi::SetDownloadPlaySession(). 0 leaves the radio untuned.
+        int Channel;
+        /// The host's own BSSID, off the same beacon: the station this client
+        /// is associated *with*. A real client keeps it across the hand-over;
+        /// see Wifi::SetDownloadPlaySession().
+        u8 HostBSSID[6];
+        /// The AID the host's association response granted this console, low
+        /// nibble (0 = unregistered). The same value `Wifi` reports as
+        /// `MPMYAID` while the console is an MP client, and a poll is only this
+        /// console's to answer while it is set.
+        int AID;
+        /// The beacon's game serial (0040xxxx), little-endian: the handoff
+        /// block's SSID serial field (027FFC4Eh).
+        u32 HostSerial;
+        /// The two stream bytes after the serial (low halfword): the handoff
+        /// block's SSID stream field (027FFC52h).
+        u32 HostToken;
+        /// Beacon capability / interval / 1-2Mbit rate mask / computed beacon
+        /// size: the handoff block's matching fields (027FFC6Eh/70h/72h/74h
+        /// and 027FFC42h).
+        u32 HostCapability;
+        u32 HostInterval;
+        u32 HostRateMask;
+        u32 HostBeaconSize;
+    };
+
+    /// Boot a single-card Download Play child image the way a real client does
+    /// after the transfer: write the header/ARM9/ARM7 segments to the
+    /// destinations the RSA frame stated, set the boot indicator to the
+    /// DS-Download-Play value, carry the session the client negotiated into its
+    /// radio state, and point both CPUs at the entrypoints. This is the "jump
+    /// to entrypoints" half of GBATEK's post-transfer step; the radio side
+    /// (tuning to the host's channel and re-seeding the association) is set up
+    /// here too, and the caller deliberately sends no deauthentication (see the
+    /// handoff's own comment in src-tauri/src/dp_joiner.rs).
+    ///
+    /// Returns true when the image's three segments fit the buffer and were
+    /// written; false (and changes nothing) otherwise.
+    bool SetupDownloadPlayBoot(const u8* image, u32 imagelen,
+                               const DownloadPlayBootInfo& info);
+
+    /* Mirror a posted IPCSYNC nibble the way the child's own ARM9 handshake
+       would (see the definition). One frame-step call; silent unless a
+       Download Play child's ARM7 is waiting on an echo its sleeping ARM9
+       never sends. */
+    void EchoDownloadPlaySync();
+
     [[nodiscard]] GBACart::CartCommon* GetGBACart() { return (ConsoleType == 1) ? nullptr : GBACartSlot.GetCart(); }
     [[nodiscard]] const GBACart::CartCommon* GetGBACart() const {  return (ConsoleType == 1) ? nullptr : GBACartSlot.GetCart(); }
 
@@ -526,6 +597,76 @@ public: // TODO: Encapsulate the rest of these members
     void SetGdbArgs(std::optional<GDBArgs> args) noexcept {}
 #endif
 
+    /* IPC FIFO traffic since boot (see IPCSent9). A frontend reads this from a
+       diagnostic thread; it is a method rather than four public members only
+       because the FIFOs themselves are protected.
+
+       "Since boot" is exact: NDS::Reset() is the boot boundary and clears
+       these four counters and the trace ring below, so a console that booted
+       by running a downloaded Download Play image reports only what it did
+       after that boot, not the firmware Download Play client's traffic it
+       replaced. */
+    void GetIPCTraffic(u64& sent9, u64& sent7, u64& recv9, u64& recv7) const
+    {
+        sent9 = IPCSent9;
+        sent7 = IPCSent7;
+        recv9 = IPCRecv9;
+        recv7 = IPCRecv7;
+    }
+
+    /* One line per traced IPCFIFOSEND word: the direction, the word, and the
+       PC/LR of the instruction that pushed it (`see IPCTrace9`). Returns the
+       characters written (excluding the terminator), or -1 if the buffer is
+       too small. */
+    int FormatIPCTrace(char* out, size_t cap) const;
+
+    /* Debug: watch stores into main RAM and ARM7 WRAM and name the instruction that made one.
+       A live state variable whose writer is only reachable through a computed
+       pointer cannot be found by reading code - there is no literal to search
+       for - so this turns the question into "which store touched it" and answers
+       it from the store itself. `lo`/`hi` are the inclusive window as the CPU
+       presents it - main RAM as 0x02000000..0x023FFFFF (either mirror folds
+       onto it), ARM7 WRAM canonically as 0x02000000|(addr&0x3FFFFF); `lo > hi`
+       disarms it. Arming also
+       clears the hits, and only the FIRST kMemWatchMax overlapping stores are
+       kept, because the writer wanted is the one that runs before any later
+       one. It costs one predictable compare per store while disarmed, and the
+       JIT's fast path writes main RAM directly, so a watch is only meaningful on
+       the interpreter (MD_NOJIT=1). */
+    void SetMemWatch(u32 lo, u32 hi);
+    int FormatMemWatch(char* out, size_t cap) const;
+
+    /* Debug: the code one CPU actually runs over a window `[lo, hi)`, with the
+       registers it ran it on.
+
+       The store watch above names the instruction that touched a variable; this
+       names the instructions the CPU ran and the state they ran with, which is
+       what a branch decision is made of. A downloaded image that boots, does
+       its wireless bring-up and then stops has left the decision behind by the
+       time anything is parked, so a snapshot cannot show it - the question is
+       "which code ran on the way, and on which value".
+
+       The PC is the one the CPU is about to execute, taken from the same value
+       the JIT dispatches on (ARM.cpp), so it is a real guest address in every
+       execution mode. The JIT dispatches whole basic blocks, so under it the
+       trace records every block entry - each a real PC, and the one every taken
+       branch lands on - while the interpreter records every instruction. Each
+       entry carries LR, CPSR and R0..R3 as they were at that PC.
+
+       `cpu` is 0 for the ARM9 and 1 for the ARM7; `lo >= hi` disarms. Arming is
+       requested from the control channel's thread and applied by the CPU thread
+       at the top of the next RunFrame (ApplyPcTraceRequest), so nothing the CPU
+       thread is walking is ever reallocated or cleared from another thread. */
+    void SetPcTrace(int cpu, u32 lo, u32 hi);
+    void ApplyPcTraceRequest();
+    int FormatPcTrace(char* out, size_t cap) const;
+    // A cheap guard for the per-instruction hook: the call itself is not free,
+    // so the CPU loops only make it while a trace is applied.
+    [[nodiscard]] bool PcTraceArmed() const noexcept { return PcTraceCpu >= 0; }
+    // Called by the CPU loops (ARM.cpp) at each executed PC; a no-op unless a
+    // trace is applied and the PC is in its window.
+    void RecordPcVisit(int cpu, u32 pc, u32 lr);
+
 protected:
     void InitTimings();
     u32 SchedListMask;
@@ -540,9 +681,82 @@ protected:
     DMA DMAs[8];
     u32 DMA9Fill[4];
     u16 IPCSync9, IPCSync7;
+    /* Whether this console booted a downloaded image (set by
+       SetupDownloadPlayBoot, cleared by Reset). Gates the Download Play
+       assists: a normal cartridge boot must never see them. */
+    bool DPBootChild = false;
     u16 IPCFIFOCnt9, IPCFIFOCnt7;
     FIFO<u32, 16> IPCFIFO9; // FIFO in which the ARM9 writes
     FIFO<u32, 16> IPCFIFO7;
+
+    // Traffic counters for the ARM9<->ARM7 IPC FIFO, which is the channel a DS
+    // game hands work between its two CPUs over. Counted where the words
+    // actually move - the pushing side's IPCFIFOSEND write and the receiving
+    // side's IPCFIFORECV read - and deliberately not derived from the FIFO
+    // levels: those are empty both before and after an exchange, so a level can
+    // never tell a channel that has never been used from one that just finished.
+    u64 IPCSent9 = 0; // words the ARM9 pushed out (IPCFIFO9)
+    u64 IPCSent7 = 0; // words the ARM7 pushed out (IPCFIFO7)
+    u64 IPCRecv9 = 0; // words the ARM9 popped from IPCFIFO7
+    u64 IPCRecv7 = 0; // words the ARM7 popped from IPCFIFO9
+
+    /* The last words pushed out through IPCFIFOSEND, in order, each with the
+       pusher's PC and LR. The counters above say a channel is being used; this
+       says *what was said through it and by which instruction*, which is how a
+       console's own request to the other CPU can be read back as a value and a
+       code address instead of inferred from its effect on the wireless block.
+       The CPU's PC is recorded as the interpreter reports it (the address of
+       the executing instruction plus 8, the ARM pipeline offset). */
+    struct IPCTraceEntry { u32 pc; u32 lr; u32 word; };
+    static const int kIPCTrace = 64;
+    IPCTraceEntry IPCTrace9[kIPCTrace] {};
+    IPCTraceEntry IPCTrace7[kIPCTrace] {};
+    u64 IPCTraceN9 = 0;  // words ever traced on IPCFIFO9 (ARM9 -> ARM7)
+    u64 IPCTraceN7 = 0;  // ... and on IPCFIFO7 (ARM7 -> ARM9)
+    void RecordIPCTrace(int cpu, u32 word);
+
+    /* The register file is kept because a watched store is usually a copy or a
+       store out of a field, and the value alone then says nothing: the writer's
+       source pointer is what names the thing being copied. It is stored for
+       every hit (64 of them is a few kB) and printed for the first few. */
+    struct MemWatchHit { u32 pc; u32 lr; u32 cpsr; u32 addr; u32 val; u16 size; u16 _pad; u32 regs[16]; };
+    static const int kMemWatchMax = 64;
+    static const int kMemWatchVerbose = 4;
+    MemWatchHit MemWatchHits[kMemWatchMax] {};
+    int MemWatchN = 0;     // hits kept (at most kMemWatchMax)
+    u64 MemWatchTotal = 0; // overlapping stores seen since the window was armed
+    u32 MemWatchLo = 1;    // empty window while Lo > Hi
+    u32 MemWatchHi = 0;
+    void RecordMemWatch(int cpu, u32 addr, u32 val, int size);
+
+    /* The path tracer's state: one CPU, one window, and a rolling ring of the
+       last visits to it with the registers at the moment of the visit. All
+       fixed-size: the control thread only records a request, and the CPU thread
+       applies it (see SetPcTrace/ApplyPcTraceRequest).
+
+       The ring has to retain a whole boot transition, not just a steady state:
+       a code window can run ~10k blocks per frame, so the old 16384-entry ring
+       held under two frames and a trace armed across a Download Play boot had
+       already forgotten the bring-up by the time anything could read it. 262144
+       entries (7 MiB per console) covers tens of frames past the boot's Reset,
+       which is the window this instrument exists to keep. */
+    struct PcTraceEntry { u32 pc; u32 lr; u32 cpsr; u32 r0; u32 r1; u32 r2; u32 r3; };
+    static const int kPcTraceRing = 262144;
+    PcTraceEntry PcTraceRing[kPcTraceRing] {};
+    u64 PcTraceTotal = 0;   // visits seen since the window was applied
+    int PcTraceN = 0;       // entries kept (at most kPcTraceRing)
+    int PcTraceCpu = -1;    // applied state: -1 while disarmed
+    u32 PcTraceLo = 1;      // empty window while Lo >= Hi
+    u32 PcTraceHi = 0;
+    u32 PcTraceFirstFrame = 0;
+    // Written by the control thread, then published through the generation;
+    // read by the CPU thread only after it sees the new generation.
+    std::atomic<u64> PcTraceReqGen { 0 };
+    u64 PcTraceAppliedGen = 0;   // CPU thread only
+    int PcTraceReqCpu = -1;
+    u32 PcTraceReqLo = 1;
+    u32 PcTraceReqHi = 0;
+
     u16 DivCnt;
     alignas(u64) u32 DivNumerator[2];
     alignas(u64) u32 DivDenominator[2];

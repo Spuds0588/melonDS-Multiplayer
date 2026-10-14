@@ -94,6 +94,17 @@ look. Three maintenance notes:
   `./build-tauri/md_smoke_test tools/mkdiagrom/diag.nds` - run bare it fails
   with "failed to read ROM file" (cwd, not a regression).
 
+* **Bringing several guests in at once: turn the stall kick off.**
+  `MD_KICK_AFTER_WINDOWS=0` stops the health watchdog resyncing a console that
+  has stalled for N windows (default **2**, and it fires once per stall episode).
+  A console *waiting for a peer to associate* looks stalled window for window,
+  so the kick can land inside a join handshake; the app logs which arm it is in
+  (`link stall kick: disabled (MD_KICK_AFTER_WINDOWS=0) …` at startup, and
+  `p2 stalled (window 4) - left alone (stall kick disabled …)` per window with
+  `MD_LINK_VERBOSE=1`). It is a diagnostic, not a fix: with it off, MPH's
+  four-console join loses its guests exactly as before (history.md v0.1.9az),
+  and with it on the 2026-09-25 MKDS join was torn up by the kick.
+
 * **Autostart env vars** (`MD_AUTOSTART_PLAYERS`, `MD_AUTOSTART_ROM`) start a
   session at boot and log a link selftest after 3s - how the alpha was
   verified without touching the UI. `MD_SHOW_BOTTOM=1` only sets the
@@ -146,6 +157,28 @@ Reading a log after a bad session, in order of usefulness:
   supervisor's `exited with status 139 (killed by signal 11)` line is for.
   Our reports do cover SIGABRT/SIGILL/SIGFPE/SIGTRAP, plus any SIGSEGV on a
   build where nothing else owns the signal.
+
+  **And a *live* session used to end in exactly that 139 (fixed v0.1.9aq).**
+  Quitting the app with a coupled group whose games were still exchanging
+  replies crashed three times out of three (two core dumps this pass, one on
+  `logs/fcs_app.log.gz`), while quitting a group whose game had already turned
+  its own radio off crashed zero times out of three - which is why the
+  correlation looked like a link defect. The core names it: `bt` is
+  `Platform::MP_SendReply` -> `0x0` on the run-loop thread, a call on the link
+  bus after process teardown had freed it. The console threads were simply never
+  stopped: at the wait the guest's game arms an answer and calls that hook about
+  sixty times a second, and the exit path reached the process teardown without
+  running the session's `Drop` (its `session teardown:` lines are absent from
+  every pre-fix log). Fixed by stopping the session in the `RunEvent::Exit` arm
+  of `app.run` - the last event on *every* exit path, so the window's close
+  button and the control channel's `quit` are both covered. The verification is
+  deterministic rather than probabilistic, which a race needs: the log now
+  carries `session teardown: stopping N console thread(s)` through
+  `session teardown: complete` *before* `event loop exiting`, and the supervisor
+  line reads `status 0`. Pre-fix, none of those four lines appeared at all.
+  Quitting an app with no session is unaffected (the drop is a no-op on `None`)
+  and takes the ~8s the health/linkmonitor threads need to notice the stop flag,
+  after the window is already gone.
 * `LINK ACTIVE / STALL / IDLE / OFF` health lines classify each console every
   5s; `p_n stalled with peers on the bus - resynced its bus state (kick #n)`
   records an automatic cure. `MD_LINK_VERBOSE=1` adds per-kind packet counters.
@@ -338,6 +371,29 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
     excludes it); if the first two disagree,
     the transport mangled the reply. `no body at all` on this line means the
     game was handed an empty answer.
+
+    **Measured 2026-09-29 (v0.1.9ap), because those four lines were read as if
+    their `body[N]` were the same span and it is not.** Over 4,096 distinct
+    replies of a coupled run, `collected length - handed length = 4` in
+    4096/4096 and the handed body is byte-identical to the first N bytes of the
+    collected body in 4096/4096: nothing is substituted or lost. The 4 bytes are
+    the FCS slot, proved by the one reply both sites printed in full (seq `EAA0`:
+    collected body `00 80 81 C7 F5 97`, handed body `00 80`,
+    `crc32(handed frame) = 97F5C781` = the dropped bytes). So
+    `guest arms an answer`, `answer sent` and `collected a reply` count the FCS
+    slot in their body and the handoff cannot; when those lines are compared,
+    compare *prefixes*, and never read "the collected bodies are all distinct" as
+    payload diversity - excluding the slot, the same run's 545 distinct collected
+    bodies reduce to the 38 payloads the guest actually sent.
+
+    **And the command direction does not crop the same way (v0.1.9ar).** Sampled
+    over a coupled run's whole session, the 10-byte command type is handed to the
+    guest's game as its first 6 bytes (`10 -> 6` in 1,767 samples) while the
+    16-byte session-data type arrives whole (`16 -> 16` in 22), so `FF 00` in the
+    host's state halfword *does* reach the guest's game - in a
+    `BE 01 02 00 22 9C FF 00 03 00 ...` frame - and v0.1.9aq's "the crop means
+    the client never sees the host's committed state" was about the 10-byte type
+    and is wrong as a general claim. Read the two directions' crops separately.
   * `[mp] deauth sent: <tx> -> <rx>, 42 byte frame, reason 0000` / `[mp] deauth
     received: ...` - a console ending the other's membership (see `fc=00C0` in
     the frame types below). This is the single decisive event in the 2026-09-25
@@ -406,6 +462,21 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   reproduce - those runs predate the FCS fix and `MD_REPLY_KEEP=1`. Set `=0`
   only to reproduce the pre-2026-09-28 wire for comparison; both settings keep
   the smoke test at 66/0. See history.md v0.1.9i.
+* **`MD_SAME_ROUND_REPLY` (default OFF) sends a poll's answer in the round the
+  poll arrived in, instead of holding the game's arm to the next poll.** It is
+  the reference arm for the one hypothesis round alignment left open - that the
+  fork's one-poll reply pipeline, where the host's window for round N sees the
+  guest's state from before N, is a fidelity gap against hardware - and it
+  answers it: with the flag on, MKDS's guest driver **starves** (its own game
+  arms 5 times for 394 polls while the host's windows collect 385 replies, 380
+  of them the firmware's `fc=0158` stand-in) and the group collapses before CUT
+  OFF completes; NSMB's healthy 234-second two-console session also loses its
+  guest at ~213 emulated s (`reason 0003`, `slots 0x000` against the flag-off
+  run's `0x003` and 11,126 replies). Both games are harmed, so the pipeline is
+  the games' own cadence and the flag stays off. It is a measurement knob, not
+  a behaviour switch - both settings keep the smoke test at 134/0 (the default
+  path is the same code, factored through `Wifi::AnswerPoll`). See history.md
+  v0.1.9bz.
 * **`MD_MP_FCS` (default on) writes the frame's FCS into its own trailing four
   bytes.** GBATEK: the sender's TX length *includes* a 4-byte FCS that "the
   hardware generates for you", and the receiver's RX header length is
@@ -535,6 +606,58 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   where it came from - `link reply timeout: 34ms = 2.03 emulated frames
   (default)` - because it used to end "(2 emulated frames at 59.826fps)" for
   every value, so a sweep at 2ms read as two frames when it is an eighth of one.
+* **`MD_DP_REPLY_MUTE=1` makes the Download Play joiner answer nothing after the
+  association** (default off). Everything up to and including the association is
+  unchanged - the joiner still beacons, authenticates, associates and drains its
+  command queue as usual - and only the two `send_reply` calls are skipped, so the
+  two arms differ in nothing the client transmits before the association and the
+  comparison isolates the host's own response to silence. It is the diagnostic
+  arm for a question the wire alone cannot answer: *does the host's Download Play
+  phase machine advance by itself, or because of what this client answers?*
+  Measured (`logs/sfc_mute.log.gz` vs `logs/sfc_base.log.gz`, 2 consoles, Star Fox
+  Recruitment, no pokes): with replies the host's per-client phase walks
+  `2 -> 10 -> 5 -> 14` and its command class `01 -> 00 -> 03 -> 00` in 243 ms
+  emulated; muted, the phase cycles `2 -> 3 -> 0`, never reaches 10/5/14, the
+  class stays `01` for 20,683 commands, 0 replies are collected in 20,069 empty
+  windows and the host deauthenticates 13 times (`reason 0001`). `tools/run_app.sh`
+  forwards it, and the joiner logs one line when it is on, because a knob this
+  script does not name never reaches the app.
+* **`MD_DP_REPLY_FORCE=<hex byte>` and `MD_DP_REPLY_FORCE_DATA=<hex byte>` sweep
+  the Download Play joiner's reply *type*** (both default off; `run_app.sh`
+  forwards both). The host's per-client mode machine switches on the reply's
+  third body byte - `07` UsernameReply, `08` RsaReply, `09` DataReply, `0x00`
+  dummy - so the byte decides which of the host's mode transitions fires.
+  `MD_DP_REPLY_FORCE` answers a *post-RSA* command the joiner has no specific
+  reply for with a normal reply of that type, and `MD_DP_REPLY_FORCE_DATA` does
+  the same for the `04` DataPacket rounds alone, so the download's later packet
+  loop can be swept without disturbing the reply that gets the host *to* the
+  download.  The shipped default is the measured one and needs no knob: `01` gets the
+  UsernameReply, `03` the RsaReply, a *post-RSA* command it has no specific
+  reply for the **RsaReply** (the type that moves the host's mode machine out of
+  14), a `04` DataPacket the **DataReply**, and the host's `05` Final the
+  **FinalReply**. Measured as the default with nothing set (`logs/sfc_dl.log.gz`,
+  `logs/sfc_fix.log.gz`, 2 consoles, Star Fox Recruitment, no pokes): the mode
+  field walks `2 -> 10 -> 5 -> 14 -> 6`, the host streams real `04` DataPackets,
+  and the image completes (see the download-loop entry below). The knobs remain
+  for sweeping: with the dummy default of before, the mode field stops at `14`
+  and the host streams nothing, and `MD_DP_REPLY_FORCE_DATA=09` was the probe
+  that first moved the packet loop before the DataReply body was built.
+* **The Download Play joiner's download loop is the shipped default, not a probe.**
+  A `04` DataPacket is parsed the way GBATEK lays it out - packet number at body
+  `09h`, data at `0Bh` up to the frame's own stated size, less the spec's one
+  padding byte, so a full packet yields `1F8h` bytes - and the RSA frame's
+  payload states the whole image (`14h` header + `24h` ARM9 + `34h` ARM7), which
+  is the benchmark the collected bytes are judged against. Each round is
+  answered with the DataReply (smallest missing packet at `03h`, distinct-packet
+  count at `05h`); the GotAllReply replaces it the moment the stated total has
+  arrived, and the host's Final is confirmed. The milestones are logged once each
+  - the RSA's total, the first packet with its first eight bytes, every 64th
+  packet, and the completion line - and `tools/appctl.py dpjoiner` prints the
+  growth as `download: <bytes> of <total> bytes in <packets> distinct packets ·
+  next wanted #<n>`. The gate is unchanged: only a title the registry marks
+  `download_play` gets a joiner thread at all, so New Super Mario Bros., Metroid
+  Prime - Hunters, Mario Kart DS and LEGO Star Wars II run with no joiner and no
+  frame of ours on their link.
 * **`MD_REPLY_BUDGET_FRAMES` caps what one frame may spend inside reply waits**
   (default **2** = two emulated frames, ~33ms; negative = no cap, the same thing
   `MD_REPLY_BUDGET_NS=-1` means in the harness). It is in *emulated frames*,
@@ -806,6 +929,20 @@ both framebuffers byte-identical while the log shows the input being delivered
 (`[input] frame 12524 player 2 touch -> 128,96` ... `frame 12534 player 2 touch
 released`).
 
+The same driver links **three** consoles: `tools/mkds_join.py --players 3` boots
+three, walks each joiner to its own group list, then joins them. The order is the
+whole trick and it is not cosmetic — an MKDS client leaves the lobby on its own
+about 13–21 emulated seconds after joining, so a route that walks the third
+console *after* the second has joined never has both clients in the room at once
+(the bus mask went `0x3` → `0x1` → `0x5` and never `0x7`). Walk every joiner
+first, then join them back to back, and the mask reaches `0x7` with `p1=host`,
+`p2=guest`, `p3=guest` and the host's `collected` matching what its two clients
+say they wrote. Report verbosity matters for the same reason: the full per-console
+register dump is thirteen control-channel round trips, and taking it at every
+menu step put ~20s of wall clock between two consoles that have to join into the
+*same* lobby, so the menu walk reports the frames/mask/screens line and the dumps
+are taken where the state is being judged.
+
 New Super Mario Bros. has its own worked route there too (`New Super Mario Bros.
 - two consoles link and play`), with the screens and the touch coordinates of
 every step. Read its **Re-run 2026-09-28 (v0.1.9r)** note before trusting it:
@@ -894,6 +1031,37 @@ command as `[control] <cmd>: <result>` in the ordinary app log so a scripted run
 and its post-mortem tell one story. **Never expose the port**: it can press
 buttons and quit the app.
 
+**The link sampler, and how to ask *when* rather than *whether*.** The digest
+prints each console's last command and answer body every five seconds, and the
+`[link-trace]` lines that print them have no frame number - so the digest can say
+"the host's command body shows `FF 00` somewhere in this run" and cannot say
+whether that happened before or after the event being explained. `probe` already
+carries the same two bodies to Rust (`mp.cmd_body`/`mp.answer_body`), so
+`tools/scripts/link-commit-trace.py sample` just polls it: one TSV row per ~12 ms
+with the emulated frame, the bus mask, each console's *own* view (on the host its
+command, on the client the command handed to its game) and the arm counters, so
+one `sample` and one `summarise` later the timing is a frame number. Per console,
+`cmd_body` is the command that console saw and `answer_body` the answer a client
+armed - one TSV holds all three legs of the handshake.
+
+```sh
+# while a route runs (the server threads per connection, so the driver and this
+# can talk at once):
+python3 tools/scripts/link-commit-trace.py sample --seconds 200 --out logs/x_link.tsv
+python3 tools/scripts/link-commit-trace.py summarise logs/x_link.tsv   # + its app log automatically
+python3 tools/scripts/link-commit-trace.py window logs/x_link.tsv     # the rows at a death
+python3 tools/scripts/link-commit-trace.py selftest                   # the reader, on fixtures
+```
+
+`summarise` exits non-zero if its checks fail and `selftest` drives the reader
+against fixtures (a surviving walker, a lobby-only host whose bus goes away, an
+empty TSV, a tap after the last sample, a foreign TSV, a short row, all three
+states of `window`) *and* against the archived runs, so a claim in these docs is
+a command rather than an argument. Two things it exists to keep straight: the
+state halfword lives at body bytes 6-7 of **both** command types, and the 10-byte
+type's tail is not the state (`FF 00 B8 B6` there against `FF 00 03 00` in the
+16-byte one).
+
 **The app writes the game's save file; the harness does not.** A session leaves
 the card alone until it ends, so an app run looks harmless right up to the
 moment `Test Roms/<game>.sav` comes back with a different md5 - a 40-minute
@@ -904,7 +1072,42 @@ before the app starts and, when the app exits, prints either `sav … unchanged
 (md5 …)` or `sav … CHANGED (md5 A -> B)` with the one `cp` that puts it back. It
 does not restore by itself - the same launcher is used to play - so a scripted
 run that needs byte-identity restores from the printed pin. The harness needs
-none of this: every `Test Roms/*.sav` survived all of its runs unchanged.
+none of this: every `Test Roms/*.sav` survived all of its runs unchanged. **And
+MKDS is not the only title that does it**: a Metroid Prime - Hunters match wrote
+`ffa024d5…` -> `b4966db3…` at session exit (2026-09-29), so read the supervisor
+line before assuming a game left its card alone.
+
+**Wait on the picture, not on a frame count.** Every route in this project was
+written as a list of frames, and a frame count is a guess with two ways to be
+wrong: a tap that lands on nothing still costs its frames, so a route that slept
+too little goes on before the screen changed and silently drives nothing, and one
+that slept too long goes on after the state it wanted has gone. The same
+Metroid Prime - Hunters `JOIN GAME` tap took ~7 s to land at one moment and
+~13 s at another, in the same session (2026-09-29) - a 5 s sleep passed in one
+case and lost the lobby in the other.
+
+```sh
+h=$(tools/appctl.py digest --player 2)             # hash this console's screens
+tools/appctl.py touch 122 64 --player 2            # the step whose landing is in doubt
+tools/appctl.py waitfor --change "$h" --player 2   # did it land, and when
+tools/appctl.py waitfor --settle --player 1        # wait out a menu transition
+```
+
+`digest` is an md5 of that console's two decoded screens (not of the PNG, whose
+bytes change with the encoder), taken off the same shot `shot` writes. `waitfor
+--change` exits non-zero with "the step before this one did not land" — which is
+the thing a frame-timed route could never say — and `waitfor --settle` refuses to
+settle while something on the screen is still animating, which is the honest
+answer for a console that is playing a match. `waitfor TEXT` (the original form)
+still reads the window's status line. `sleep` now takes `--ms` as well as a bare
+count, like every other duration command.
+
+**Real time passes between two driver commands.** There is no pause: a console
+keeps emulating while a driver reads a screenshot, so a route that inspects
+between steps races the game — this is what dropped a joined MPH guest three
+times while a PNG was being looked at. Never diagnose a timing-sensitive state
+from a picture taken by hand; take the picture inside the script, or wait on the
+picture with the commands above.
 
 ```sh
 tools/appctl.py status                     # session, frame counters, link mask
@@ -920,7 +1123,8 @@ tools/appctl.py touch 128 95 --ms 150      # pen down at a DS coordinate
 tools/appctl.py index 2 && tools/appctl.py tap KeyA   # real key events, real keymap
 tools/appctl.py click '#start'             # click UI by CSS selector
 tools/appctl.py advance --player 1 --frames 300   # wait for the console to actually run
-tools/appctl.py wifiio --player 1          # what player 1's game is reading out of the block
+tools/appctl.py wifiio --player 1          # what player 1's game reads out of the block, writes into it, and says over IPC
+tools/appctl.py mem --player 1 04000208 12 # 12 bytes of that console's own memory (hex addr, 4-byte steps)
 tools/appctl.py vary body --body "00 00 00 00"  # diagnostics: perturb one input (see below)
 tools/appctl.py script tools/scripts/example.txt  # a file of these, one per line
 ```
@@ -967,10 +1171,205 @@ tools/appctl.py vary off --player 1          # cumulative applied
 ```
 
 A probe set on a dead link reads `applied 0`, which is a measurement of nothing -
-check a digest line before believing a probe. Note that the control channel's
-`probe` command - the framebuffer/POWCNT1/wifi snapshot `tools/mkds_join.py` uses
-for its per-step report - is not an `appctl.py` subcommand; call it as
-`{"cmd":"probe","player":N}`.
+check a digest line before believing a probe.
+
+`mem` reads a console's own memory out of the emulator, which is the instrument
+the roadmap named as the unblocker for every game question a picture cannot
+answer (the MKDS park, MPH's `SELECT HUNTER`, NSMB's star gauge). The address is
+a hex string with or without `0x`; `addr` and `len` must both be multiples of 4
+(the bridge reads whole ARM9 words) and `len` is 4..4096. Everything else is
+refused with the reason - `mem … 0400020B 8`, `mem … 02000000 9999` and
+`mem … zz 8` are three sentences, not a rounded read or a traceback. The read is
+proof against the thing a picture is bad at: on 2026-09-29 a console sat on a
+black screen with its ARM9 in the BIOS's vblank-wait loop, and
+`mem --player 1 04000208 12` read `00000001 00000000 00040019` - IME 1, IE with
+vblank enabled - at exactly that instant, which is how "this CPU can never be
+woken" was ruled out instead of argued about.
+
+`poke` is the write half of that, and it exists because of a limit the read half
+cannot cross: a read can show that a loop's exit condition is **false**, but only
+a write can show that the loop is what *holds* the console. `poke <hex addr>
+<hex words> --player N` writes whole 32-bit words (space- or comma-separated,
+1..1024 of them) through the bridge's existing `md_write_ram` and answers the
+bytes as they now stand, so what the bus kept can be compared with what was
+asked for. Words rather than bytes, because a variable reads here the way it
+reads in `mem` and there is no endianness to get wrong. Used once, it settled
+the MKDS park in a single step: `pc9` was `0200FD10` on 37 of 40 samples, one
+`poke 2173300 00000000` moved it to `02021544` on **40 of 40** - the branch that
+loop's own test guards - and the consumer count beside it advanced by exactly the
+dequeue's increment. Diagnostics only; nothing on the product path calls it.
+
+`tools/scripts/sfc-dp-poke-search.py` is `poke` turned into a search: it writes
+one word at a time into the Star Fox host's own Download Play records (entrant
+record `0x020B4C00`, received-name record `0x020B17A0`, DP title records
+`0x020B3D40`/`0x020B5640`), holds it, restores it, and scores each trial on the
+wire - the joiner's received command class (`dpjoiner.lastCommand`) and the class
+byte the host's composer last wrote into its slot (the `002A` row of `wifiio`).
+`commandsRecv` must keep advancing, so a poke that freezes the host is reported
+as a stall at that word rather than scored as no effect; because those records
+are live state the host rewrites while it runs, each word's value is re-read
+immediately before its trial and the one in place is what gets restored.
+`--dry-run` lists the candidates; `--only`/`--region`/`--skip`/`--resume-from`
+scope a run; `--json` logs it. The parked state is a prerequisite (drive it there
+with `tools/scripts/sfc-dp-host.sh`), and the harness refuses to run if the
+joiner is the console it is about to perturb. What it measured (v0.1.9cp): no
+single word arms the transfer - the words the host consults live are structural
+and changing one freezes its command stream 10-30 s and then recovers - which is
+the honest shape of the negative result, not a missing measurement. Note that
+`dpjoiner`'s `--player` argument *moves* the joiner console; omit it to read its
+state.
+
+`tools/scripts/sm64-dp-host.sh` is the same kind of state-based route as
+`sfc-dp-host.sh`, for the test set's other single-card title, Super Mario 64 DS.
+Its VS screen is the game's Download Play entry, and its font defeats the ASCII
+screen readers, so the walk is touch geometry measured off framebuffer captures
+(`appctl.py shot` plus `render`; the composite is 256 px per console, the top
+screen above the bottom one): a tap anywhere on the title screen, then the **VS**
+bar at about `(37,172)` on the bottom screen. Do not tap the waiting room's
+bottom bar - that is the host's own "TOUCH TO START", and with no second *local*
+player it answers "Practice alone?". Success is read only from the link and the
+joiner's counters, never from a screen: exit 0 when a `04` DataPacket is seen (or
+the `download:` count moves), 2 when the host reached its waiting room,
+registered the client and stated its RSA image but never streamed data, and 1
+when the waiting room was never reached. Overrides `TAP_X`/`TAP_Y`,
+`VS_X`/`VS_Y`, `BOOT_S`, `HOST_WAIT_S`, `TRANSFER_WAIT_S`, `APP_LOG`, `LOG`.
+`tools/scripts/sm64-dp-force-sweep.sh` runs that route once per reply type
+(`MD_DP_REPLY_FORCE`), launching and quitting the app per value and writing a
+one-line verdict per value - the same question `sfc_force8`/`sfc_data9` answered
+for Star Fox.
+
+`tools/scripts/sfc-dp-arm-class.py` is `poke` aimed at the one byte that decides
+the Download Play command class - byte 0 of the host's 6-byte DP command body at
+ARM9 `0x023722E0`, which is exactly the byte GBATEK's CMD DATA `[06h]` carries to
+wifi-RAM slot offset `0x2A`. **It is a host memory patch, not a client
+behaviour**, and it says so in its own header: it holds that byte at a chosen
+class (`--class`, default `04`) while the host runs, reports the classes the
+joiner saw, then restores the original byte. The host rewrites the byte to `00`
+every round (~166/s, back within 20 ms), so a hold has to keep re-writing it -
+the tool does, and prints how many holds it used. `--natural` just reports the
+byte and writes nothing. Nothing is sent to the host over the link and
+`dp_joiner.rs` is not involved; the tool is not wired into the app. With the
+byte held at `04` the wire carries `06 01 02 00 03 11 04 50 08 00 02 00`
+(15,356 frames measured against 309,913 of the natural `... 11 00 50 ...`), and
+the joiner logs `the host's Download Play command is now 04 (DataPacket), size 3,
+flags 11, slave flags 0002`. What the host streams is its own five-byte stub
+body, not a real payload: the frame layout is the spec for the capture side, the
+packet contents are the host's placeholder. A parked host is a prerequisite
+(drive it there with `tools/scripts/sfc-dp-host.sh`).
+
+`tools/scripts/sfc-dp-data-frame.py` moves the same experiment one step earlier,
+to the sender's own *length* input rather than the class byte it produces. The
+ARM9 hands the ARM7 a frame by posting a WM message `{id 0x800F, buffer
+0x023722E0, length}` into the next of eleven 0x100-byte slots at `0x020B4C40 +
+0x100*k` and pushing `(slot << 6) | 0x0A` down the IPC FIFO; the ARM7 wireless
+library's composer (`0x023EFC18`) copies `length + 2` bytes of that buffer into
+the wifi-RAM TX slot, and does not copy at all when the length is zero. The tool
+holds that length word (`--len`, default `40`) and, optionally, the class byte
+(`--class`, default `04`; `none` to leave it), reports the classes the joiner saw
+*and* the frame body lengths the host sent (read out of the new part of the app
+log named by `--log`/`$MD_LOG`), then restores every word. **It is a host memory
+patch, not a client behaviour.** Only slots that really carry the DP command
+message (id `0x800F`, buffer `0x023722E0`) are touched, so the one slot holding a
+different message is left alone; every word is read back after restore and the
+tool says so loudly if it is not the value it started from. `--natural` reports
+and writes nothing. Measured: `--len 0x40` sends `body[72]=06 01 02 00 20 11 04
+50 08 00 02 00 00 38 02 00 00 00` (93 in a 6 s hold), `--len 0x1F8` sends
+`body[512]` (38), and `--len 0` sends only the 14-byte header form - the
+composer's own gate. The six-byte DS header, the incrementing packet number, the
+class and the payload are the capture-side layout; the payload itself is still
+the host's stub, because the host's engine never fills `0x023722E0` with image
+bytes. Holding the words perturbs the host's own state machine: after the `0x1F8`
+sweep the host deauthenticated the joiner (reason `0001`) and moved to another DP
+phase, so the tool is a measurement, not a fix.
+
+`appctl.py memwatch <lo> <hi>` answers the question no static search can: which
+instruction stores into a span of a console's own main RAM. `NDS::SetMemWatch`
+arms an inclusive window (off while `lo > hi`) and the main-RAM case of all six
+`ARM9Write8/16/32` and `ARM7Write8/16/32` entry points records the writer's PC,
+LR, CPSR and register file (`MemWatchHit`; the first `kMemWatchMax = 64` hits are
+kept, because the writer wanted runs first, and the register file is printed for
+the first `kMemWatchVerbose = 4`). `memwatch` with no window, or `--off`,
+reports without arming; arming clears the hits. Both CPUs' main-RAM spellings are
+folded onto one window (the ARM7 also sees it at `0x02800000`), so a mirror
+address cannot arm a watch that matches nothing and answers `0 stores` - which
+reads exactly like "nothing writes this" and was a real defect, caught by using
+it - and the report prints the folded address for the same reason. It costs one
+predictable compare per store while disarmed. **The JIT writes main RAM on its
+fast path and never reaches these functions, so arm it on the interpreter**
+(`MD_NOJIT=1`). Used that way it named the writer of Star Fox's Download Play
+class byte on its first try (v0.1.9cr): a `strb` in the DP engine's publisher,
+running in **IRQ mode**, reached through a computed pointer that no literal
+search could find. Six smoke checks hold its contract (`md_smoke_test`): a store
+in the window is named, one outside it is not, a window armed at a mirror matches
+the folded address, re-arming drops the previous hits, a store ending at the
+window's low edge is not claimed, and an undersized report buffer is refused
+rather than truncated.
+
+The same registers are now on the probe the drivers call: `arm9_ime`,
+`arm9_ie`, `arm9_if`, `arm9_vblank_pending` and `arm9_can_take_irq`, read live
+rather than from the five-second digest, plus `pc9`/`pc7` sampled on demand
+(the digest's cadence is the wrong resolution for "is this CPU stuck in that
+loop or visiting it?"). **The digest line's `W_IF`/`W_IE` are the *wireless
+block's* registers, not the CPU's.** They were printed as a bare `IF`/`IE` next
+to `arm7 IME … IE7 …` until 2026-09-29, and that label is what turned a parked
+console's `IE 0000` into a false reading of "interrupts are disabled, nothing can
+wake it" for a whole pass - the console was awake, in its vblank wait, and one
+button press returned it to the game's title screen. A label that can be
+mistaken for another register is a defect even when the value is right.
+**The same paragraph had a second defect, and it was a wrong bit rather than a
+wrong label: `wifi_ie_bit` tested `IE7 & 0x80`.** `IRQ_Wifi` is **24** -
+`Wifi.cpp` raises it with `NDS.SetIRQ(1, IRQ_Wifi)` and `NDS::SetIRQ` is
+`IF[cpu] |= 1 << irq` - so the wifi line is **bit 8 of the high halfword**
+(`IE7 & 0x0100`), and bit 23 is `IRQ_SPI`. Every log printed before 2026-09-29
+that says `wifi ie no` is reading bit 23; the archived runs' own raw `IE7`
+values say the wifi line was enabled the whole time. `tools/scripts/mp-arm7-watch.py --teardown <log>...`
+now says so from a log alone - it also prints, per console, every wireless
+on/off and deauth in/out in frame order, who deauthed first, whether the other
+console was handed that frame, and how many five-second digests left anything
+pending (`W_IF & W_IE != 0000`); `--selftest` checks it against the three
+archived sessions.
+
+**A single-instant PC sample cannot answer what a CPU is doing, and this file's
+own tooling learned that the hard way.** Both ARM7s halt in the BIOS between
+their scheduled wakeups, so a `pc7` sampled once every 0.3 s lands in the halt
+loop most of the time on *either* console; that produced "the guest's ARM7 is
+idle while the host's runs its code" out of 193/226 versus 100/333 samples,
+which the emulator's own per-register read tally then contradicted (v0.1.9au:
+the guest does ~7x the host's wireless traffic, and the spin pair - client 158-192
+reads/frame against host 6.2-6.9 - is the same order in a survivor and in two
+failures). So the live TSV now carries an aggregate beside the instant
+(`io_rate`, `io_spin`, `io_top`, from the `wifiio` counts differenced over the
+frames the sample covers), and
+`tools/scripts/mp-arm7-watch.py --activity logs/<run>_stdout.txt` differences the
+same counters between the driver's own blocks - which is how that table was
+produced, and repeatable in one command. It differences **only registers that
+appear in both blocks** (it prints how many that was) and says so: a register
+entering the driver's top-ten list has no baseline, and differencing it would
+report its whole history as one window's work - the first version of this mode
+did exactly that and inflated the host's total by ~35% until it was fixed in the
+same pass. When the question is "is this CPU idle or busy", ask it of a tally,
+never of a snapshot - and then check what the tally left out.
+
+The same report answers the opposite question - *which instruction wrote this*
+- for a console whose game is stuck (v0.1.9co). Beside the read side it prints a
+**write-side recorder**: every write the console's own software makes into the
+low wireless RAM (offsets below `0x40`, the header and the head of a frame body)
+in order with the writer's PC and LR, a per-offset last-writer table, and the
+command-slot arm's PC/LR **with the writer's whole register file** - so a frame
+that keeps going out with the wrong class byte can be traced to the code that
+composed it rather than guessed at from the wire. It also prints an **IPC FIFO
+trace**: the last 64 words each way through `IPCFIFOSEND`, each with the pushing
+CPU's PC and LR, which is the channel a DS game hands work between its two CPUs
+over. Two things to know before trusting a `pc=`: (1) the **JIT** reports `R[15]`
+as the start of the block an instruction compiled into, so run the session with
+**`MD_NOJIT=1`** and the signal becomes instruction addresses - the ARM
+interpreter reports the executing instruction plus 8, the pipeline offset, and
+the report says so; (2) toggling the JIT *mid-session* through `set_jit`
+segfaults (measured), which is why the knob is an autostart variable and not a
+runtime command. `probe` **is** an `appctl.py` subcommand
+(`tools/appctl.py probe --player N`, register files, interrupt state, MP and IPC
+counters); the raw form `{"cmd":"probe","player":N}` still works and is what
+`tools/mkds_join.py` uses.
 
 The frame ledger (`[mp] tx frame: slot N (NAME) fc=... seq=...`, the transport's
 `[link-trace] pN tx/rx`, the reply window's credit and the delivery lines) is the
@@ -1091,3 +1490,78 @@ melonDS provides a Nix flake with support for both macOS and Linux. The [Nix pac
 
 * To run melonDS, just type `nix run github:melonDS-emu/melonDS`.
 * To get a shell for development, clone the melonDS repository and type `nix develop` in its directory.
+
+**`mem --cpu 7` reads the ARM7's own address space, and until 2026-09-29 nothing
+could.** `md_read_ram` walked `ARM9Read32`, so every question about the ARM7 side
+(WRAM at `0x03800000`, the game's own ARM7 image in shared WRAM at `0x06000000`)
+was unanswerable from the control channel - and the routine that would have to feed
+the ARM9's message queue lives there. The bridge now has `md_read_ram_cpu(inst,
+cpu, ...)` (9 = ARM9, 7 = ARM7), the `mem` command takes a `cpu` field and echoes
+it in the answer, and `tools/appctl.py mem --cpu 7 <addr> [len]` is the caller.
+Exercise: 80 reads of 4 KB cover all 320 KB of ARM7 memory in about a second, and
+the result disassembles as real code. Two traps worth knowing before using it on
+this question: the ARM7 reaches I/O through a `0x04000000` base plus an offset
+(`add r0, r1, #392` for `IPCFIFOSEND`), so scanning for the absolute address finds
+nothing; and a listing built by concatenating two regions into one buffer gets the
+second region's VMA wrong by the gap between them - read and disassemble each
+region separately.
+
+**The same space can be written, and the parked-game probes read it too.**
+`md_write_ram_cpu` (behind `tools/appctl.py poke --cpu 7`) is the write half; the
+read-back comes from the same space, so a poke answers what the bus kept. The
+first ARM7-side "satisfy it and watch" experiment used it: the gate at
+`0x0380B3A4` (`*(0x0380FFF4)+0x3F4`) is consumed within 2-5 emulated frames of the
+write and the two ARM9s leave their dequeue at once. Two tools carry the method:
+`tools/scripts/mkds-park-probe.py --cpu 7` samples `pc7` and reads whose address
+space asked for (`--var ADDR[:LEN]` on both consoles in one window), and
+`tools/scripts/arm7-ctx-watch.py` traces the wifi context's fields (the gate and
+the queues at `+0x188`/`+0x1F4`/`+0x200`, plus the `+0x300` pointers) live, one
+row per console per sample, so "is this ever nonzero" is answerable over a whole
+session rather than at one instant. Three traps this pass paid for: the ARM7's
+`0x06000000` window is **VRAM** in melonDS's map and MKDS maps its wide ARM7 wifi
+library into it, so its 128 KB image plus its data tail is what `mem --cpu 7`
+returns there (`0x06020000`-`0x0603FFFF` is zero, `0x06040000+` is the image's
+mirror, and the tail from `0x06019000` holds live per-console data - two consoles'
+"images" differ only in that tail); `pc7` is one instant and lands in the BIOS
+most of the time on either console, so only the histogram or the read counters
+say what an ARM7 is doing; and a post path found by disassembly is one of fifteen
+call sites of `0x0600F19C` - each hands it a different descriptor inside the
+wifi context, so naming one is not naming the channel.
+
+**IPC FIFO traffic counters, because a level cannot answer "was this channel ever
+used".** `NDS::IPCSent9`/`IPCSent7` and `IPCRecv9`/`IPCRecv7` (src/NDS.h, bumped
+where `IPCFIFO9.Write`/`IPCFIFO7.Write` and the two receive reads actually happen
+in src/NDS.cpp), read by `md_get_ipc_stats` and exposed in the driver's probe JSON
+as `ipc` (`arm9_sends`, `arm7_sends`, `arm9_recvs`, `arm7_recvs`, plus each CPU's
+`fifocnt` and `sync`). The per-CPU FIFO members are protected, so the bridge reads
+through `NDS::GetIPCTraffic`. What it bought in one run: the ARM7 pushes ~7 words
+per frame into the FIFO for a whole session and the ARM9 pops every one of them,
+*including at the park* - so "both FIFOs read `0x8501` (empty)" says nothing about
+whether a channel is in use, and the earlier reading of it as "IPC idle" was
+wrong. `tools/scripts/arm7-ctx-watch.py` carries these columns next to the wifi
+context's queue counts and the retry-queue count `q1f4_8` (the halfword
+`0x600F19C` tests before deferring a message: `ctx+0x1F4+8`).
+
+**`md_get_regs` reads a CPU's whole register file, and a park needs it.** A
+program counter names a loop, not the function waiting in it, and one sample a
+second cannot tell a stuck loop from a sampler that always lands on the same
+instruction. The probe now carries `regs9`/`regs7` and `sp9`/`lr9`/`sp7`/`lr7`
+(`md_get_regs`, cpu 9 or 7; the two cores are unrelated C++ types - ARMv5 and
+ARMv4 - so the copy is written per CPU). `tools/scripts/mkds-stack-probe.py`
+waits for a park, prints the register file and scans the bytes above `sp9` for
+return addresses (a word in the game's code range whose preceding instruction is
+an ARM `bl`/`blx`, or a Thumb `bl` high half), dumping the raw stack beside the
+report. `tools/scripts/mkds-park-burst.py` samples a park twelve times a second
+with the queue words `0x02173300`/`0x021732AC`/`0x021732CC`, which is how
+`pc9 0200FD10` was shown to be an *instant* of the SDK's `delay(r0)` helper
+(`r0 = 0`, `lr` and `sp` identical in every sample) rather than a wait. Three
+traps this pass paid for: the trigger "both consoles' `pc9 == 0200FD10`" also
+matches the **boot path** (the first live run of the burst script "found" a park
+at frame 1,379 with the link down - require `link 0x3` *and* frames past the route
+as well); the player field on the control channel is **1-based on the wire**
+(`ctrl_json_player` subtracts one), so a 0-based index is refused with
+`player 0 is out of range 1..4`; and the ARM7's *shared WRAM* - a third code copy
+at `0x037F8000` where the SDK's IPC library lives, holding the `0x04000188` and
+`0x04000184` literals and the `WaitForInterrupt` loop - is a different memory from
+ARM7 WRAM (`0x03800000`, which reads zero at those offsets) and is what
+`mem --cpu 7 037F8000` returns.

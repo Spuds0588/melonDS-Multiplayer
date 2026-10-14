@@ -191,6 +191,10 @@ Which titles actually link up, and how far each one gets, is tracked in [compati
 
 **Short version:** New Super Mario Bros. plays 2-player multiplayer today. Mario Kart DS and Metroid Prime - Hunters both join but stop on the game's own screen. **3 and 4-player sessions are not working yet.**
 
+Single-card **Download Play** support — how one cartridge serves four consoles — is a planned feature rather than a permanent gap, because it is both the widest-compatibility step left and the cheapest 4-player configuration to emulate. See [Milestone 4 in to-do.md](./to-do.md#the-road-to-a-working-2-3-and-4-player-link).
+
+The project's target configuration is **four players on one machine, on the least powerful hardware that can work**, and that goal outranks emulation accuracy when the two conflict.
+
 ---
 
 ## Project Status

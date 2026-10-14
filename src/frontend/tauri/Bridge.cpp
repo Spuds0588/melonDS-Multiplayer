@@ -34,6 +34,31 @@ using melonDS::u8;
 
 /* ------------------------------------------------------------ instance state */
 
+/* One outstanding Link-test expectation for one console: the exact bytes and
+   timestamp a consumer there should read, and what the consumers saw of it.
+   Only the first matching read is recorded - by then the frame is gone, and a
+   second sighting would be a different frame.
+
+   `expect` is the frame as the *wire* leaves it, not as the sender handed it
+   over: the bus writes the hardware's FCS into the frame's own trailing four
+   bytes (see LocalMP::ApplyWireFCS), so a probe armed with the sender's bytes
+   would wait for a frame that cannot arrive. That mistake made the Link test
+   compare its nonce against a checksum and report FAILED on a healthy bus in
+   every state (2026-09-30, history.md v0.1.9bo). */
+struct MDProbe
+{
+    bool   armed = false;
+    u8     expect[32] {};
+    size_t expect_len = 0;
+    u64    expect_ts = 0;
+    bool   fcs_written = false; // the wire owns this frame's trailing four bytes
+
+    bool   observed = false;   // a consumer read a frame carrying this tag
+    bool   payload_ok = false; // ... and the bytes are the ones the sender queued
+    bool   ts_ok = false;      // ... and the timestamp is the one it was queued with
+    char   seen_by[12] = "";   // "game" or "drain"
+};
+
 struct MDInstance
 {
     std::string name;
@@ -41,6 +66,10 @@ struct MDInstance
     std::string last_error;
     std::string rom_path;
     std::string rom_title;
+    /* The 4-byte game code at header offset 0x0C ("AMCE", "A2DE", ...), the
+       cartridge's own identity. Read once at load so the host can resolve a
+       per-game profile without re-reading (or trusting) the ROM path. */
+    std::string rom_game_code;
     std::string sav_path;
 
     /* Buttons the host currently holds down, in the MD_BTN_* active-high
@@ -61,6 +90,17 @@ struct MDInstance
     u64 link_bytes_sent = 0;
     u64 link_bytes_received = 0;
 
+    /* The receive total, split by *who read the frame*. Both halves used to be
+       one number, which made "the console accepted 9 frames" ambiguous between
+       the console's own game polling them and a scripted drain collecting them
+       - and on 2026-09-30 an app Link test read that growth as its own success
+       while its drains had collected nothing at all (see the L/L2 fields in
+       LinkStats v3). `link_packets_received` stays the sum. */
+    u64 link_packets_read_game = 0;
+    u64 link_bytes_read_game = 0;
+    u64 link_packets_read_drained = 0;
+    u64 link_bytes_read_drained = 0;
+
     /* Per-kind packet counters (LinkStats v2). 'broadcast' = MP frames and
        acks a console pulled off its own receive slot; 'cmd'/'reply' = the
        host's command/reply handshake; 'host_polls' = MP host-frame polls,
@@ -80,6 +120,9 @@ struct MDInstance
        (total-packet counter only; a clock of polls is meaningless). Drives
        LINK STALL detection in the host's health log. */
     u64 link_last_rx_us = 0;
+
+    /* The outstanding Link-test expectation for this console, if any. */
+    MDProbe probe;
 
     /* Identity on the virtual air. Every instance boots the same firmware, so
        the per-console offset has to be applied by the host; MELN keeps the
@@ -315,16 +358,6 @@ void note_packet_sent_kind(void* userdata, int kind, int len)
     if (len > 0) inst->link_bytes_sent += (u64)len;
 }
 
-void note_packet_received(void* userdata, int len)
-{
-    auto* inst = static_cast<MDInstance*>(userdata);
-    if (!inst) return;
-
-    std::lock_guard<std::mutex> lock(g_link_lock);
-    inst->link_packets_received++;
-    if (len > 0) inst->link_bytes_received += (u64)len;
-}
-
 void note_packet_received_kind(void* userdata, int kind, int len)
 {
     auto* inst = static_cast<MDInstance*>(userdata);
@@ -332,6 +365,7 @@ void note_packet_received_kind(void* userdata, int kind, int len)
 
     std::lock_guard<std::mutex> lock(g_link_lock);
     inst->link_packets_received++;
+    inst->link_packets_read_game++;
     switch (kind)
     {
     case 0: inst->link_rx_broadcast++; break;
@@ -340,8 +374,48 @@ void note_packet_received_kind(void* userdata, int kind, int len)
     case 3: inst->link_rx_ack++; break;
     default: break;
     }
-    if (len > 0) inst->link_bytes_received += (u64)len;
+    if (len > 0)
+    {
+        inst->link_bytes_received += (u64)len;
+        inst->link_bytes_read_game += (u64)len;
+    }
     inst->link_last_rx_us = now_us();
+}
+
+/* ------------------------------------------------------------------ probe
+
+   One outstanding expectation per console, armed by the Link test on the
+   receiver and observed by whichever consumer reads the frame first. Its own
+   mutex, not g_link_lock: md_link_recv_packet calls it while holding the link
+   lock, and the game path calls it without, so sharing one lock would either
+   deadlock the drain or leave the game path unguarded. */
+std::mutex g_probe_lock;
+
+void probe_observe(void* userdata, const char* who, const u8* frame, size_t len, u64 timestamp)
+{
+    auto* inst = static_cast<MDInstance*>(userdata);
+    if (!inst || !frame) return;
+
+    std::lock_guard<std::mutex> lock(g_probe_lock);
+    MDProbe& pr = inst->probe;
+    if (!pr.armed || pr.observed) return;
+    if (len != pr.expect_len) return;
+
+    /* The tag is every byte of the frame the sender chose - which is the whole
+       frame when the wire wrote no FCS into it, and the frame minus its
+       trailing four bytes when it did. The slot is left out of the tag because
+       the wire computes it: it is a checksum *over* those bytes, so a mangled
+       body already fails the comparison, and including it would only re-test
+       our own CRC. Everything else has to match byte for byte before this is
+       taken as the probe's own frame. */
+    const size_t tag = pr.fcs_written ? (len - 4) : len;
+    if (tag > pr.expect_len) return;
+    if (memcmp(frame, pr.expect, tag) != 0) return;
+
+    pr.observed = true;
+    pr.payload_ok = (memcmp(frame, pr.expect, pr.expect_len) == 0);
+    pr.ts_ok = (timestamp == pr.expect_ts);
+    std::snprintf(pr.seen_by, sizeof(pr.seen_by), "%s", who ? who : "?");
 }
 
 void note_poll(void* userdata, bool got_packet)
@@ -453,6 +527,11 @@ int md_load_rom(MDInstance* inst, const char* rom_path)
     while (!title.empty() && (title.back() == '\0' || title.back() == ' '))
         title.pop_back();
 
+    /* Game code: the second thing a cartridge is, after its title. Four ASCII
+       bytes at offset 0x0C; kept verbatim (not trimmed) because the code is
+       fixed-width and a space is not a terminator. */
+    const std::string game_code(romdata.data() + 0x0C, romdata.data() + 0x10);
+
     const std::string sav = sav_path_for(rom_path);
     std::unique_ptr<u8[]> savedata;
     u32 savelen = 0;
@@ -501,6 +580,7 @@ int md_load_rom(MDInstance* inst, const char* rom_path)
 
     inst->rom_path = rom_path;
     inst->rom_title = title;
+    inst->rom_game_code = game_code;
     inst->sav_path = sav;
     inst->stop_reason = MD_STOP_NONE;
     inst->last_error.clear();
@@ -516,6 +596,7 @@ void md_eject_rom(MDInstance* inst)
     if (inst->nds->CartInserted())
         inst->nds->EjectCart();
     inst->rom_title.clear();
+    inst->rom_game_code.clear();
     inst->rom_path.clear();
 }
 
@@ -568,16 +649,30 @@ int md_set_firmware(MDInstance* inst, const char* firmware_path)
 
 int md_write_ram(MDInstance* inst, u32 addr, const void* data, size_t len)
 {
+    return md_write_ram_cpu(inst, 9, addr, data, len);
+}
+
+int md_write_ram_cpu(MDInstance* inst, int cpu, u32 addr, const void* data, size_t len)
+{
     if (!inst || !inst->nds || !data) return -1;
     if ((addr & 3) || (len & 3))
-        return set_error(inst, "md_write_ram requires 4-byte alignment");
+        return set_error(inst, "md_write_ram_cpu requires 4-byte alignment");
+    if (cpu != 7 && cpu != 9)
+        return set_error(inst, "md_write_ram_cpu takes cpu 7 or 9");
 
     const u8* bytes = static_cast<const u8*>(data);
     for (size_t i = 0; i < len; i += 4)
     {
         u32 word;
         std::memcpy(&word, bytes + i, 4);
-        inst->nds->ARM9Write32(addr + (u32)i, word);
+        /* The write half of md_read_ram_cpu: the reader went in first because
+           "what value is this ARM7 waiting on" is a read, but a variable that
+           holds a console can only be settled by changing it, and the ARM7's
+           0x03800000/0x06000000 are not reachable from an ARM9 write. */
+        if (cpu == 7)
+            inst->nds->ARM7Write32(addr + (u32)i, word);
+        else
+            inst->nds->ARM9Write32(addr + (u32)i, word);
     }
 
     return 0;
@@ -585,17 +680,59 @@ int md_write_ram(MDInstance* inst, u32 addr, const void* data, size_t len)
 
 int md_read_ram(MDInstance* inst, u32 addr, void* out, size_t len)
 {
+    return md_read_ram_cpu(inst, 9, addr, out, len);
+}
+
+int md_read_ram_cpu(MDInstance* inst, int cpu, u32 addr, void* out, size_t len)
+{
     if (!inst || !inst->nds || !out) return -1;
     if ((addr & 3) || (len & 3))
-        return set_error(inst, "md_read_ram requires 4-byte alignment");
+        return set_error(inst, "md_read_ram_cpu requires 4-byte alignment");
+    if (cpu != 7 && cpu != 9)
+        return set_error(inst, "md_read_ram_cpu takes cpu 7 or 9");
 
     u8* bytes = static_cast<u8*>(out);
     for (size_t i = 0; i < len; i += 4)
     {
-        const u32 word = inst->nds->ARM9Read32(addr + (u32)i);
+        /* The two CPUs have their own address spaces: an ARM9 read of an ARM7
+           address (0x03800000 WRAM, 0x06000000 the game's own ARM7 image) sees
+           nothing at all, which is why the routine that posts into an ARM9
+           queue could not be read for eleven passes. */
+        const u32 word = (cpu == 7) ? inst->nds->ARM7Read32(addr + (u32)i)
+                                    : inst->nds->ARM9Read32(addr + (u32)i);
         std::memcpy(bytes + i, &word, 4);
     }
 
+    return 0;
+}
+
+int md_get_regs(MDInstance* inst, int cpu, u32* out16)
+{
+    if (!inst || !inst->nds || !out16) return -1;
+    if (cpu != 7 && cpu != 9) return set_error(inst, "md_get_regs takes cpu 7 or 9");
+
+    /* ARM9 is an ARMv5 and ARM7 an ARMv4, so the two cores are unrelated types
+       and the copy cannot be shared. */
+    if (cpu == 7)
+    {
+        for (int i = 0; i < 16; i++) out16[i] = inst->nds->ARM7.R[i];
+    }
+    else
+    {
+        for (int i = 0; i < 16; i++) out16[i] = inst->nds->ARM9.R[i];
+    }
+    return 0;
+}
+
+int md_get_ipc_stats(MDInstance* inst, MDIPCStats* out)
+{
+    if (!inst || !inst->nds || !out) return -1;
+
+    /* Unsynchronised reads of counters the emulating thread bumps: each is a
+       single aligned 64-bit load, and the question they answer ("did this side
+       ever push a word") is about orders of magnitude, not one word. */
+    inst->nds->GetIPCTraffic(out->arm9_sends, out->arm7_sends,
+                             out->arm9_recvs, out->arm7_recvs);
     return 0;
 }
 
@@ -779,6 +916,15 @@ u32 md_run_frame(MDInstance* inst)
 
     const u32 lines = inst->nds->RunFrame();
     inst->frame_counter++;
+    /* The Download Play re-seed lives here rather than in the wifi event
+       because a stalled child has no wifi event: its own init leaves the
+       radio down, which cancels Event_Wifi, so a USTimer hook would never
+       fire (measured: 2 ticks total, then silence). The frame step is what
+       still runs for every console. One-shot and guarded inside. */
+    inst->nds->Wifi.ReseedDownloadPlayLink();
+    /* Same reasoning as above: only a stalled Download Play child has an
+       un-echoed nibble, so this is silent everywhere else. */
+    inst->nds->EchoDownloadPlaySync();
     return lines;
 }
 
@@ -1014,6 +1160,20 @@ int md_link_send_packet(MDInstance* inst, const void* data, size_t len, uint64_t
     return queued;
 }
 
+int md_link_send_reply(MDInstance* inst, const void* data, size_t len, uint64_t timestamp, uint16_t aid)
+{
+    if (!inst || inst->slot < 0 || !data || len == 0) return 0;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (!g_link_bus) return 0;
+
+    const int queued = g_link_bus->SendReply(inst->slot, (u8*)data, (int)len, timestamp, aid);
+
+    inst->link_packets_sent++;
+    if (queued > 0) inst->link_bytes_sent += (u64)queued;
+    return queued;
+}
+
 int md_link_recv_packet(MDInstance* inst, void* out, size_t cap, uint64_t* timestamp)
 {
     if (!inst || inst->slot < 0 || !out || cap == 0) return 0;
@@ -1027,9 +1187,73 @@ int md_link_recv_packet(MDInstance* inst, void* out, size_t cap, uint64_t* times
     {
         inst->link_packets_received++;
         inst->link_bytes_received += (u64)got;
+        inst->link_packets_read_drained++;
+        inst->link_bytes_read_drained += (u64)got;
         if (timestamp) *timestamp = ts;
+        md::probe_observe(inst, "drain", (const u8*)out, (size_t)got, ts);
     }
     return got;
+}
+
+int md_probe_arm(MDInstance* inst, const void* expect, size_t len, uint64_t ts)
+{
+    if (!inst || !expect || len == 0 || len > sizeof(inst->probe.expect)) return -1;
+
+    std::lock_guard<std::mutex> lock(md::g_probe_lock);
+    MDProbe& pr = inst->probe;
+    memset(pr.expect, 0, sizeof(pr.expect));
+    pr.fcs_written = melonDS::LocalMP::ApplyWireFCS(pr.expect, (const u8*)expect, len);
+    pr.expect_len = len;
+    pr.expect_ts = ts;
+    pr.observed = false;
+    pr.payload_ok = false;
+    pr.ts_ok = false;
+    pr.seen_by[0] = 0;
+    pr.armed = true;
+    return 0;
+}
+
+void md_probe_disarm(MDInstance* inst)
+{
+    if (!inst) return;
+
+    /* Clears the observation too, not just the arming: a caller that disarms
+       and then asks has to be told "nothing armed", never handed the result of
+       whatever the last expectation saw (the Rust side reads first and disarms
+       after, and this is what keeps that order from being load-bearing). */
+    std::lock_guard<std::mutex> lock(md::g_probe_lock);
+    MDProbe& pr = inst->probe;
+    pr.armed = false;
+    pr.observed = false;
+    pr.payload_ok = false;
+    pr.ts_ok = false;
+    pr.seen_by[0] = 0;
+}
+
+int md_probe_result(MDInstance* inst, MDProbeResult* out)
+{
+    if (!inst || !out) return -1;
+
+    std::lock_guard<std::mutex> lock(md::g_probe_lock);
+    const MDProbe& pr = inst->probe;
+    out->armed = pr.armed ? 1u : 0u;
+    out->observed = pr.observed ? 1u : 0u;
+    out->payload_ok = pr.payload_ok ? 1u : 0u;
+    out->ts_ok = pr.ts_ok ? 1u : 0u;
+    std::snprintf(out->seen_by, sizeof(out->seen_by), "%s", pr.seen_by);
+    return 0;
+}
+
+int md_link_test_attach(MDInstance* inst, int on)
+{
+    if (!inst || inst->slot < 0) return -1;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (!g_link_bus) return -1;
+
+    if (on) g_link_bus->Begin(inst->slot);
+    else g_link_bus->End(inst->slot);
+    return 0;
 }
 
 int md_link_stats(MDInstance* inst, MDLinkStats* out)
@@ -1044,6 +1268,12 @@ int md_link_stats(MDInstance* inst, MDLinkStats* out)
     out->packets_received = inst->link_packets_received;
     out->bytes_sent = inst->link_bytes_sent;
     out->bytes_received = inst->link_bytes_received;
+    out->packets_read_game = inst->link_packets_read_game;
+    out->bytes_read_game = inst->link_bytes_read_game;
+    out->packets_read_drained = inst->link_packets_read_drained;
+    out->bytes_read_drained = inst->link_bytes_read_drained;
+    if (g_link_bus && inst->slot >= 0)
+        g_link_bus->GetDelivered(inst->slot, &out->packets_delivered, &out->bytes_delivered);
     out->rx_broadcast = inst->link_rx_broadcast;
     out->rx_cmd = inst->link_rx_cmd;
     out->rx_reply = inst->link_rx_reply;
@@ -1058,6 +1288,50 @@ int md_link_stats(MDInstance* inst, MDLinkStats* out)
                         g_link_epoch.time_since_epoch())
                         .count();
     return 0;
+}
+
+uint64_t md_link_stats_canary(uint8_t* out, size_t cap)
+{
+    if (!out || cap < sizeof(MDLinkStats)) return 0;
+
+    /* Every field carries a distinct small number: its position in this
+       declaration order. A reader in another language asserts each of its own
+       fields against the number this side put in *that name*, so a field that
+       moved, was dropped, or was written in the wrong place shows up as a
+       named mismatch instead of as a plausible-looking number that means
+       something else. `offsetof` would not do it: two u64 fields swapped in
+       place keep their offsets and change only which name reads them. */
+    MDLinkStats s {};
+#define MDCAN(name, idx) s.name = (decltype(s.name))idx
+    MDCAN(connected, 0);
+    MDCAN(begin_count, 1);
+    MDCAN(end_count, 2);
+    MDCAN(packets_sent, 3);
+    MDCAN(packets_received, 4);
+    MDCAN(bytes_sent, 5);
+    MDCAN(bytes_received, 6);
+    MDCAN(packets_delivered, 7);
+    MDCAN(bytes_delivered, 8);
+    MDCAN(packets_read_game, 9);
+    MDCAN(bytes_read_game, 10);
+    MDCAN(packets_read_drained, 11);
+    MDCAN(bytes_read_drained, 12);
+    MDCAN(rx_broadcast, 13);
+    MDCAN(rx_cmd, 14);
+    MDCAN(rx_reply, 15);
+    MDCAN(rx_ack, 16);
+    MDCAN(rx_polls, 17);
+    MDCAN(tx_cmd, 18);
+    MDCAN(tx_reply, 19);
+    MDCAN(tx_ack, 20);
+    MDCAN(rx_empty_polls, 21);
+    MDCAN(last_rx_us, 22);
+    MDCAN(epoch_us, 23);
+#undef MDCAN
+
+    memset(out, 0, sizeof(s));
+    memcpy(out, &s, sizeof(s));
+    return (uint64_t)sizeof(s);
 }
 
 int md_link_mp_digest(MDInstance* inst, MDMPDigest* out)
@@ -1149,7 +1423,41 @@ uint64_t md_link_mp_digest_size(void)
 int md_wifi_io_report(MDInstance* inst, char* out, int cap)
 {
     if (!inst || !inst->nds || !out || cap <= 0) return -1;
-    return inst->nds->Wifi.FormatMPIoReport(out, (size_t)cap);
+    int n = inst->nds->Wifi.FormatMPIoReport(out, (size_t)cap);
+    if (n < 0) return -1;
+    /* The wireless picture carries the channel a game feeds its own ARM7
+       wireless driver over as well: without it, "this console's game stopped
+       composing commands" and "it never asked the other CPU to send anything"
+       are the same observation. */
+    const int m = inst->nds->FormatIPCTrace(out + n, (size_t)(cap - n));
+    if (m > 0) n += m;
+    return n;
+}
+
+int md_mem_watch(MDInstance* inst, uint32_t lo, uint32_t hi)
+{
+    if (!inst || !inst->nds) return -1;
+    inst->nds->SetMemWatch(lo, hi);
+    return 0;
+}
+
+int md_mem_watch_report(MDInstance* inst, char* out, int cap)
+{
+    if (!inst || !inst->nds || !out || cap <= 0) return -1;
+    return inst->nds->FormatMemWatch(out, (size_t)cap);
+}
+
+int md_pc_trace(MDInstance* inst, int cpu, uint32_t lo, uint32_t hi)
+{
+    if (!inst || !inst->nds) return -1;
+    inst->nds->SetPcTrace(cpu, lo, hi);
+    return 0;
+}
+
+int md_pc_trace_report(MDInstance* inst, char* out, int cap)
+{
+    if (!inst || !inst->nds || !out || cap <= 0) return -1;
+    return inst->nds->FormatPcTrace(out, (size_t)cap);
 }
 
 int md_link_mp_vary(MDInstance* inst, int kind, int value, const uint8_t* body,
@@ -1182,6 +1490,26 @@ int md_link_slot(MDInstance* inst)
     return inst ? inst->slot : -1;
 }
 
+int md_link_attached(MDInstance* inst)
+{
+    if (!inst || inst->slot < 0) return -1;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (!g_link_bus) return -1;
+    return g_link_bus->IsAttached(inst->slot) ? 1 : 0;
+}
+
+int md_console_mac(MDInstance* inst, unsigned char* out6)
+{
+    if (!inst || !out6) return -1;
+    /* Set by apply_console_mac at ROM load, before the console boots. Until
+       then there is no identity to hand out, which is a refusal and not a
+       zero MAC. */
+    if (!inst->firmware_mac_valid) return -1;
+    std::memcpy(out6, inst->console_mac.data(), 6);
+    return 0;
+}
+
 /* ---------------------------------------------------------------- diagnostics */
 
 const char* md_last_error(MDInstance* inst)
@@ -1197,6 +1525,16 @@ int md_rom_title(MDInstance* inst, char* out, size_t cap)
     if (inst->rom_title.empty()) return -1;
 
     std::snprintf(out, cap, "%s", inst->rom_title.c_str());
+    return 0;
+}
+
+int md_rom_game_code(MDInstance* inst, char* out, size_t cap)
+{
+    if (!inst || !out || cap == 0) return -1;
+    out[0] = '\0';
+    if (inst->rom_game_code.size() != 4) return -1;
+
+    std::snprintf(out, cap, "%s", inst->rom_game_code.c_str());
     return 0;
 }
 
@@ -1246,6 +1584,48 @@ u32 md_get_pc(MDInstance* inst, int cpu)
     if (!inst || !inst->nds) return 0;
     if (cpu == 9) return inst->nds->ARM9.R[15];
     if (cpu == 7) return inst->nds->ARM7.R[15];
+    return 0;
+}
+
+int md_dp_boot(MDInstance* inst, const void* image, size_t len,
+               u32 header_dest, u32 header_size,
+               u32 arm9_dest, u32 arm9_size, u32 arm9_entry,
+               u32 arm7_dest, u32 arm7_temp, u32 arm7_size, u32 arm7_entry,
+               const MDDPSession* session)
+{
+    if (!inst || !inst->nds || !image || !session) return -1;
+
+    melonDS::NDS::DownloadPlayBootInfo info {};
+    info.ARM9Entry = arm9_entry;
+    info.ARM7Entry = arm7_entry;
+    info.HeaderDest = header_dest;
+    info.HeaderSize = header_size;
+    info.ARM9Dest = arm9_dest;
+    info.ARM9Size = arm9_size;
+    info.ARM7Dest = arm7_dest;
+    info.ARM7Temp = arm7_temp;
+    info.ARM7Size = arm7_size;
+    info.Channel = (int)session->channel;
+    info.AID = (int)session->aid;
+    std::memcpy(info.HostBSSID, session->host_bssid, 6);
+    info.HostSerial = session->host_serial;
+    info.HostToken = session->host_token;
+    info.HostCapability = session->host_capability;
+    info.HostInterval = session->host_interval;
+    info.HostRateMask = session->host_rate_mask;
+    info.HostBeaconSize = session->host_beacon_size;
+
+    if (!inst->nds->SetupDownloadPlayBoot(static_cast<const u8*>(image), (u32)len, info))
+        return set_error(inst, "download-play boot: image does not fit the RSA load map");
+
+    std::fprintf(stderr,
+                 "[melonDS bridge] %s: booted the downloaded image (%zu bytes) - "
+                 "header -> %08X, ARM9 -> %08X (entry %08X), ARM7 -> %08X (entry %08X), "
+                 "session carried: channel %d, BSSID %02X:%02X:%02X:%02X:%02X:%02X, AID %d\n",
+                 inst->name.c_str(), len, info.HeaderDest, info.ARM9Dest, info.ARM9Entry,
+                 info.ARM7Dest, info.ARM7Entry, info.Channel,
+                 info.HostBSSID[0], info.HostBSSID[1], info.HostBSSID[2],
+                 info.HostBSSID[3], info.HostBSSID[4], info.HostBSSID[5], info.AID);
     return 0;
 }
 

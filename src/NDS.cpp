@@ -17,6 +17,7 @@
 */
 
 #include <assert.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
@@ -435,8 +436,573 @@ void NDS::SetupDirectBoot(const std::string& romname)
     SetWifiWaitCnt(0x0030);
 }
 
+bool NDS::SetupDownloadPlayBoot(const u8* image, u32 imagelen,
+                                const DownloadPlayBootInfo& info)
+{
+    if (!image) return false;
+    if (info.HeaderSize < 0x160) return false;
+
+    const u64 total = (u64)info.HeaderSize + info.ARM9Size + info.ARM7Size;
+    if (total == 0 || (u64)imagelen < total) return false;
+
+    const u8* header = image;
+    const u8* arm9 = image + info.HeaderSize;
+    const u8* arm7 = arm9 + info.ARM9Size;
+
+    // A downloaded child does not start on top of whatever this console was
+    // running. On hardware the firmware performs the download and then hands
+    // over from a reset machine, so this path is a whole-console Reset() - the
+    // same one md_load_rom does before SetupDirectBoot(rom) - and it has to run
+    // BEFORE the image is written, because Reset() clears main RAM.
+    //
+    // Skipping it is not a cosmetic difference. The child's zero-initialized
+    // data, its ARM7's WRAM, the IPC FIFOs, the timers and both CPUs are then
+    // the previous game's leftovers, so the child's own init computes addresses
+    // from data that was never its own: live, it ran from the entry to an
+    // unrelated address a few hundred bytes in and took an undefined
+    // instruction or a data abort there - at a different address every run,
+    // which is the signature of reading stale RAM rather than of a bad image.
+    Reset();
+
+    // Reset() leaves the CPU mode and the CP15/TCM state a boot starts from;
+    // the writes below rebuild what the firmware would have set up. Same order
+    // as SetupDirectBoot(): shared WRAM first, then the RAM.
+    MapSharedWRAM(3);
+
+    // The FreeBIOS ARM9 image has no Nintendo logo, and games read it (DS<->GBA
+    // comm). SetupDirectBoot() copies the cartridge's; the downloaded header
+    // carries the same standard logo, so the child's own image supplies it.
+    if (!IsLoadedARM9BIOSKnownNative())
+        memcpy(ARM9BIOS.data() + 0x20, header + 0xC0, 0x9C);
+
+    // The child image is a second DS image, so the RAM copies a direct boot
+    // would leave for a game (its header, the cart id and the two CRCs) come
+    // from the *downloaded* header instead of the cartridge's.
+    auto rd16 = [&](u32 off) -> u16 {
+        u16 v = 0; if (off + 2 <= info.HeaderSize) memcpy(&v, header + off, 2); return v;
+    };
+    auto rd32 = [&](u32 off) -> u32 {
+        u32 v = 0; if (off + 4 <= info.HeaderSize) memcpy(&v, header + off, 4); return v;
+    };
+    const u32 cartid = rd32(0x0C);
+    const u16 headercrc = rd16(0x15E);
+    const u16 securcrc = rd16(0x160);
+
+    for (u32 i = 0; i < 0x170; i += 4)
+    {
+        u8 b[4] = {0, 0, 0, 0};
+        for (u32 k = 0; k < 4; k++)
+            if (i + k < info.HeaderSize) b[k] = header[i + k];
+        u32 tmp;
+        memcpy(&tmp, b, 4);
+        NDS::ARM9Write32(0x027FFE00 + i, tmp);
+    }
+
+    NDS::ARM9Write32(0x027FF800, cartid);
+    NDS::ARM9Write32(0x027FF804, cartid);
+    NDS::ARM9Write16(0x027FF808, headercrc);
+    NDS::ARM9Write16(0x027FF80A, securcrc);
+    NDS::ARM9Write16(0x027FF850, 0x5835);
+    NDS::ARM9Write32(0x027FFC00, cartid);
+    NDS::ARM9Write32(0x027FFC04, cartid);
+    NDS::ARM9Write16(0x027FFC08, headercrc);
+    NDS::ARM9Write16(0x027FFC0A, securcrc);
+    NDS::ARM9Write16(0x027FFC10, 0x5835);
+    NDS::ARM9Write16(0x027FFC30, 0xFFFF);
+    // GBATEK: Boot Indicator 2 = "booted from DS Download Play via Wifi", the
+    // value a real child image is handed (a direct boot writes 1 here).
+    NDS::ARM9Write16(0x027FFC40, 0x0002);
+
+    /* NOTE (2026-10-13, measured, to-do.md "Indicator staging fires the tail
+       but the consumer stays undispatched"): an `ASFE`-gated
+       `[027FFC40] = 1` staging lived here and was REMOVED after three live
+       routes proved it moves init without moving the game: the tail fires,
+       both struct-inits run, the game's own setter stores flag 1 - and the
+       registered consumer entry `0201466D` is never dispatched, no window is
+       read, the park is unchanged. A firmware-unfaithful lie with no path to
+       progress stays out per the no-speculative-code rule; the recipe and
+       the 45-visit boot trace stay in to-do.md. */
+
+    /* The firmware handoff context the indicator promises: GBATEK's 60-byte
+       block at `027FFC42h-027FFC7Dh` (BIOS RAM Usage / DS Download Play /
+       Nintendo Beacons chapters). A real client reads it through the pointer
+       its main init hands downstream (this image: the `02018F2C` consumer
+       passes `027FFC42`, not values - and copies all 60 bytes), and it reads
+       it ONCE at boot - poking it in late changes nothing (measured, to-do.md
+       "Context poke FALSIFIED": 4 min, flag 0, BB74 0 visits, consumed 0).
+       So the whole block is staged here, before the CPUs start, from the live
+       beacon the joiner associated with - not guessed words (the previous
+       7-word staging landed off GBATEK's offsets and the child never touched
+       its radio with it; see to-do.md p61).
+       This path only ever runs for single-card Download Play titles (the
+       joiner that calls it is itself gated on the title's Download Play
+       profile), so no per-game switch is involved: every real DL child gets
+       this block from its firmware. */
+    {
+        u8 block[60] = {};
+        auto wr16 = [&](u32 off, u16 v) {
+            block[off] = (u8)(v & 0xFF);
+            block[off + 1] = (u8)(v >> 8);
+        };
+        wr16(0x00, (u16)(info.HostBeaconSize & 0xFFFF)); // 42h beacon size
+        // 44h RSSI: the bus models no signal strength, so GBATEK's "high"
+        // example (82h) - what a same-machine measurement would read.
+        wr16(0x02, 0x0082);
+        for (u32 i = 0; i < 6; i++)
+            block[0x04 + i] = info.HostBSSID[i];         // 46h BSSID
+        wr16(0x0A, 0x0020);                              // 4Ch SSID size
+        for (u32 i = 0; i < 4; i++)
+            block[0x0C + i] = (u8)((info.HostSerial >> (8 * i)) & 0xFF); // 4Eh
+        block[0x10] = (u8)(info.HostToken & 0xFF);       // 52h stream
+        block[0x11] = (u8)((info.HostToken >> 8) & 0xFF);
+        // 54h-6Dh SSID padding stays zero-filled (see block init).
+        wr16(0x2C, (u16)(info.HostCapability & 0xFFFF)); // 6Eh caps
+        wr16(0x2E, (u16)(info.HostRateMask & 0xFFFF));   // 70h rates
+        wr16(0x30, (u16)(info.HostRateMask & 0xFFFF));   // 72h rates
+        wr16(0x32, (u16)(info.HostInterval & 0xFFFF));   // 74h interval
+        wr16(0x34, 0x0002);                              // 76h listen
+        wr16(0x36, (u16)(info.Channel & 0xFFFF));        // 78h channel
+        // 7Ah-7Dh unknown stays zero-filled (see block init).
+        // Halfword writes, not word writes: ARM9Write32 aligns its address
+        // down (`addr &= ~0x3`), which lands every word of a 0x..42-based
+        // block two bytes low and clobbers the indicator with the size (live:
+        // `[027FFC40]` read back 0061, the whole block shifted -2; see
+        // to-do.md p61). All 30 halfword addresses here are 2-aligned, which
+        // ARM9Write16 keeps. Staged values are logged once by the joiner's
+        // handoff line on the Rust side.
+        for (u32 i = 0; i < sizeof(block); i += 2)
+            NDS::ARM9Write16(0x027FFC42 + i, (u16)block[i] | ((u16)block[i + 1] << 8));
+    }
+
+    /* NOTE (2026-10-13, measured falsification, to-do.md "Staging erased"):
+       a flag staging lived here - `[02174E08] = 1` behind a gate-shape check
+       (`020121F6..FC` + pool) - and was REMOVED after the live route proved
+       it inert: the game's own prologue BSS-clear erases BSS after staging
+       (live `[02174E08]` reads 0 with the skip branch proven fired), and the
+       consumer task that would read it is never dispatched at all. Kept out
+       per the no-speculative-code rule; see to-do.md for the trace. */
+
+    // The child's own segments, at the destinations the host stated.
+    for (u32 i = 0; i < info.HeaderSize; i += 4)
+    {
+        u32 tmp;
+        memcpy(&tmp, header + i, 4);
+        NDS::ARM9Write32(info.HeaderDest + i, tmp);
+    }
+    for (u32 i = 0; i < info.ARM9Size; i += 4)
+    {
+        u32 tmp;
+        memcpy(&tmp, arm9 + i, 4);
+        NDS::ARM9Write32(info.ARM9Dest + i, tmp);
+    }
+    for (u32 i = 0; i < info.ARM7Size; i += 4)
+    {
+        u32 tmp;
+        memcpy(&tmp, arm7 + i, 4);
+        NDS::ARM7Write32(info.ARM7Dest + i, tmp);
+        // A real client also stages the ARM7 at the temp address the RSA frame
+        // names, because its ARM9 boot code SHA1s the image from there before
+        // relocating it. Skipping the staging copy is what the first run did.
+        if (info.ARM7Temp != 0 && info.ARM7Temp != info.ARM7Dest)
+            NDS::ARM7Write32(info.ARM7Temp + i, tmp);
+    }
+
+    ARM7BIOSProt = 0x1204;
+
+    // Reset() above already cleared both CPUs (CPSR 0xD3, ARM, Supervisor,
+    // registers zeroed), so JumpTo below lands in ARM mode instead of
+    // inheriting the Thumb bit a mid-run game would have left set.
+
+    // The firmware writes its header copy and the user settings into main RAM
+    // (touch calibration, nickname, MAC). Reset() just cleared that RAM, so it
+    // has to be redone - exactly the call SetupDirectBoot() makes.
+    SPI.GetFirmwareMem()->SetupDirectBoot();
+
+    // The machine state a direct boot leaves the two CPUs in, so the child
+    // image starts where the firmware would have handed it over.
+    ARM9.CP15Write(0x100, 0x00052078);
+    ARM9.CP15Write(0x200, 0x00000042);
+    ARM9.CP15Write(0x201, 0x00000042);
+    ARM9.CP15Write(0x300, 0x00000002);
+    ARM9.CP15Write(0x502, 0x15111011);
+    ARM9.CP15Write(0x503, 0x05100011);
+    ARM9.CP15Write(0x600, 0x04000033);
+    ARM9.CP15Write(0x601, 0x04000033);
+    ARM9.CP15Write(0x610, 0x0200002B);
+    ARM9.CP15Write(0x611, 0x0200002B);
+    ARM9.CP15Write(0x620, 0x00000000);
+    ARM9.CP15Write(0x621, 0x00000000);
+    ARM9.CP15Write(0x630, 0x08000035);
+    ARM9.CP15Write(0x631, 0x08000035);
+    ARM9.CP15Write(0x640, 0x0300001B);
+    ARM9.CP15Write(0x641, 0x0300001B);
+    ARM9.CP15Write(0x650, 0x00000000);
+    ARM9.CP15Write(0x651, 0x00000000);
+    ARM9.CP15Write(0x660, 0xFFFF001D);
+    ARM9.CP15Write(0x661, 0xFFFF001D);
+    ARM9.CP15Write(0x670, 0x027FF017);
+    ARM9.CP15Write(0x671, 0x027FF017);
+    ARM9.CP15Write(0x910, 0x0300000A);
+    ARM9.CP15Write(0x911, 0x00000020);
+
+    ARM9.R[12] = info.ARM9Entry;
+    ARM9.R[13] = 0x03002F7C;
+    ARM9.R[14] = info.ARM9Entry;
+    ARM9.R_IRQ[0] = 0x03003F80;
+    ARM9.R_SVC[0] = 0x03003FC0;
+
+    ARM7.R[12] = info.ARM7Entry;
+    ARM7.R[13] = 0x0380FD80;
+    ARM7.R[14] = info.ARM7Entry;
+    ARM7.R_IRQ[0] = 0x0380FF80;
+    ARM7.R_SVC[0] = 0x0380FFC0;
+
+    ARM9.JumpTo(info.ARM9Entry);
+    ARM7.JumpTo(info.ARM7Entry);
+
+    SetExMemCnt(0, 0xE880, 0xFFFF);
+    SetExMemCnt(1, 0x0080, 0x00FF);
+
+    PostFlag9 = 0x01;
+    PostFlag7 = 0x01;
+
+    PowerControl9 = 0x820F;
+    GPU.SetPowerCnt(PowerControl9);
+
+    /* 0x0003, not 0x0001: the wifi power domain (bit 1, which the mask below
+       already anticipates) stays on across the hand-over - the transfer just
+       ran over this radio, and the downloaded image's first act is wireless.
+       Without it the boot parks the console with wifi disabled and the
+       SetDownloadPlayLink attach below cannot happen (UpdatePowerOn reads
+       PowerUS bit 0 clear but Enabled false). The direct-boot path above
+       keeps 0x0001: a cartridge boot owns its own power-up. */
+    PowerControl7 = 0x0003;
+    SPU.SetPowerCnt(PowerControl7 & 0x0001);
+    Wifi.SetPowerCnt(PowerControl7 & 0x0002);
+
+    RCnt = 0x8000;
+    NDSCartSlot.WriteSPICnt(0, 0x8000, 0xFFFF);
+    NDSCartSlot.WriteSPICnt(1, 0x8000, 0xFFFF);
+    SPU.SetBias(0x200);
+    SetWifiWaitCnt(0x0030);
+
+    // A real child does not come out of the transfer as a stranger: it was
+    // already tuned to the host's channel, already associated with the host's
+    // BSSID, and already holding the AID the host granted it, and the radio
+    // does not lose any of that across the hand-over. Reset() above cleared all
+    // of it (CurChannel, IsMP/IsMPClient/MPMYAID), so the session is put back
+    // before the CPUs start - otherwise the child's first frame is dropped
+    // before a channel byte is stamped, everything it hears is dropped by
+    // CheckRX, and the host's own beacons and polls are addressed to a station
+    // that no longer exists.
+    Wifi.SetDownloadPlaySession(info.Channel, info.HostBSSID, info.AID);
+
+    // The session above is who the child is; this is its radio being on to
+    // hear with. Reset() left PowerState 0x0200/TRXPower 0 and an empty RX
+    // window, and the driver's own bring-up never advances past power-down
+    // on its own (see Wifi::SetDownloadPlayLink for the measured chain).
+    // After the session so the association it carries is already in place.
+    Wifi.SetDownloadPlayLink();
+
+    // Reset() parked the console and Start() is what lets the CPUs run - the
+    // same last step md_load_rom takes after SetupDirectBoot(rom). Without it
+    // the LCD would keep scanning while no instruction ever executes.
+    DPBootChild = true;
+    Start();
+
+    return true;
+}
+
+void NDS::EchoDownloadPlaySync()
+{
+    /* The child's ARM9 handshake (`strh (nibble<<8),[IPCSYNC]`, then wait for
+       the echo) is correct code that never runs here: ARM9 main sleeps in an
+       unconditional idle after its boot prologue while ARM7 spins on the
+       echo (measured live, to-do.md "SFC guest park"). This performs the
+       exact halfword store ARM9's own `strh` would, through ARM9IOWrite16 so
+       the IRQ gating is identical - including its absence (a pure nibble has
+       bit 0x2000 clear, so no IRQ fires; ARM7 polls the echo on its VBlank
+       iterations, which is how the hardware behaves too).
+
+       Self-limiting three ways, so a healthy console never notices: only
+       Download Play children (never a cartridge boot), only while ARM9 has
+       not yet echoed what ARM7 posted (an awake ARM9 echoing for itself
+       always matches first, and anything it writes later lands identically),
+       and never anything but that nibble - including following it back down
+       to zero, which is ARM9's own per-iteration store and the phase-advance
+       the other side waits for. */
+    if (!DPBootChild) return;
+    const u16 arm7out = (IPCSync7 >> 8) & 0x0F;
+    if (((IPCSync9 >> 8) & 0x0F) == arm7out) return;
+    ARM9IOWrite16(0x04000180, arm7out << 8);
+}
+
+void NDS::RecordIPCTrace(int cpu, u32 word)
+{
+    /* A pointer, not a reference: ARMv4 and ARMv5 have no common lvalue, and a
+       conditional between them would slice the derived CPU into a temporary. */
+    ARM* arm = cpu ? static_cast<ARM*>(&ARM7) : static_cast<ARM*>(&ARM9);
+    IPCTraceEntry* ring = cpu ? IPCTrace7 : IPCTrace9;
+
+    const u64 n = cpu ? IPCTraceN7++ : IPCTraceN9++;
+    IPCTraceEntry& e = ring[n % (u64)kIPCTrace];
+    e.pc = arm->R[15];
+    e.lr = arm->R[14];
+    e.word = word;
+}
+
+int NDS::FormatIPCTrace(char* out, size_t cap) const
+{
+    if (!out || cap < 128) return -1;
+
+    int n = 0;
+    const auto put = [&](const char* fmt, ...) {
+        if ((size_t)n >= cap - 1) return;
+        va_list ap;
+        va_start(ap, fmt);
+        const int w = vsnprintf(out + n, cap - (size_t)n, fmt, ap);
+        va_end(ap);
+        if (w <= 0) return;
+        n += w;
+        if ((size_t)n > cap - 1) n = (int)cap - 1;
+    };
+
+    put("  ipc fifo words, in order (cpu word pc lr; pc is the interpreter's,\n"
+        "  i.e. the pushing instruction's address plus 8):\n");
+
+    const struct { int cpu; const IPCTraceEntry* ring; u64 total; } dirs[2] = {
+        { 0, IPCTrace9, IPCTraceN9 },
+        { 1, IPCTrace7, IPCTraceN7 },
+    };
+
+    for (const auto& d : dirs)
+    {
+        const u64 keep = (d.total < (u64)kIPCTrace) ? d.total : (u64)kIPCTrace;
+        const u64 first = d.total - keep;
+        put("    arm%d->arm%d %llu word(s), last %llu:\n", d.cpu ? 7 : 9, d.cpu ? 9 : 7,
+            (unsigned long long)d.total, (unsigned long long)keep);
+        for (u64 k = 0; k < keep; k++)
+        {
+            const IPCTraceEntry& e = d.ring[(first + k) % (u64)kIPCTrace];
+            put("      %08X @%08X lr=%08X\n", e.word, e.pc, e.lr);
+        }
+    }
+
+    return n;
+}
+
+void NDS::SetMemWatch(u32 lo, u32 hi)
+{
+    /* Fold the window the same way the stores are folded. Both CPUs see main
+       RAM as 0x02000000 and, above it, as a mirror of itself; arming at a mirror
+       address used to match nothing and report "0 stores" rather than say the
+       window was wrong, which is the worst of both (a silent negative). A
+       window outside main RAM cannot match anything anyway - the watch is only
+       called from the main-RAM cases of the four write functions - so folding
+       is lossless here. */
+    if (lo <= hi)
+    {
+        lo = 0x02000000 | (lo & 0x3FFFFF);
+        hi = 0x02000000 | (hi & 0x3FFFFF);
+    }
+
+    MemWatchLo = lo;
+    MemWatchHi = hi;
+    MemWatchN = 0;
+    MemWatchTotal = 0;
+}
+
+void NDS::RecordMemWatch(int cpu, u32 addr, u32 val, int size)
+{
+    /* Main RAM is seen by the ARM7 at 0x02000000 and its 0x02800000 mirror, so
+       the two CPUs' addresses are folded onto one window before comparing. */
+    const u32 canon = 0x02000000 | (addr & 0x3FFFFF);
+
+    if (canon + (u32)size <= MemWatchLo) return;
+    if (canon > MemWatchHi) return;
+
+    MemWatchTotal++;
+    if (MemWatchN >= kMemWatchMax) return;
+
+    ARM* arm = cpu ? static_cast<ARM*>(&ARM7) : static_cast<ARM*>(&ARM9);
+    MemWatchHit& h = MemWatchHits[MemWatchN++];
+    h.pc = arm->R[15];
+    h.lr = arm->R[14];
+    h.cpsr = arm->CPSR;
+    h.addr = canon;
+    h.val = val;
+    h.size = (u16)size;
+    h._pad = (u16)cpu;
+    for (int i = 0; i < 16; i++) h.regs[i] = arm->R[i];
+}
+
+int NDS::FormatMemWatch(char* out, size_t cap) const
+{
+    if (!out || cap < 128) return -1;
+
+    int n = 0;
+    const auto put = [&](const char* fmt, ...) {
+        if ((size_t)n >= cap - 1) return;
+        va_list ap;
+        va_start(ap, fmt);
+        const int w = vsnprintf(out + n, cap - (size_t)n, fmt, ap);
+        va_end(ap);
+        if (w <= 0) return;
+        n += w;
+        if ((size_t)n > cap - 1) n = (int)cap - 1;
+    };
+
+    if (MemWatchLo > MemWatchHi)
+    {
+        put("  main-ram watch: off\n");
+        return n;
+    }
+
+    put("  main-ram watch %08X..%08X: %llu overlapping store(s), first %d:\n",
+        MemWatchLo, MemWatchHi, (unsigned long long)MemWatchTotal, MemWatchN);
+
+    for (int i = 0; i < MemWatchN; i++)
+    {
+        const MemWatchHit& h = MemWatchHits[i];
+        put("    arm%d %u-byte store %08X <- %08X @pc %08X lr=%08X cpsr=%08X\n",
+            h._pad ? 7 : 9, h.size, h.addr, h.val, h.pc, h.lr, h.cpsr);
+
+        if (i >= kMemWatchVerbose) continue;
+        for (int r = 0; r < 16; r += 4)
+        {
+            put("        r%-2d %08X  r%-2d %08X  r%-2d %08X  r%-2d %08X\n",
+                r, h.regs[r], r+1, h.regs[r+1], r+2, h.regs[r+2], r+3, h.regs[r+3]);
+        }
+    }
+
+    return n;
+}
+
+void NDS::SetPcTrace(int cpu, u32 lo, u32 hi)
+{
+    /* Runs on the control channel's thread while the CPU thread is inside
+       md_run_frame. It only records the request and publishes it; the CPU
+       thread applies it at the top of its next frame (ApplyPcTraceRequest), so
+       nothing the CPU thread is walking is touched from here. An earlier
+       version cleared and (worse) an earlier one reallocated the recorder here
+       and the app died with SIGSEGV; keeping all mutation on the CPU thread is
+       the fix, not a wider lock. */
+    PcTraceReqCpu = (lo >= hi) ? -1 : ((cpu == 1) ? 1 : 0);
+    PcTraceReqLo = (lo >= hi) ? 1u : lo;
+    PcTraceReqHi = (lo >= hi) ? 0u : hi;
+    PcTraceReqGen.fetch_add(1, std::memory_order_release);
+}
+
+void NDS::ApplyPcTraceRequest()
+{
+    const u64 gen = PcTraceReqGen.load(std::memory_order_acquire);
+    if (gen == PcTraceAppliedGen) return;
+    PcTraceAppliedGen = gen;
+    PcTraceCpu = PcTraceReqCpu;
+    PcTraceLo = PcTraceReqLo;
+    PcTraceHi = PcTraceReqHi;
+    PcTraceN = 0;
+    PcTraceTotal = 0;
+    PcTraceFirstFrame = NumFrames;
+}
+
+void NDS::RecordPcVisit(int cpu, u32 pc, u32 lr)
+{
+    if (PcTraceCpu != cpu) return;
+    if (pc < PcTraceLo || pc >= PcTraceHi) return;
+
+    ARM* arm = cpu ? static_cast<ARM*>(&ARM7) : static_cast<ARM*>(&ARM9);
+    PcTraceEntry& e = PcTraceRing[PcTraceTotal % (u64)kPcTraceRing];
+    e.pc = pc;
+    e.lr = lr;
+    e.cpsr = arm->CPSR;
+    e.r0 = arm->R[0];
+    e.r1 = arm->R[1];
+    e.r2 = arm->R[2];
+    e.r3 = arm->R[3];
+    PcTraceTotal++;
+    if (PcTraceN < kPcTraceRing) PcTraceN++;
+}
+
+int NDS::FormatPcTrace(char* out, size_t cap) const
+{
+    if (!out || cap < 128) return -1;
+
+    int n = 0;
+    const auto put = [&](const char* fmt, ...) {
+        if ((size_t)n >= cap - 1) return;
+        va_list ap;
+        va_start(ap, fmt);
+        const int w = vsnprintf(out + n, cap - (size_t)n, fmt, ap);
+        va_end(ap);
+        if (w <= 0) return;
+        n += w;
+        if ((size_t)n > cap - 1) n = (int)cap - 1;
+    };
+
+    if (PcTraceCpu < 0 || PcTraceLo >= PcTraceHi)
+    {
+        put("  arm%d path trace: off\n", PcTraceCpu == 1 ? 7 : 9);
+        return n;
+    }
+
+    const u64 total = PcTraceTotal;
+    const int kept = PcTraceN;
+    /* Chronological from the oldest surviving entry: once the ring has wrapped,
+       the oldest is at `total % kPcTraceRing` and the newest just before it. */
+    const int first = (total >= (u64)kPcTraceRing)
+                    ? (int)(total % (u64)kPcTraceRing) : 0;
+    const u32 lastFrame = NumFrames;
+
+    put("  arm%d path trace %08X..%08X: %llu visit(s), last %d kept, frame %u..%u\n",
+        PcTraceCpu == 1 ? 7 : 9, PcTraceLo, PcTraceHi,
+        (unsigned long long)total, kept, PcTraceFirstFrame, lastFrame);
+
+    /* The high-level path: each 4 KiB band the retained history touches, in the
+       order it is first reached there. This is where the console went, without
+       the intra-function churn. */
+    {
+        static const int kMaxBands = 1024;
+        u32 seen[kMaxBands];
+        int nseen = 0;
+        for (int k = 0; k < kept; k++)
+        {
+            const u32 band = PcTraceRing[(first + k) % kPcTraceRing].pc & 0xFFFFF000u;
+            bool have = false;
+            for (int s = 0; s < nseen; s++) if (seen[s] == band) { have = true; break; }
+            if (!have && nseen < kMaxBands) seen[nseen++] = band;
+        }
+        put("  code regions reached, in order (%d):\n", nseen);
+        for (int s = 0; s < nseen; s++) put("    %08X\n", seen[s]);
+    }
+
+    /* The tail, with the state each visit ran on: pc lr cpsr r0 r1 r2 r3. This
+       is the report's whole point - the branch's own inputs, not a guess about
+       them - so it is printed for the last few hundred visits. */
+    const int tail = kept < 320 ? kept : 320;
+    put("  last %d visit(s), in order (pc lr cpsr r0 r1 r2 r3):\n", tail);
+    for (int k = kept - tail; k < kept; k++)
+    {
+        const PcTraceEntry& e = PcTraceRing[(first + k) % kPcTraceRing];
+        put("    %08X %08X %08X %08X %08X %08X %08X\n",
+            e.pc, e.lr, e.cpsr, e.r0, e.r1, e.r2, e.r3);
+    }
+
+    return n;
+}
+
 void NDS::Reset()
 {
+    /* A trace armed across a boot should follow the console that comes out of
+       the boot, not the one it replaced, and the reset is that boundary. Only
+       the CPU thread runs Reset, so the recorder may be reset here directly. */
+    if (PcTraceCpu >= 0)
+    {
+        PcTraceN = 0;
+        PcTraceTotal = 0;
+        PcTraceFirstFrame = NumFrames;
+    }
+
     Platform::FileHandle* f;
     u32 i;
 
@@ -503,10 +1069,30 @@ void NDS::Reset()
 
     IPCSync9 = 0;
     IPCSync7 = 0;
+    DPBootChild = false;
     IPCFIFOCnt9 = 0;
     IPCFIFOCnt7 = 0;
     IPCFIFO9.Clear();
     IPCFIFO7.Clear();
+
+    /* The FIFO traffic readouts are published as "since boot" (see
+       GetIPCTraffic and FormatIPCTrace), and Reset() is that boot boundary:
+       clearing the FIFOs while keeping their counters is the one combination
+       that lies. A Download Play child crosses this Reset() to boot the image
+       it downloaded, so without this its post-boot IPC traffic cannot be told
+       apart from the firmware Download Play client's that came before it -
+       measured live at the hand-off, the booted child's own 17 words sat
+       inside counters reading 103 and 205,847 (logs/audit5_finding.txt). The
+       wifi register record is already per-boot (Wifi::Reset clears MPIo); this
+       is the same rule for the IPC record. */
+    IPCSent9 = 0;
+    IPCSent7 = 0;
+    IPCRecv9 = 0;
+    IPCRecv7 = 0;
+    IPCTraceN9 = 0;
+    IPCTraceN7 = 0;
+    memset(IPCTrace9, 0, sizeof(IPCTrace9));
+    memset(IPCTrace7, 0, sizeof(IPCTrace7));
 
     DivCnt = 0;
     SqrtCnt = 0;
@@ -926,6 +1512,11 @@ template <CPUExecuteMode cpuMode>
 u32 NDS::RunFrame()
 {
     Current = this;
+
+    /* Apply any pending path-trace arm/disarm here, on the CPU thread, before
+       either CPU executes: the control channel only publishes a request (see
+       SetPcTrace), so the recorder's state is never mutated from two threads. */
+    ApplyPcTraceRequest();
 
     FrameStartTimestamp = SysTimestamp;
 
@@ -2161,6 +2752,7 @@ void NDS::ARM9Write8(u32 addr, u8 val)
     {
     case 0x02000000:
         JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(addr);
+        if (MemWatchLo <= MemWatchHi) RecordMemWatch(0, addr, val, 1);
         *(u8*)&MainRAM[addr & MainRAMMask] = val;
         return;
 
@@ -2202,6 +2794,7 @@ void NDS::ARM9Write16(u32 addr, u16 val)
     {
     case 0x02000000:
         JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(addr);
+        if (MemWatchLo <= MemWatchHi) RecordMemWatch(0, addr, val, 2);
         *(u16*)&MainRAM[addr & MainRAMMask] = val;
         return;
 
@@ -2262,6 +2855,7 @@ void NDS::ARM9Write32(u32 addr, u32 val)
     {
     case 0x02000000:
         JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(addr);
+        if (MemWatchLo <= MemWatchHi) RecordMemWatch(0, addr, val, 4);
         *(u32*)&MainRAM[addr & MainRAMMask] = val;
         return ;
 
@@ -2557,6 +3151,7 @@ void NDS::ARM7Write8(u32 addr, u8 val)
     case 0x02000000:
     case 0x02800000:
         JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr);
+        if (MemWatchLo <= MemWatchHi) RecordMemWatch(1, addr, val, 1);
         *(u8*)&MainRAM[addr & MainRAMMask] = val;
         return;
 
@@ -2576,6 +3171,7 @@ void NDS::ARM7Write8(u32 addr, u8 val)
 
     case 0x03800000:
         JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr);
+        if (MemWatchLo <= MemWatchHi) RecordMemWatch(1, addr, val, 1);
         *(u8*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)] = val;
         return;
 
@@ -2616,6 +3212,7 @@ void NDS::ARM7Write16(u32 addr, u16 val)
     case 0x02000000:
     case 0x02800000:
         JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr);
+        if (MemWatchLo <= MemWatchHi) RecordMemWatch(1, addr, val, 2);
         *(u16*)&MainRAM[addr & MainRAMMask] = val;
         return;
 
@@ -2635,6 +3232,7 @@ void NDS::ARM7Write16(u32 addr, u16 val)
 
     case 0x03800000:
         JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr);
+        if (MemWatchLo <= MemWatchHi) RecordMemWatch(1, addr, val, 2);
         *(u16*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)] = val;
         return;
 
@@ -2686,6 +3284,7 @@ void NDS::ARM7Write32(u32 addr, u32 val)
     case 0x02000000:
     case 0x02800000:
         JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr);
+        if (MemWatchLo <= MemWatchHi) RecordMemWatch(1, addr, val, 4);
         *(u32*)&MainRAM[addr & MainRAMMask] = val;
         return;
 
@@ -2705,6 +3304,7 @@ void NDS::ARM7Write32(u32 addr, u32 val)
 
     case 0x03800000:
         JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr);
+        if (MemWatchLo <= MemWatchHi) RecordMemWatch(1, addr, val, 4);
         *(u32*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)] = val;
         return;
 
@@ -3108,6 +3708,7 @@ u32 NDS::ARM9IORead32(u32 addr)
             else
             {
                 ret = IPCFIFO7.Read();
+                IPCRecv9++;
 
                 if (IPCFIFO7.IsEmpty() && (IPCFIFOCnt7 & 0x0004))
                     SetIRQ(1, IRQ_IPCSendDone);
@@ -3513,6 +4114,8 @@ void NDS::ARM9IOWrite32(u32 addr, u32 val)
             {
                 bool wasempty = IPCFIFO9.IsEmpty();
                 IPCFIFO9.Write(val);
+                IPCSent9++;
+                RecordIPCTrace(0, val);
                 if ((IPCFIFOCnt7 & 0x0400) && wasempty)
                     SetIRQ(1, IRQ_IPCRecv);
             }
@@ -3819,6 +4422,7 @@ u32 NDS::ARM7IORead32(u32 addr)
             else
             {
                 ret = IPCFIFO9.Read();
+                IPCRecv7++;
 
                 if (IPCFIFO9.IsEmpty() && (IPCFIFOCnt9 & 0x0004))
                     SetIRQ(0, IRQ_IPCSendDone);
@@ -4147,6 +4751,8 @@ void NDS::ARM7IOWrite32(u32 addr, u32 val)
             {
                 bool wasempty = IPCFIFO7.IsEmpty();
                 IPCFIFO7.Write(val);
+                IPCSent7++;
+                RecordIPCTrace(1, val);
                 if ((IPCFIFOCnt9 & 0x0400) && wasempty)
                     SetIRQ(0, IRQ_IPCRecv);
             }

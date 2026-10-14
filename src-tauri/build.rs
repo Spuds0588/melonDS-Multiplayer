@@ -131,6 +131,12 @@ fn main() {
         "src/NDS.h",
         "src/GPU.cpp",
         "src/GPU.h",
+        // The CPU and its CP15: an edit here changes what the emulator does
+        // with every access, and the archives are still the same files cargo
+        // already saw, so without these two names the host links stale.
+        "src/ARM.cpp",
+        "src/ARM.h",
+        "src/CP15.cpp",
     ] {
         println!("cargo:rerun-if-changed={}", project_root.join(watch).display());
     }

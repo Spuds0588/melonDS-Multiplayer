@@ -22,6 +22,14 @@ console, click UI, read the emulated screens as text, and save screenshots.
     tools/appctl.py index 2 && tools/appctl.py tap KeyA
     tools/appctl.py script tools/scripts/example.txt
 
+A route that has to wait for the *game* can wait on the picture instead of on a
+frame count, which is what every earlier route in this project guessed at:
+
+    h=$(tools/appctl.py digest --player 2)     # before the tap
+    tools/appctl.py touch 122 64 --player 2
+    tools/appctl.py waitfor --change "$h" --player 2   # did it land, and when
+    tools/appctl.py waitfor --settle --player 1        # wait out the transition
+
 Button names (see MD_BTN_* in src-tauri/src/lib.rs):
     a b select start right left up down r l x y     (compose with '+': up+a)
     or a raw mask in hex: 0x1
@@ -244,7 +252,10 @@ def cmd_ping(ch, args):
 def cmd_status(ch, args):
     st = ch.call(cmd="status")
     if not st.get("active"):
-        return json.dumps(st)
+        # The channel's own answer for "nothing is running" is `{active: false}`;
+        # printing it raw made the idle app the one place this command did not
+        # answer like a sentence (found driving the empty state, 2026-09-30).
+        return "(no session: no console is running)"
     frames = ", ".join(f"p{f['player']}@{f['seq']}" for f in st["frames"])
     return (
         f"session: {st['players']} player(s), {st['rom']}\n"
@@ -260,6 +271,183 @@ def cmd_ui(ch, args):
 def cmd_wifiio(ch, args):
     """What the console's own game is reading out of its wireless block."""
     return ch.call(cmd="wifiio", player=args.player)
+
+
+def cmd_memwatch(ch, args):
+    """Which instruction stores into a span of this console's own main RAM.
+
+    Arms a store watch on [lo, hi] (inclusive) and prints the stores that land
+    in it with the writer's PC, LR and CPSR. This answers "who wrote this
+    variable" when the writer reaches it through a computed pointer, so the
+    address has no literal in the code to search for. Off with `--off`, and only
+    held while the session's console is running - arming clears the hits, and the
+    first 64 are kept. The JIT writes main RAM on its fast path, so a session
+    started with MD_NOJIT=1 is the one where this sees every store.
+    """
+    req = {"cmd": "memwatch", "player": args.player}
+    if not args.off and args.lo is not None and args.hi is not None:
+        req["lo"] = args.lo
+        req["hi"] = args.hi
+    return ch.call(**req)
+
+
+def cmd_pctrace(ch, args):
+    """The code path one CPU ran over a window, in the order it first ran it.
+
+    Arms a PC recorder on `[lo, hi)` and prints the ordered path: the 4 KiB
+    code regions it entered in order, then the last few hundred visits as
+    (pc lr cpsr r0 r1 r2 r3). A downloaded image that boots, does its wireless
+    bring-up and then declines a session has left that decision behind by the
+    time anything is parked, so a snapshot cannot show it - this answers "which
+    code did it run on the way", which is where a give-up branch lives.
+
+    The PC is a real guest address in every execution mode: it is the address
+    the CPU is about to run, taken from the same value the JIT dispatches on. So
+    under the shipped JIT a whole basic block is one entry (each a real PC),
+    while on the interpreter (MD_NOJIT=1) every instruction is one. Run it in the
+    shipped JIT config: the interpreter changes the timing and, for a link, where
+    the console parks.
+
+    Off with `--off`, and only held while the console is running. Arming is
+    applied by the CPU thread at the top of its next frame, so this command
+    waits a few frames before reading the report back.
+    """
+    req = {"cmd": "pctrace", "player": args.player, "cpu": args.cpu}
+    if args.off:
+        req["off"] = True
+    elif args.lo is not None and args.hi is not None:
+        req["lo"] = args.lo
+        req["hi"] = args.hi
+    return ch.call(**req)
+
+
+def cmd_probe(ch, args):
+    """A console's CPUs and interrupts as numbers: where each is and whether it
+    can take an interrupt.
+
+    The five-second digest carries the program counters, but five seconds is the
+    wrong resolution for "is this CPU stuck in that loop, or visiting it?" - so
+    a caller samples them as fast as it can talk. `pc9`/`lr9` name where the
+    game is; `arm9_ime`/`ie`/`if` say whether a pending interrupt could move it.
+    """
+    out = ch.call(cmd="probe", player=args.player)
+    r9 = out["regs9"]
+    r7 = out["regs7"]
+    names = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+             "r8", "r9", "r10", "r11", "r12", "sp", "lr", "pc"]
+    lines = [
+        f"p{out['player']} frame {out['frames']} asleep={out['asleep']} "
+        f"pc9 {out['pc9']} lr9 {out['lr9']} sp9 {out['sp9']} · pc7 {out['pc7']}",
+        "  ARM9  " + " ".join(f"{n}={v}" for n, v in zip(names, r9)),
+        "  ARM7  " + " ".join(f"{n}={v}" for n, v in zip(names, r7)),
+        f"  irq: can_take={out['arm9_can_take_irq']} IME={out['arm9_ime']} "
+        f"IE={out['arm9_ie']} IF={out['arm9_if']} vblank_pending={out['arm9_vblank_pending']}",
+        f"  lcd: powcnt1={out['powcnt1']} dispcntA={out['dispcnt_a']} "
+        f"dispcntB={out['dispcnt_b']} vcount={out['vcount']}",
+    ]
+    mp = out.get("mp", {})
+    if mp:
+        lines.append(
+            f"  mp: cmds tx {mp.get('cmds_tx')} acks {mp.get('acks_tx')} "
+            f"collected {mp.get('collected')} empty {mp.get('empty')} "
+            f"clientfail {mp.get('clientfail')} deauth out {mp.get('deauth_out')}"
+        )
+    ipc = out.get("ipc", {})
+    if ipc:
+        lines.append(
+            f"  ipc: 9sends {ipc.get('arm9_sends')} 9recvs {ipc.get('arm9_recvs')} "
+            f"7sends {ipc.get('arm7_sends')} 7recvs {ipc.get('arm7_recvs')} "
+            f"fifocnt9 {ipc.get('fifocnt9')} fifocnt7 {ipc.get('fifocnt7')}"
+        )
+    return "\n".join(lines)
+
+
+def cmd_dpjoiner(ch, args):
+    """The synthesized single-card Download Play joiner, as numbers.
+
+    Present only for a title whose profile says `download_play` (Star Fox
+    Command, ASFE). Arming is the Settings per-game switch, not a knob here, so
+    a disarmed joiner prints all zeros - which is the gate's proof: off means
+    zero bus operations, not "nothing visible". `--player` moves which console
+    acts as the Download Play client.
+    """
+    req = {"cmd": "dpjoiner"}
+    if args.player is not None:
+        req["player"] = args.player - 1
+    out = ch.call(**req)
+    if not out.get("present"):
+        return out.get("note", "no download-play joiner on this title")
+    out_line = (
+        f"download-play joiner: console {out['joiner']}, "
+        f"{'armed' if out['armed'] else 'DISARMED'}\n"
+        f"  beacons {out['beacons']} · auth sent {out['authSent']} / recv {out['authRecv']} · "
+        f"assoc sent {out['assocSent']} / recv {out['assocRecv']} · "
+        f"replies sent {out.get('repliesSent', 0)} · "
+        f"other host frames {out['hostFrames']}\n"
+        f"  last auth status {out['lastAuthStatus']:#06x}"
+        f" (0 = accepted, non-zero = refused)\n"
+        f"  last assoc status {out.get('lastAssocStatus', 0):#06x}, AID {out.get('lastAssocAid', 0):#06x}"
+        f" (status 0 with a nonzero AID = the host registered this client)\n"
+        f"  host commands {out.get('commandsRecv', 0)} (last {out.get('lastCommand', 0):#04x}, "
+        f"slave flags {out.get('lastCmdSlaveFlags', 0):#06x}) · acks {out.get('acksRecv', 0)}, "
+        f"our reply collected {out.get('repliesCollected', 0)} times\n"
+        f"  download: {out.get('imageBytes', 0)} of {out.get('imageTotalBytes', 0)} bytes "
+        f"in {out.get('imagePackets', 0)} distinct packets · next wanted #"
+        f"{out.get('imageNext', 0)}"
+        f" · {'BOOTED' if out.get('booted') else 'not booted'}"
+    )
+    if out.get("deauths"):
+        out_line += (
+            f"\n  deauths from the host {out['deauths']} "
+            f"(last reason {out['lastDeauthReason']:#06x} - the host refused the association)"
+        )
+    return out_line
+
+
+def cmd_mem(ch, args):
+    """Read a console's main RAM through the bridge (the memory-read instrument).
+
+    Answers the ARM9's own 32-bit words at that address, which is how a game's
+    state becomes a number instead of an inference from a picture - a parked
+    game and a busy one look identical from the screen. `addr` is hex, with or
+    without `0x`, and both it and the length are multiples of 4.
+    """
+    out = ch.call(cmd="mem", player=args.player, addr=args.addr, len=args.len,
+                  cpu=args.cpu)
+    words = out["words"]
+    base = int(out["addr"], 16)
+    # The CPU is named in the answer, not assumed: an ARM7 read and an ARM9 read
+    # of the same number are different consoles' memories.
+    lines = [f"p{out['player']} {'ARM7' if out.get('cpu') == 7 else 'ARM9'} "
+             f"{out['addr']} ({out['len']} bytes)"]
+    for i in range(0, len(words), 4):
+        row = " ".join(words[i:i + 4])
+        lines.append(f"  {base + i * 4:08X}  {row}")
+    return "\n".join(lines)
+
+
+def cmd_poke(ch, args):
+    """Write a console's own variable, then answer it as it now stands.
+
+    The write half of `mem`. A read can show that a loop's exit condition is
+    false; only changing the value it tests can show that the loop is what
+    holds the console. `words` is a list of hex 32-bit words, so a variable
+    reads as it will in `mem` rather than as raw bytes.
+    """
+    out = ch.call(cmd="poke", player=args.player, addr=args.addr, words=args.words,
+                  cpu=args.cpu)
+    words = out["words"]
+    base = int(out["addr"], 16)
+    # The count comes from the answer, not from re-splitting the argument: the
+    # server also accepts comma-separated words, so `len(args.words.split())`
+    # would report "wrote 1" for two words the console did take.
+    # The CPU is named, like `mem`'s: an ARM7 write and an ARM9 write of the
+    # same number are different consoles' memories.
+    lines = [f"p{out['player']} {'ARM7' if out.get('cpu') == 7 else 'ARM9'} "
+             f"{out['addr']} ({out['len']} bytes, wrote {len(words)})"]
+    for i in range(0, len(words), 4):
+        lines.append(f"  {base + i * 4:08X}  {' '.join(words[i:i + 4])}")
+    return "\n".join(lines)
 
 
 def cmd_vary(ch, args):
@@ -297,6 +485,44 @@ def cmd_see(ch, args):
 def cmd_shot(ch, args):
     out = ch.call(cmd="shot", name=args.name)
     return f"{out['path']} ({out['bytes']} bytes)"
+
+
+def screen_digest(ch, player):
+    """A hash of one console's two screens as they are right now.
+
+    The channel has no "what is on this console's screen" query, and reading one
+    as ASCII is a lossy downscale; a shot is exact and already exists. The
+    composite PNG is 512x384 - player N's screens are the 256x384 column at
+    (N-1)*256 - so a digest is the decoded pixels of one column, not the PNG
+    bytes (which change with the encoder, not the picture).
+    """
+    import hashlib
+
+    from PIL import Image
+
+    out = ch.call(cmd="shot", name="digest")
+    im = Image.open(out["path"]).convert("RGB")
+    left = (player - 1) * 256
+    if left + 256 > im.width:
+        raise SystemExit(
+            f"digest: player {player} is out of range: this shot has {im.width // 256} console(s)"
+        )
+    return hashlib.md5(im.crop((left, 0, left + 256, im.height)).tobytes()).hexdigest()
+
+
+def cmd_digest(ch, args):
+    """Print the digest of one console's screens (hand it to `waitfor --change`).
+
+    This is the missing half of a scripted route. Every route in this project
+    was written as a fixed list of frames, and the frames are a guess: a tap
+    that lands on nothing and a tap that works look the same to the driver, and
+    the guest join in a Metroid Prime Hunters lobby takes seven seconds at one
+    moment and five at another (2026-09-29), so a route that slept five either
+    went on too early or, worse, went on late - the lobby drops an idle guest
+    after a minute or two, and the route then drives a console that is not there
+    any more. Ask for the digest, act, then wait on it.
+    """
+    return screen_digest(ch, args.player)
 
 
 def cmd_quit(ch, args):
@@ -451,8 +677,11 @@ def cmd_bands(ch, args):
 
 
 def cmd_sleep(ch, args):
-    ch.call(cmd="sleep", ms=args.ms)
-    return f"slept {args.ms}ms"
+    ms = args.ms if args.ms is not None else (args.count if args.count is not None else 100)
+    if ms < 0:
+        raise SystemExit("sleep: milliseconds cannot be negative")
+    ch.call(cmd="sleep", ms=ms)
+    return f"slept {ms}ms"
 
 
 def cmd_advance(ch, args):
@@ -497,15 +726,53 @@ def cmd_advance(ch, args):
 
 
 def cmd_waitfor(ch, args):
+    """Wait for one of three things: window text, a settled screen, a change.
+
+    `waitfor TEXT` reads the window's status line, which is the whole of what
+    the app says about itself. `--settle` waits until a console's picture stops
+    changing, which is how a caller finds the end of a menu transition without
+    naming a frame, and `--change DIGEST` waits until it is no longer what
+    `digest` returned - the answer to "did that tap land anywhere", which no
+    frame count can give (a tap that lands on nothing still costs its frames).
+    """
+    want = [bool(args.text), args.settle, bool(args.change)]
+    if sum(want) != 1:
+        raise SystemExit(
+            "waitfor: give exactly one of TEXT, --settle or --change DIGEST "
+            "(see --help)"
+        )
     start = time.time()
+    prev = None
     while time.time() - start < args.timeout:
-        ui = json.loads(ch.call(cmd="ui"))
-        hay = ui.get("status", "") + " " + (ui.get("active") or "")
-        if args.text in hay:
-            return f"found {args.text!r} after {time.time() - start:.1f}s: {ui.get('status')!r}"
+        if args.text:
+            ui = json.loads(ch.call(cmd="ui"))
+            hay = ui.get("status", "") + " " + (ui.get("active") or "")
+            if args.text in hay:
+                return f"found {args.text!r} after {time.time() - start:.1f}s: {ui.get('status')!r}"
+        elif args.change:
+            now = screen_digest(ch, args.player)
+            if now != args.change:
+                return (f"player {args.player} screen changed after "
+                        f"{time.time() - start:.1f}s: {now}")
+        else:
+            now = screen_digest(ch, args.player)
+            if prev is not None and now == prev:
+                return (f"player {args.player} screen settled after "
+                        f"{time.time() - start:.1f}s: {now}")
+            prev = now
         time.sleep(0.2)
-    last = json.loads(ch.call(cmd="ui"))
-    raise SystemExit(f"never saw {args.text!r} in {args.timeout}s; status is {last.get('status')!r}")
+    if args.text:
+        last = json.loads(ch.call(cmd="ui"))
+        raise SystemExit(f"never saw {args.text!r} in {args.timeout}s; status is {last.get('status')!r}")
+    if args.change:
+        raise SystemExit(
+            f"player {args.player} screen was still {args.change} after {args.timeout}s "
+            "- the step before this one did not land"
+        )
+    raise SystemExit(
+        f"player {args.player} screen never settled in {args.timeout}s "
+        "- something on it is animating"
+    )
 
 
 SCRIPT_SKIP = {"script"}
@@ -604,9 +871,52 @@ def build_parser():
     p.add_argument("--dir", default="logs/shots")
     p.set_defaults(func=cmd_window)
 
+    p = sub.add_parser("dpjoiner", help="the synthesized Download Play joiner: its frame counters, and which console is the client")
+    p.add_argument("--player", type=int, help="1-based console that acts as the Download Play client (default: the last one)")
+    p.set_defaults(func=cmd_dpjoiner)
+
     p = sub.add_parser("wifiio", help="what the console's game reads out of its wifi block (registers, in order, and the frame it was handed)")
     p.add_argument("--player", type=int, default=1)
     p.set_defaults(func=cmd_wifiio)
+
+    p = sub.add_parser("memwatch", help="which instruction stores into a span of this console's own main RAM")
+    p.add_argument("lo", nargs="?", help="hex low address of the window (e.g. 023722E0)")
+    p.add_argument("hi", nargs="?", help="hex high address, inclusive (e.g. 023722E3)")
+    p.add_argument("--off", action="store_true", help="disarm and just report the hits so far")
+    p.add_argument("--player", type=int, default=1)
+    p.set_defaults(func=cmd_memwatch)
+
+    p = sub.add_parser("pctrace", help="the code path one CPU ran over a window, in order (which code did the console run)")
+    p.add_argument("lo", nargs="?", help="hex low address of the window (e.g. 02000000)")
+    p.add_argument("hi", nargs="?", help="hex high address, exclusive (e.g. 02400000)")
+    p.add_argument("--cpu", type=int, choices=(9, 7), default=9, help="which CPU to trace (default 9)")
+    p.add_argument("--off", action="store_true", help="disarm and just report the path so far")
+    p.add_argument("--player", type=int, default=1)
+    p.set_defaults(func=cmd_pctrace)
+
+    p = sub.add_parser("probe", help="a console's CPUs, registers, interrupts and MP counters right now")
+    p.add_argument("--player", type=int, default=1)
+    p.set_defaults(func=cmd_probe)
+
+    p = sub.add_parser("mem", help="read a console's main RAM (hex addr, multiple of 4) - the game's own state, not its picture")
+    p.add_argument("addr", help="hex address, with or without 0x, multiple of 4 (e.g. 02000000)")
+    p.add_argument("len", nargs="?", type=int, default=16, help="bytes to read, multiple of 4 (default 16, max 4096)")
+    p.add_argument("--player", type=int, default=1)
+    p.add_argument("--cpu", type=int, choices=[9, 7], default=9,
+                   help="which CPU's address space to read: 9 = ARM9 main RAM "
+                        "(default), 7 = ARM7 (WRAM 0x03800000, the game's own ARM7 "
+                        "image at 0x06000000), which an ARM9 read cannot see")
+    p.set_defaults(func=cmd_mem)
+
+    p = sub.add_parser("poke", help="write a console's own variable (hex words) - the write half of mem, for testing a poll")
+    p.add_argument("addr", help="hex word address, multiple of 4 (e.g. 021732AC)")
+    p.add_argument("words", help="hex 32-bit words, space/comma separated (e.g. '0000003E 00000000')")
+    p.add_argument("--player", type=int, default=1)
+    p.add_argument("--cpu", type=int, choices=[9, 7], default=9,
+                   help="which CPU's address space to write: 9 = ARM9 main RAM "
+                        "(default), 7 = ARM7 (WRAM 0x03800000, the game's own ARM7 "
+                        "image at 0x06000000), which an ARM9 write cannot reach")
+    p.set_defaults(func=cmd_poke)
 
     p = sub.add_parser("vary", help="perturb one input of the parked handshake: body (replace the body bytes this console's game reads), off")
     p.add_argument("kind", choices=["off", "body"])
@@ -669,8 +979,13 @@ def build_parser():
     p.add_argument("--rows", type=int, default=12, help="edges per row to call it text (default 12)")
     p.set_defaults(func=cmd_bands)
 
-    p = sub.add_parser("sleep", help="wait, in milliseconds")
-    p.add_argument("ms", type=int)
+    p = sub.add_parser("sleep", help="wait, in milliseconds: sleep 500, or --ms 500")
+    # Every other command that takes a duration spells it `--ms` (`press --ms`,
+    # `tap --ms`, `touch --ms`), and `sleep --ms 500` - the form that spelling
+    # invites - died in argparse with a usage dump (2026-09-29 playtest). Both
+    # forms work now, the way `advance` already accepts a bare count and a flag.
+    p.add_argument("count", nargs="?", type=int, metavar="MS", help="milliseconds (same as --ms)")
+    p.add_argument("--ms", type=int, help="milliseconds (default 100)")
     p.set_defaults(func=cmd_sleep)
 
     p = sub.add_parser("advance", help="wait for a console to run more frames: advance N, or --frames N")
@@ -685,10 +1000,19 @@ def build_parser():
                    help="seconds to wait (default: sized from the frame count at ~60 fps)")
     p.set_defaults(func=cmd_advance)
 
-    p = sub.add_parser("waitfor", help="wait for text to appear in the window's status line")
-    p.add_argument("text")
+    p = sub.add_parser("waitfor", help="wait for window text, a settled screen, or a screen change")
+    p.add_argument("text", nargs="?", help="text to appear in the window's status line")
+    p.add_argument("--settle", action="store_true",
+                   help="wait until a console's picture stops changing")
+    p.add_argument("--change", metavar="DIGEST",
+                   help="wait until a console's picture differs from this digest (see `digest`)")
+    p.add_argument("--player", type=int, default=1, help="for --settle/--change (1-based)")
     p.add_argument("--timeout", type=float, default=20.0)
     p.set_defaults(func=cmd_waitfor)
+
+    p = sub.add_parser("digest", help="hash a console's screens now (for `waitfor --change`)")
+    p.add_argument("--player", type=int, default=1, help="1-based")
+    p.set_defaults(func=cmd_digest)
 
     p = sub.add_parser("script", help="run a file of these commands, one per line")
     p.add_argument("file")

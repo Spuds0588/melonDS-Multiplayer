@@ -25,6 +25,37 @@
 #                           Both are forwarded explicitly: a knob this script does
 #                           not name never reaches the app, which is how the
 #                           budget override came to look like it did nothing.
+#   MD_DP_REPLY_MUTE=1 the Download Play joiner associates and then answers
+#                     nothing at all (nothing before the association changes).
+#                     The diagnostic arm for "does the host's own phase machine
+#                     advance by itself, or because of what this client sends?"
+#   MD_DP_REPLY_FORCE=<hex> the Download Play joiner answers a post-RSA command
+#                     it has no specific reply for with a normal reply whose
+#                     third body byte is this reply type. The host's per-client
+#                     mode machine dispatches on that byte (Username 07,
+#                     RsaReply 08), so sweeping it names the reply the host
+#                     waits for at each mode. Unset keeps the measured default:
+#                     the RsaReply that carries the host from mode 14 to mode 6
+#                     and starts the download.
+#   MD_DP_REPLY_FORCE_DATA=<hex> the same override applied to the 04 DataPacket
+#                     rounds only, so the download's later packet loop can be
+#                     swept without disturbing the RsaReply that reaches mode 6.
+#   MD_DP_PLAYER_BODY=1 the Download Play joiner answers one post-boot 00 poll
+#                     with a UsernameReply (nickname) instead of the repeated
+#                     RsaReply, testing whether a plausible guest player body
+#                     advances the host's roster past Recruitment (default off).
+#   MD_MP_REDELIVER=1  the reference arm of the hand-over-once guard: hand one
+#                     held frame to the console's game a second time, so the
+#                     guard's counter and REDELIVERED line can be seen to fire
+#                     instead of only never firing (default off).
+#   MD_KICK_AFTER_WINDOWS  consecutive stalled health windows before the watchdog
+#                     resyncs a console's bus state (default 2; 0 = never). A
+#                     console *waiting for a peer to associate* looks stalled
+#                     window for window, and kicking it then discards the
+#                     replies it goes on to miss - the 2026-09-25 MKDS join was
+#                     broken this way, and MPH's four-console join reproduces it
+#                     (history.md v0.1.9az). Set 0 while bringing several guests
+#                     in at once.
 #   MD_CONTROL_PORT   test-drive control channel port (default 7373; empty string
 #                     turns it off). tools/appctl.py speaks it: press buttons,
 #                     inject input, read the DS screens back as text, screenshots.
@@ -100,13 +131,21 @@ setsid nohup bash -c '
   RUST_LOG="$1" MD_AUTOSTART_PLAYERS="$2" MD_AUTOSTART_ROM="$3" \
     MD_CONTROL_PORT="$5" MD_LOG="$6" \
     MD_LINK_VERBOSE="${MD_LINK_VERBOSE:-}" \
+    MD_NOJIT="${MD_NOJIT:-}" \
     MD_LINK_PROBE="${MD_LINK_PROBE:-}" \
     MD_CMD_RETRY_NOTIFY="${MD_CMD_RETRY_NOTIFY:-}" \
     MD_REPLY_TIMEOUT_MS="${MD_REPLY_TIMEOUT_MS:-}" \
     MD_REPLY_BUDGET_FRAMES="${MD_REPLY_BUDGET_FRAMES:-}" \
     MD_MP_FCS="${MD_MP_FCS:-}" MD_STOCK_MP="${MD_STOCK_MP:-}" \
     MD_RX_NOCROP="${MD_RX_NOCROP:-}" \
+    MD_MP_REDELIVER="${MD_MP_REDELIVER:-}" \
     MD_REPLY_KEEP="${MD_REPLY_KEEP:-}" MD_ARM_PERSIST="${MD_ARM_PERSIST:-}" \
+    MD_DP_REPLY_MUTE="${MD_DP_REPLY_MUTE:-}" \
+    MD_DP_REPLY_FORCE="${MD_DP_REPLY_FORCE:-}" \
+    MD_DP_REPLY_FORCE_DATA="${MD_DP_REPLY_FORCE_DATA:-}" \
+    MD_DP_PLAYER_BODY="${MD_DP_PLAYER_BODY:-}" \
+    MD_SAME_ROUND_REPLY="${MD_SAME_ROUND_REPLY:-}" \
+    MD_KICK_AFTER_WINDOWS="${MD_KICK_AFTER_WINDOWS:-}" \
     MD_SHOTS_DIR="${MD_SHOTS_DIR:-}" "$4" &
   child=$!
   printf "[supervisor] app pid %s started\n" "$child"

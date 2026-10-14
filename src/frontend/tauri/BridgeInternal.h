@@ -46,9 +46,20 @@ void notify_mp_end(void* userdata);
    Wifi::CheckRX polls far more often than packets arrive. */
 void note_packet_sent(void* userdata, int len);
 void note_packet_sent_kind(void* userdata, int kind, int len);
-void note_packet_received(void* userdata, int len);
 void note_packet_received_kind(void* userdata, int kind, int len);
 void note_poll(void* userdata, bool got_packet);
+
+/* The receive half of a Link test. A probe is armed on the *receiving* console
+   with the exact bytes and timestamp the sender is about to queue; every path
+   that hands a frame to that console's game (MP_RecvPacket) or to a scripted
+   reader (md_link_recv_packet) calls this with what it just read, and the first
+   one to see the tag is credited. Written because the drain used to race the
+   console's own game for the same inbox and lose: the game polls every frame
+   from inside the emulation, so a test that only counted its own drains could
+   report "no reply" for frames the game had already consumed (2026-09-30).
+   `who` is "game" or "drain" and is reported back verbatim. */
+void probe_observe(void* userdata, const char* who, const melonDS::u8* frame, size_t len,
+                   melonDS::u64 timestamp);
 
 /* Shared link bus. Both return nullptr while linking is disabled. */
 melonDS::LocalMP* link_bus();

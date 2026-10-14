@@ -7,6 +7,9 @@
 
 add_executable(md_smoke_test smoke_test.cpp)
 target_link_libraries(md_smoke_test PRIVATE melonds_bridge)
+# The smoke test drives the link bus class directly for the reply-path checks;
+# its header sits beside the core (LocalMP.cpp is in melonds_bridge's sources).
+target_include_directories(md_smoke_test PRIVATE "${CMAKE_SOURCE_DIR}/src/net")
 
 # Writes raw frames plus a manifest so the rendering can be inspected by eye,
 # not just asserted on.

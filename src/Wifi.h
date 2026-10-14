@@ -165,6 +165,69 @@ public:
 
     void SetPowerCnt(u32 val);
 
+    /* Carry a Download Play client's negotiated session across its boot into
+       the downloaded image: the host's channel, the host's own BSSID, and the
+       AID the host granted this console.
+
+       Why all three and not just the channel: a real client does not come out
+       of a single-card transfer as a stranger. Its firmware's Download Play
+       client negotiated this session, and the hand-over into the downloaded
+       image does not undo any of it - the channel, the association's BSSID and
+       the assigned AID all live in the wireless block and survive the jump.
+       This emulator's boot is a whole-console Reset() (see
+       NDS::SetupDownloadPlayBoot), which clears all of it: `CurChannel` to 0
+       and `IsMP`/`IsMPClient`/`MPMYAID` to nothing. Without this the child's
+       radio is untuned *and* it is not a station the host's beacons or polls
+       are addressed to, which is the shape measured in
+       logs/v9dpsession_finding.txt: the host keeps beaconing and polling, and
+       the freshly booted child is not in the conversation at all.
+
+       It is a held fallback, exactly like the channel: a child that goes on to
+       negotiate its own association replaces all of it through CheckRX's normal
+       paths, and a deauthentication clears the association half (see the
+       frametype 00C0 arm). `Wifi::Reset()` clears the whole hold. */
+    void SetDownloadPlaySession(int channel, const u8* hostbssid, int aid);
+
+    /* Run the booted child's own radio bring-up prefix on the Download Play
+       hand-off, so its RX guards pass when its driver's frames start arriving.
+
+       Measured live (to-do.md "Guest bring-up branch", 2026-10-12): on a
+       real route the child sits at PowerState 0x0200 with TRX power 0, so it
+       hears nothing, and its driver's own bring-up never advances past
+       power-down on its own. The model reaches power-on through exactly one
+       path (see UpdatePowerStatus): PowerDownCtrl bit 1 set plus a recompute
+       with ModeReset set (reqflags 3: TRXPower up, PowerState bit 8, the
+       -2048us delay, IRQ11) - and the delay only completes once the wifi
+       event runs, which needs bus attach (MP_Begin via W_PowerUS bit 0 clear
+       with the wifi power domain enabled). This replays the model inputs the
+       host's own driver wrote live (the ModeWEP 004A's PowerDownCtrl side
+       effect, the ModeReset/PowerTX prefix, the PowerUS 0 attach), through
+       Write() so the power model transitions genuinely. Deliberately NOT
+       carried: W_ModeWEP itself (driver-owned, overwritten by bring-up within
+       seconds), the W_PowerForce pulse (a transient whose recomputes settle
+       to nothing), and W_PowerState (the core drops the write unless
+       ModeWEP&7==3 - the model reaches state 0 on its own through the
+       delay). The RX window is seeded first (4000-4800, the value the powered
+       radio latches) because the freshly Reset window is empty and the
+       driver's self-test writes only zeros; and the RXCnt enable bit is set
+       by direct store, never through Write(), whose bit-15 arm fires a TX.
+       NDS::SetupDownloadPlayBoot enables the wifi power domain first - the
+       PowerUS write below only attaches because of it. */
+    void SetDownloadPlayLink();
+
+    /* One-shot post-boot restore of the carried session, fired from USTimer.
+       See the definition for the measured reason. */
+    void ReseedDownloadPlayLink();
+
+    /* One line per *change* to a register that decides whether this console's
+       transceiver is on (the mode/WEP control, the power-management registers,
+       the serial-port enables and the BB/RF power+mode registers), with the
+       ARM7 PC that made the write. Bounded per register and per console, so one
+       console's bring-up cannot exhaust the other's budget. Diagnostic only:
+       it changes no behaviour and is silent unless MD_LINK_VERBOSE=1. */
+    void TracePowerWrite(int id, u16 old, u16 val);
+    u32 PowerWriteSeen[20] = {};
+
     void USTimer(u32 param);
 
     u16 Read(u32 addr);
@@ -216,6 +279,26 @@ public:
         u64 cmds_tx_dup;     // ... of which repeated the previous seqno
         u64 acks_sent;       // acks transmitted
         u64 acks_client_fail;// ... of which reported a failed client
+
+        /* ---- the host's own round loop (v0.1.9bg) ----
+
+           A lobby's heartbeat is the host's *game* writing its CMD slot: one
+           command is one round, and the game writes the next only after it has
+           read the answers to the last. That makes the game's own departure
+           from the lobby a counter rather than an inference - measured at
+           three consoles, 60.0 rounds/s rock steady and then exactly zero, a
+           few seconds after the second client associates, while the beacon
+           slot stays armed (so the firmware goes on beaconing the game's last
+           frame), the role stays 1, and every reply the lobby did exchange was
+           credited and read. `loop_stop_since_join_us` is the number to read:
+           how long after the newest client's association the game gave up. */
+        u64 rounds_multi;    // rounds whose client mask addressed 2+ clients
+        u64 client_joins;    // association responses this console sent as host
+        u64 loop_stops;      // times the game stopped writing its CMD slot
+        u64 loop_life_us;    // the last lobby's CMD-writing lifetime
+        u64 loop_stop_since_join_us;  // that stop, minus the newest association
+        u64 loop_start_us;   // when the current stretch of rounds began
+        u64 last_client_join_us;      // when the newest client associated
 
         // last frames seen, bodies included (both roles)
         u16 last_cmd_seq;
@@ -292,6 +375,54 @@ public:
         u16 ring_val[kRing];
         u64 ring_total;
 
+        /* ---- which register, and from where ----
+
+           The count/last-value table above says *what* the console's own code
+           read; this says *where the decision was made*. A radio driver gates
+           its bring-up on a register it read (a status bit, a chip id) or on
+           one it believes it wrote, and that branch is an instruction with a
+           PC. The last `kRegRing` accesses to the register window - reads and
+           writes both, because a gate can sit on either - are kept in order
+           with the accessing CPU's PC/LR and the console frame they happened
+           on, so the child's post-boot bring-up is the entries after the frame
+           the image was booted on. Always on, no logging; dumped by
+           FormatMPIoReport. */
+        static const int kRegRing = 1024;
+        /* The window after a Download Play hand-off, printed on its own by the
+           text report (see `Wifi::DpSessionFrame`). The ring cannot serve it
+           by itself: 1024 entries is a few frames of a running game, so by
+           the time a report is asked for, what the console did after the boot
+           has usually rolled out of it. The report prints what the ring still
+           holds from the hand-off frame on, states exactly how many entries
+           that is, and says when the ring has rolled past the start of the
+           window rather than showing an empty window that is indistinguishable
+           from a console that never touched its radio again. */
+        static const int kRegRingBoot = 256;
+        /* How much of the ring the text report prints. The whole ring is kept
+           (a run has to be sampled after the fact), but the report is read by
+           a person and is size-checked by its caller, so only the tail goes
+           into it. */
+        static const int kRegRingTail = 192;
+
+        struct MPIoReg
+        {
+            u32 off;      // halfword offset in the register window
+            u32 pc;
+            u32 lr;
+            u16 val;
+            u8  wr;       // 1 = this console's own software wrote it
+            u32 frame;    // NDS::NumFrames at the access
+        };
+
+        MPIoReg reg_ring[kRegRing];           // the last register accesses, in order
+        u64 reg_ring_total;
+
+        u32 regr_pc[kRegWords];               // last reader PC/LR per halfword
+        u32 regr_lr[kRegWords];
+        u32 regw_pc[kRegWords];               // last writer PC/LR per halfword
+        u32 regw_lr[kRegWords];
+        u16 regw_val[kRegWords];
+
         /* Every read of the wireless RAM window, in order, with the value it
            returned. This is the ground truth the zone below annotates: the
            zone says which delivery a read belonged to, and this says what the
@@ -319,6 +450,46 @@ public:
         u16 zone_off[kZone];
         u16 zone_val[kZone];
         u32 zone_n;
+
+        /* ---- who wrote the frame the host is about to send ----
+
+           The read side above answers "what did this console's own code
+           branch on"; this answers the other half of a parked state — "which
+           of its instructions put *this* command in the slot". Every write
+           the console's software makes into the low wireless RAM (the
+           command buffer a Download Play host composes at offset 0) is kept
+           with the writer's PC/LR, plus a per-offset last-writer table, so
+           the code behind a class byte is a PC that can be disassembled
+           instead of a guess. The TX-slot arms are kept separately because
+           the arm is the step that makes the composed frame actually leave.
+           Always on, no logging; dumped by FormatMPIoReport. */
+        static const int kWrRing = 256;
+        static const int kWrKeep = 0x40;      // command header + body start
+
+        struct MPIoWr { u32 pc; u32 lr; u16 off; u16 val; };
+
+        MPIoWr wr[kWrRing];                   // the last writes, in order
+        u64 wr_total;
+
+        u32 wr_pc[kWrKeep];                   // last writer PC per offset
+        u32 wr_lr[kWrKeep];
+        u16 wr_val[kWrKeep];
+        u64 wr_n[kWrKeep];
+
+        u32 wr_cmd_pc, wr_cmd_lr;             // last writer of W_TXSlotCmd
+        u16 wr_cmd_val;
+        u64 wr_cmd_n;
+
+        /* The writer's whole register file at the moment it armed the command
+           slot. The routine that arms the slot and the routine that composes
+           the frame are the same code, and the frame's description lives in
+           its registers, so the arm is the one instant where "what was this
+           frame built from" is answerable without a debugger. */
+        u32 wr_cmd_regs[17];
+        u32 wr_cmd_cpsr;
+        u32 wr_reply_pc, wr_reply_lr;         // last writer of W_TXSlotReply1
+        u16 wr_reply_val;
+        u64 wr_reply_n;
     };
 
     const MPIo& GetMPIo() const { return MPIO; }
@@ -392,9 +563,59 @@ private:
     u8 RFVersion;
     u32 RFRegs[0x40];
 
+    /* The baseband/RF serial ports are not instantaneous. After the console
+       starts a transfer - a write to W_BBCnt, or a data write that clocks an RF
+       register - the chip is busy for a few microseconds and W_BBBusy /
+       W_RFBusy read 1 until it finishes. Both flags were hard-wired to 0 ("TODO
+       eventually"), which is invisible to a driver that polls for busy to
+       clear, but a driver that reads the flag to learn the transfer has
+       started spins forever, and a read of W_BB_READ while a transfer is in
+       flight must return the previous transfer's data, not this one's.
+
+       The deadlines are in the console's shared microsecond clock
+       (NDS::GetSharedUSClock), the same clock Wifi::USTimestamp carries, so
+       they are compared against the console's own emulated time and not the
+       host's. They are transient (a transfer lasts microseconds) and are
+       deliberately kept out of the savestate stream - see DoSavestate. */
+    u64 BBBusyUntil;
+    u64 RFBusyUntil;
+    /// W_BB_READ: data from the last completed read transfer.
+    u8 BBReadResult;
+
     u32 RFChannelIndex[2];
     u32 RFChannelData[14][2];
     int CurChannel;
+    /// The channel kept while the RF registers name none, set by
+    /// SetDownloadPlaySession() (0 = none). On hardware a handed-off child
+    /// does not scan: it was already tuned to the host's when the image
+    /// arrived, but this fork's boot is a whole-console Reset() (see
+    /// NDS::SetupDownloadPlayBoot) that leaves CurChannel at 0, so without
+    /// this fallback every frame it sends is dropped before a channel byte
+    /// is stamped and everything it hears fails the CurChannel check.
+    int HeldChannel;
+    /// The rest of the session carried across a Download Play boot, set by
+    /// SetDownloadPlaySession(): the host's own BSSID and the AID it granted
+    /// this console. Kept here rather than only written once so the same fact
+    /// can be re-seeded if the boot path is re-entered, and so a reader can ask
+    /// what the session was without parsing a log. Cleared by Reset().
+    u8 HeldBSSID[6];
+    int HeldAID;
+    /// The emulated frame the Download Play hand-off was performed on, so the
+    /// one window that matters after a child boot - what its radio did from the
+    /// reset onward - can be printed on its own (0 = no hand-off). Set with
+    /// HeldAID by SetDownloadPlaySession(); cleared by Reset().
+    u32 DpSessionFrame;
+    /* Whether the post-boot re-seed below has disarmed (the game configured
+       its own RX window, so the link is its own now). Cleared with
+       DpSessionFrame by Reset() and armed by SetDownloadPlaySession(). Until
+       then the re-seed re-applies the carried session every frame the window
+       reads zero - the child's init zeroes the hand-off's registers within
+       ~40 frames of the boot (measured live), so a delayed one-shot lands
+       after the park has already formed. */
+    bool DpReseeded;
+    /* One-shot log guard for the re-seed (it otherwise runs every frame
+       while the window reads zero). */
+    bool DpReseedLogged;
 
     struct TXSlot
     {
@@ -421,6 +642,7 @@ private:
 
     int MPReplyTimer;
     u16 MPClientMask, MPClientFail;
+    bool MPLoopAlive;      // the host's game is writing rounds (see MPDiag)
 
     /* Which piece of code is starting a reception, so the delivery trace can
        name it: 0 none, 1 the MP reply handoff, 2 an association response,
@@ -473,6 +695,19 @@ private:
     u64 MPArmServedSerial;
     u16 MPArmServedSeq;
 
+    /* Same-round reply (`MD_SAME_ROUND_REPLY`, default off; see the note above
+       `reply_same_round` in Wifi.cpp). When on, a poll that arrives with no live
+       arm is remembered instead of answered, and the answer is sent the moment
+       the game's own arm for that round lands - so the host's window for round N
+       is handed the state the guest reached after round N, not before it. A poll
+       whose arm never arrives in its own round is answered by the next one, so
+       no round is ever silent (`MPPendingPoll` is that fallback). */
+    bool MPReplySameRound;
+    bool MPPendingPoll;     // a poll whose arm has not been written yet
+    u16 MPPendingTime;      // that poll's clienttime, for its reply
+    u16 MPPendingMask;      // and its client mask
+    u16 MPPendingSeq;       // its seq, for the trace
+
     /* The read recorder (see MPIo in the public section). `Read` is the public
        wrapper that records; `ReadRaw` is the register logic underneath it. */
     MPIo MPIO {};
@@ -493,6 +728,13 @@ private:
 
     u16 ReadRaw(u32 addr);
     void RecordMPIoRead(u32 addr, u16 val);
+    void RecordMPIoWrite(u32 addr, u16 val);
+
+    /* The register window's PC-tagged record, shared by both of the above:
+       one ring entry plus the per-halfword last-accessor PC, so a driver's
+       bring-up gate is an address that can be disassembled rather than a
+       register name that can only be counted. */
+    void RecordRegAccess(u16 addr, u16 val, bool write);
 
     /* The flight recorder's counters (see MPDiag in the public section). The
        "the game read the command it was handed" region lives in MPIO.zone now:
@@ -507,6 +749,40 @@ private:
     bool IsMPClient;
     u64 NextSync;           // for clients: timestamp for next sync point
     u64 RXTimestamp;
+    /* The bus timestamp of the frame the hold above is holding, kept un-clamped
+       (`RXTimestamp` is raised to "now" when a frame arrives late), so the
+       hand-over-once guard below identifies the frame the bus actually sent. */
+    u64 MPHoldStamp;
+
+    /* ---- handed-over-once guard (2026-09-30, v0.1.9be) ----
+
+       A frame pulled off the shared bus is identified here by the tuple the bus
+       carried it with, and the last few hand-overs are remembered so a second
+       one to the same console's game can be recognised: `MPRedeliveries` counts
+       exactly that. It is the counter the three-console failure was blamed on -
+       one console's beacon deliveries showed 191 hand-overs against 151 distinct
+       802.11 sequence numbers - and it is the counter that answers the blame,
+       because it stays 0 in the healthy two-console session *and* in the failing
+       three-console one.
+
+       The sequence-number repeats are real but they are the *host's* 12-bit
+       sequence counter wrapping: all 40 land exactly 80.1537s after the first,
+       i.e. two genuinely different beacons that share a seqno (see the v0.1.9be
+       row in history.md). So a hand-over only counts as repeated when the send
+       timestamp matches as well, which a wrap cannot. Eight entries are enough:
+       a second hand-over would have to survive eight other deliveries to escape
+       the window. */
+    struct MPDeliveredFrame
+    {
+        u64 Stamp;
+        u32 Len;
+        u16 FC;
+        u16 Seq;
+    };
+    MPDeliveredFrame MPLastDelivered[8] {};
+    int MPLastDeliveredNext;
+    u64 MPBusDeliveries;   // frames handed to this console's game off the bus
+    u64 MPRedeliveries;    // ... of which repeated one just handed over
 
     class WifiAP* WifiAP;
 
@@ -535,12 +811,17 @@ private:
     void FireTX();
     void SendMPDefaultReply();
     void SendMPReply(u16 clienttime, u16 clientmask);
+    /* Answer one poll, taking the game's held arm if the live slot has none -
+       the reply path both the poll and the same-round arm-write use. */
+    void AnswerPoll(u16 seqno, u16 clienttime, u16 clientmask);
     u16 MPReplyAID();
     void SendMPAck(u16 cmdcount, u16 clientfail);
     bool ProcessTX(TXSlot* slot, int num);
 
     void IncrementRXAddr(u16& addr, u16 inc = 2);
-    void StartRX();
+    /* `bus_stamp` is the timestamp the shared bus carried the frame with, or 0
+       when the frame did not come off the bus (the host's reply handoff). */
+    void StartRX(u64 bus_stamp);
     void FinishRX();
     void MPClientReplyRX(int client);
     bool CheckRX(int type);
