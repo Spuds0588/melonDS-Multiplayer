@@ -16,21 +16,21 @@
 #                      ~60 s to settle before it accepts the guest's tap.
 #   hub                reached by the GUEST's headline tap (128,60 on
 #                      player 2): P1 shows two labeled boxes, P2 a waiting
-#                      message. P1 box1 (128,72) goes back to character
-#                      select; P1 box2 (128,120) goes forward.
-#   2-button confirm   LEFT (76,168) confirms, RIGHT (180,168) backs out
-#                      to the hub (digest-proven both ways).
-#   converged screen   both consoles show the box+6-dots screen. Twice the
-#                      host has aborted here within seconds (radio off, no
-#                      deauth, mask 0x0) with the guest never confirmed, so
-#                      the script taps the guest's box (128,92 on player 2)
-#                      immediately after the host's LEFT - that is the one
-#                      open variable (see CONFIRM_GUEST, default on).
+#                      message. OCR names them: box1 (128,72) is CONTINUE
+#                      (forward), box2 (128,120) is QUIT VS - tapping it
+#                      three sessions in a row is what tore every session
+#                      down, not a battle confirm (measured 2026-10-14).
+#   quit confirm       the 2-button screen after QUIT VS: LEFT (76,168) is
+#                      YES (teardown: converged box+dots screen, radios off
+#                      host-first, no deauth, guest ends on the firmware's
+#                      "DS Download Play Failed!" dialog), RIGHT (180,168)
+#                      is NO (back to the hub, digest-proven). Never tap
+#                      LEFT here expecting a battle.
 #
 # Usage: run after sm64-dp-host.sh exit 0 + BOOTED (dpjoiner reads BOOTED):
 #   tools/scripts/sm64-dp-launch.sh
 #
-# Exit 0: the link is still up (mask nonzero) 15 s after the confirms.
+# Exit 0: the link is still up (mask nonzero) 15 s after CONTINUE.
 # Exit 1: otherwise (parked or dead - the log says which step stopped).
 #
 set -u
@@ -40,7 +40,6 @@ CTL_PORT="${CTL_PORT:-7373}"
 CTL=(python3 tools/appctl.py --port "$CTL_PORT")
 LOG="${LOG:-$PWD/logs/sm64_dp_launch.log}"
 SETTLE_S="${SETTLE_S:-70}"
-CONFIRM_GUEST="${CONFIRM_GUEST:-1}"
 
 exec >>"$LOG" 2>&1
 echo "--- sm64-dp-launch start $(date +%H:%M:%S) pid $$ port $CTL_PORT"
@@ -80,17 +79,14 @@ tapp() { tap 2 128 60; }
 tapp
 sleep 6
 
-say "hub: P1 box2 (128,120) forward to the 2-button confirm"
-tap 1 128 120
+say "hub: P1 box1 CONTINUE (128,72) forward into the battle"
+tap 1 128 72
 sleep 8
 
-say "confirm: P1 LEFT (76,168)"
-tap 1 76 168
-if [ "$CONFIRM_GUEST" = "1" ]; then
-    say "guest confirm: P2 box (128,92) immediately (the open variable)"
-    sleep 2
-    tap 2 128 92
-fi
+# No further taps are scripted past CONTINUE: whatever screen follows is
+# unmapped (the old script's LEFT/RIGHT taps here belonged to the QUIT VS
+# confirm and ended every session they touched). The verdict below reports
+# whether the link is up; drive the rest by hand off screenshots.
 
 sleep 15
 final_mask="$(mask)"

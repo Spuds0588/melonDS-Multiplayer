@@ -120,6 +120,13 @@ if [ "$joined" = "1" ]; then
 else
     say "no client registered in ${HOST_WAIT_S}s - tapping START anyway (expect Practice alone?)"
 fi
+# The association is not enough: the host's game needs seconds more to list
+# the client in its own roster, and a START tap in that window is silently
+# swallowed (measured 2026-10-14: assoc and tap in the same second parked at
+# 0x00 with download 0; a re-tap minutes later streamed 0x04 immediately).
+SETTLE_AFTER_ASSOC_S="${SETTLE_AFTER_ASSOC_S:-15}"
+say "settling ${SETTLE_AFTER_ASSOC_S} s for the host's own roster before the START tap"
+sleep "$SETTLE_AFTER_ASSOC_S"
 before="$(downloaded)"; before="${before:-0}"
 say "START bar: tapping ($START_X,$START_Y) on console $PLAYER (download before: $before)"
 tap "$PLAYER" "$START_X" "$START_Y"
