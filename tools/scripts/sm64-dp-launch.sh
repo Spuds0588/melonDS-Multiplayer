@@ -39,6 +39,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 CTL_PORT="${CTL_PORT:-7373}"
 CTL=(python3 tools/appctl.py --port "$CTL_PORT")
 LOG="${LOG:-$PWD/logs/sm64_dp_launch.log}"
+APP_LOG="${APP_LOG:-$PWD/logs/sm64_app.log}"
 SETTLE_S="${SETTLE_S:-70}"
 
 exec >>"$LOG" 2>&1
@@ -60,11 +61,20 @@ fi
 
 # The child needs a minute or more past BOOT to light its screens and attach
 # (first run: guest rendering ~2 min post-boot, live MP exchange both ways).
-# There is no text signature to gate on (font defeats the readers), so this
-# is a fixed wait, not a readiness check.
+# But the attach is a lottery (run 4: guest never attached, host stopped TX
+# ~30 s post-boot, every later blind tap uninterpretable), so the route
+# gates on it: the guest's rx must be climbing past the boot window. A dead
+# guest aborts the route with no taps fired (the p66 lesson).
 say "booted; waiting 90 s for the guest's game to attach"
 sleep 90
-say "state: $( "${CTL[@]}" status 2>/dev/null | head -1 )"
+rx1="$( grep -oE 'mp p2 \[guest\]: cmds rx [0-9]+' "$APP_LOG" 2>/dev/null | grep -oE '[0-9]+' | tail -1 )"
+sleep 10
+rx2="$( grep -oE 'mp p2 \[guest\]: cmds rx [0-9]+' "$APP_LOG" 2>/dev/null | grep -oE '[0-9]+' | tail -1 )"
+say "guest rx ${rx1:-?} -> ${rx2:-?}: $( "${CTL[@]}" status 2>/dev/null | head -1 )"
+if [ -z "${rx1:-}" ] || [ -z "${rx2:-}" ] || [ "$rx2" -le "$rx1" ]; then
+    say "FAIL: guest traffic not climbing - the attach lost the lottery; no taps fired"
+    exit 1
+fi
 
 say "character picks: P1 panel 1 (34,68), P2 panel 2 (98,68)"
 tap 1 34 68
@@ -77,7 +87,29 @@ sleep "$SETTLE_S"
 say "guest headline tap (128,60 on player 2) to the hub"
 tapp() { tap 2 128 60; }
 tapp
-sleep 6
+# The hub has a known digest (P1 bottom, 128x96): fbdc62cdd0441d1db53cc3587f22bf8f.
+# Run 4 proved blind taps past a missed hub are uninterpretable, so CONTINUE
+# waits for it (60 s) and the route aborts untapped if it never arrives.
+HUB_DIGEST="fbdc62cdd0441d1db53cc3587f22bf8f"
+say "waiting up to 60 s for the hub signature before CONTINUE"
+hubbed=0
+for i in $(seq 1 6); do
+    sleep 10
+    "${CTL[@]}" shot --name sm64_hubgate >/dev/null 2>&1
+    dg="$(python3 -c "
+from PIL import Image
+import hashlib
+im = Image.open('logs/shots/sm64_hubgate.png').convert('L')
+print(hashlib.md5(bytes(im.crop((0,192,256,384)).resize((128,96)).getdata())).hexdigest())
+" 2>/dev/null)"
+    say "hub gate poll $i: ${dg:-noread}"
+    if [ "${dg:-}" = "$HUB_DIGEST" ]; then hubbed=1; break; fi
+done
+if [ "$hubbed" != "1" ]; then
+    say "FAIL: hub signature never appeared - no CONTINUE tapped"
+    exit 1
+fi
+say "hub confirmed; P1 box1 CONTINUE (128,72) forward into the battle"
 
 say "hub: P1 box1 CONTINUE (128,72) forward into the battle"
 tap 1 128 72
