@@ -54,8 +54,10 @@ while [ "$try" -lt "$MAX_TRIES" ]; do
         quit_app
         continue
     fi
-    if ! LOG="$HOST_LOG" APP_LOG="$APP_LOG" CTL_PORT="$CTL_PORT" "$HOST_SCRIPT"; then
-        echo "try $try: host route failed (exit $?) - relaunching"
+    LOG="$HOST_LOG" APP_LOG="$APP_LOG" CTL_PORT="$CTL_PORT" "$HOST_SCRIPT"
+    host_rc=$?
+    if [ "$host_rc" != "0" ]; then
+        echo "try $try: host route failed (exit $host_rc) - relaunching"
         quit_app
         continue
     fi
