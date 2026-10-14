@@ -65,14 +65,22 @@ fi
 # ~30 s post-boot, every later blind tap uninterpretable), so the route
 # gates on it: the guest's rx must be climbing past the boot window. A dead
 # guest aborts the route with no taps fired (the p66 lesson).
-say "booted; waiting 90 s for the guest's game to attach"
-sleep 90
-rx1="$( grep -oE 'mp p2 \[guest\]: cmds rx [0-9]+' "$APP_LOG" 2>/dev/null | grep -oE '[0-9]+' | tail -1 )"
-sleep 10
-rx2="$( grep -oE 'mp p2 \[guest\]: cmds rx [0-9]+' "$APP_LOG" 2>/dev/null | grep -oE '[0-9]+' | tail -1 )"
-say "guest rx ${rx1:-?} -> ${rx2:-?}: $( "${CTL[@]}" status 2>/dev/null | head -1 )"
-if [ -z "${rx1:-}" ] || [ -z "${rx2:-}" ] || [ "$rx2" -le "$rx1" ]; then
-    say "FAIL: guest traffic not climbing - the attach lost the lottery; no taps fired"
+# The attach is a lottery (run 4: guest never attached, host stopped TX ~30 s
+# post-boot, every later blind tap uninterpretable), so the route gates on the
+# shared predictor instead of a fixed wait: dp_attach_gate.py answers from the
+# log's own clock (0 attached, 1 dead, 2 too early - poll again). A dead
+# guest aborts the route with no taps fired (the p66 lesson).
+say "booted; polling the attach gate (up to ${GATE_WAIT_S:-120} s)"
+gate_rc=2
+for i in $(seq 1 "${GATE_POLLS:-12}"); do
+    sleep 10
+    gate_out="$(python3 tools/scripts/dp_attach_gate.py "$APP_LOG" 2>&1)"
+    gate_rc=$?
+    say "gate poll $i: $gate_out"
+    if [ "$gate_rc" != "2" ]; then break; fi
+done
+if [ "$gate_rc" != "0" ]; then
+    say "FAIL: attach gate refused (rc=$gate_rc) - the attach lost the lottery; no taps fired"
     exit 1
 fi
 

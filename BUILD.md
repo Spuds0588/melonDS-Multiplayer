@@ -1225,18 +1225,41 @@ Its VS screen is the game's Download Play entry, and its font defeats the ASCII
 screen readers, so the walk is touch geometry measured off framebuffer captures
 (`appctl.py shot` plus `render`; the composite is 256 px per console, the top
 screen above the bottom one): a tap anywhere on the title screen, then the **VS**
-bar at about `(37,172)` on the bottom screen. Do not tap the waiting room's
-bottom bar - that is the host's own "TOUCH TO START", and with no second *local*
-player it answers "Practice alone?". Success is read only from the link and the
-joiner's counters, never from a screen: exit 0 when a `04` DataPacket is seen (or
-the `download:` count moves), 2 when the host reached its waiting room,
-registered the client and stated its RSA image but never streamed data, and 1
-when the waiting room was never reached. Overrides `TAP_X`/`TAP_Y`,
-`VS_X`/`VS_Y`, `BOOT_S`, `HOST_WAIT_S`, `TRANSFER_WAIT_S`, `APP_LOG`, `LOG`.
+bar at about `(37,172)` on the bottom screen. Once the joiner is registered
+the waiting room's bottom bar - the host's own "TOUCH TO START" - starts the
+download (with no client it answers "Practice alone?"): the script waits for
+registration, settles `SETTLE_AFTER_ASSOC_S` (15 s, for the host's own roster -
+a same-second tap is swallowed) and taps `(128,168)`. Success is read only
+from the link and the joiner's counters, never from a screen: exit 0 when a
+`04` DataPacket is seen (or the `download:` count moves), 2 when the host
+reached its waiting room, registered the client and stated its RSA image but
+never streamed data, and 1 when the waiting room was never reached. Overrides
+`TAP_X`/`TAP_Y`, `VS_X`/`VS_Y`, `START_X`/`START_Y`, `BOOT_S`, `HOST_WAIT_S`,
+`TRANSFER_WAIT_S`, `SETTLE_AFTER_ASSOC_S`, `APP_LOG`, `LOG`.
+`tools/scripts/sm64-dp-launch.sh` continues past BOOT through character picks
+(P1 panel `(34,68)`, P2 panel `(98,68)`), a ~70 s stage settle, the guest's
+headline tap `(128,60)` to the hub (gated on the hub's known digest), and the
+hub's CONTINUE box `(128,72)` - never the QUIT VS box `(128,120)`, whose
+2-button screen tears the session down (LEFT tears down, RIGHT backs out,
+both digest-proven). The hub boxes were named by OCR (`tesseract --psm 7`).
 `tools/scripts/sm64-dp-force-sweep.sh` runs that route once per reply type
 (`MD_DP_REPLY_FORCE`), launching and quitting the app per value and writing a
 one-line verdict per value - the same question `sfc_force8`/`sfc_data9` answered
 for Star Fox.
+
+`tools/scripts/dp_attach_gate.py` is the shared early predictor for the guest
+attach lottery both single-card titles lose (SFC 4/7, SM64 2/6): past boot+15 s
+the host's reply-window reads and the guest's cmds rx must both climb (healthy:
+thousands per 5 s; dead: exactly +0 on both). Single-shot off the app log
+(`MD_LINK_VERBOSE=1` required): exit 0 attached, 1 dead, 2 undecided (no boot
+or boot+15 s unreached - poll again). Validated by replay on five saved
+sessions across both titles with zero false calls, including a mid-session
+slice (attached) vs the same log's tail (dead after teardown).
+`tools/scripts/dp-session-retry.sh` loops the whole session around that gate:
+env `ROM`, `HOST_SCRIPT`, optional `NEXT_SCRIPT`, `MAX_TRIES` (default 3) - it
+launches, drives the host route, polls the gate, and relaunches on refusal
+instead of working menus on a dead session. Proven live (two refused tries,
+clean relaunch, exit 1 with no strays).
 
 `tools/scripts/sfc-dp-arm-class.py` is `poke` aimed at the one byte that decides
 the Download Play command class - byte 0 of the host's 6-byte DP command body at
