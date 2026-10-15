@@ -36,7 +36,7 @@ single-console play.
 | Tetris DS (USA) | 2 | ✅ **playable over single-card Download Play** | First Download Play title to reach real gameplay: the guest boots the downloaded image, joins the host's STANDARD lobby as player 2, and both consoles play a live versus match (distinct boards, mask 0x3). See the Tetris DS section |
 | LEGO Star Wars II - The Original Trilogy (USA) (Rev 1) | — | ⬜ none | The game has no multiplayer mode to link |
 | 0595 - Club House Games (U)(WRG) | 1 | 🟡 boots, multiplayer untested | Title screen renders ("Balance", touch prompt); no menu route driven, no link attempted |
-| Bomberman (USA) | 1 | 🟡 boots, multiplayer untested | Boots into an attract-mode battle (COM players); no menu route driven |
+| Bomberman (USA) | 2 | 🟡 transfer completes 2/2, guest errors post-boot, no battle | Registered (`ABME`, `download_play`); Battle leads straight to a Download host lobby, the guest associates (`AID C001`), the roster lists both players, host Start streams `672764/672764 bytes in 2693 packets · BOOTED` — then both consoles show `Communication error`: the booted guest game never gets on the radio (`answered 0`, stand-in covers), the host's `06` rounds go unanswered and it quits. Systematic (2/2 identical), not the attach lottery. See the Bomberman section |
 | Diddy Kong Racing DS (USA) | 1 | 🟡 boots, multiplayer untested | Title/start menu renders; no route driven |
 | Kirby Super Star Ultra (USA) | 1 | 🟡 boots, multiplayer untested | Intro cutscene plays; no route driven |
 | Mario Hoops 3 on 3 (USA) | 1 | 🟡 boots, multiplayer untested | Title menu renders (EXHIBITION etc.); no route driven |
@@ -1339,6 +1339,14 @@ Route (P1 hosts, console 2 is the synthesized client), all taps bottom-screen co
 Past the boot both consoles show the STANDARD lobby with a 2-player roster, the host's A moves it to `Please wait until all of the players have set their rules`, the guest's A confirms, and a versus match runs on both screens with distinct live boards (different wells, different NEXT queues, gameplay-evolving 20 s apart), both frames advancing in lockstep, no further deauths. One host deauth (`reason 0x0013`) is on record mid-session with the session unaffected — unexplained, noted, nothing depends on it.
 
 First boot writes the game's save (new `Test Roms/Tetris DS (USA).sav`; supervisor-pinned, exit 0). Higher player counts (the title supports up to 10 over Download Play) and the other modes (MISSION, PUSH) are unmeasured.
+
+---
+
+## Bomberman (USA) — 🟡 Download Play transfer completes, guest errors post-boot, 2 players
+
+Route (P1 hosts, console 2 synthesized client): START past the attract battle → title `TOUCH TO START` `(128,150)` → Battle `(190,98)` → the Download host lobby (`Starting a Battle Game! Waiting for players to enter!`, then `Please start the download once all players are together!`). The joiner hears the beacon (serial `00400022`, empty SSID, ch 7), auth/assoc `0000`/`C001`, roster lists `melonDS` twice; host Start streams `672764 of 672764 bytes in 2693 distinct packets · BOOTED` (`logs/bomb2_app.log`, `logs/bomb3_app.log`, shots `logs/shots/bomb{battle,2_lobby,booted,3_boot}.png`).
+
+Post-boot, both consoles show the game's own `Communication error. Press A Button to turn the power OFF and try again.` The log names the mechanism: `the booted client's own game is not on the radio`, the firmware stand-in covers its polls (`canned 357`), the guest game answers nothing itself (`answered 0`, rx near-all-duplicate), so the host's `06 01 00...` rounds carry no game-state and it stops (~+140 s emulated), `mask 0x0`, no deauth. Identical 2/2 — a systematic post-boot guest-radio gap for this image, contrasting Tetris (whose guest game joins and plays) and resembling SFC's pre-handoff-failure shape. Next: per-title guest bring-up (the handoff staging was tuned for SFC's validator; Bomberman's image may fail different fields pre-radio) or a longer host patience probe. Clean quits (exit 0), no `.sav` written.
 
 ---
 

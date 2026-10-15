@@ -107,6 +107,19 @@ const GAME_FIXES: &[GameFixSpec] = &[
         source: "GBATEK 'List of DS Download Play Games' + compatibility.md",
     },
     GameFixSpec {
+        code: "ABME",
+        name: "Bomberman",
+        fix: "Single-card Download Play up to 8 players alongside multi-card; \
+              the Battle menu leads straight to a Download host lobby. Same \
+              shared joiner (src-tauri/src/dp_joiner.rs), armed by this entry. \
+              Host lobby reached live ('Starting a Battle Game! Waiting for \
+              players to enter!'); the transfer itself is unmeasured - \
+              recognized attach point and opt-in, not a working download.",
+        implemented: false,
+        download_play: true,
+        source: "compatibility.md 'Bomberman' + logs/bomb_app.log",
+    },
+    GameFixSpec {
         code: "ASFE",
         name: "Star Fox Command",
         fix: "Single-card Download Play only: the game's Recruitment screen is the \
@@ -245,7 +258,7 @@ mod tests
                 assert!(!p.download_play_joiner(), "{code}");
             }
         }
-        for code in ["ASFE", "ASME", "ATRE"] {
+        for code in ["ASFE", "ASME", "ATRE", "ABME"] {
             let on = resolve(code, true).unwrap();
             assert!(on.download_play, "{code} is a single-card Download Play title");
             assert!(on.download_play_joiner(), "{code}");
