@@ -775,6 +775,79 @@ int LocalMP::RecvPacket(int inst, u8* packet, u64* timestamp)
     return RecvPacketGeneric(inst, packet, false, timestamp);
 }
 
+int LocalMP::RecvPacketFull(int inst, u8* packet, u64* timestamp, u32* senderOut, u32* typeOut)
+{
+    if ((inst < 0) || (inst >= kMaxMPConsoles)) return 0;
+    Console& self = Consoles[inst];
+
+    if (!Semaphore_TryWait(self.frameSem, 0))
+        return 0;
+
+    Mutex_Lock(MPQueueLock);
+
+    /* Same short-read guard as RecvPacketGeneric: a semaphore posted for an
+       entry the router has since dropped for room reads as nothing. */
+    if (self.inboxRead == self.inboxWrite)
+    {
+        Mutex_Unlock(MPQueueLock);
+        return 0;
+    }
+
+    MPPacketHeader pktheader = {};
+    self.inboxRead = RingRead(self.inbox, kPacketQueueSize, self.inboxRead, &pktheader, sizeof(pktheader));
+
+    if (pktheader.Magic != 0x4946494E)
+    {
+        Log(LogLevel::Warn, "PACKET FIFO OVERFLOW\n");
+        self.inboxRead = self.inboxWrite;
+        Semaphore_Reset(self.frameSem);
+        Mutex_Unlock(MPQueueLock);
+        return 0;
+    }
+
+    if (pktheader.Length)
+    {
+        self.inboxRead = RingRead(self.inbox, kPacketQueueSize, self.inboxRead, packet, pktheader.Length);
+
+        /* Same ownership rule as the generic path: reading a command makes
+           this console its sender's client, whoever the reader is. */
+        if ((pktheader.Type & 0xFFFF) == 1)
+            self.hostInst = (int)pktheader.SenderID;
+    }
+
+    if (timestamp) *timestamp = pktheader.Timestamp;
+    if (senderOut) *senderOut = pktheader.SenderID;
+    if (typeOut) *typeOut = pktheader.Type;
+    Mutex_Unlock(MPQueueLock);
+    return pktheader.Length;
+}
+
+int LocalMP::RequeuePacket(int inst, u32 sender, u32 type, u8* packet, int len, u64 timestamp)
+{
+    if ((inst < 0) || (inst >= kMaxMPConsoles)) return 0;
+    if (!packet || len <= 0 || len > kMaxFrameSize) return 0;
+
+    Mutex_Lock(MPQueueLock);
+    Console& self = Consoles[inst];
+    if (!self.attached)
+    {
+        Mutex_Unlock(MPQueueLock);
+        return 0;
+    }
+
+    /* The entry exactly as the router filed it: same sender, same type, same
+       timestamp, body already on-wire (FCS in its own tail slot). Appended to
+       the tail, so the frames behind it keep their order and this one is read
+       last - a scanner does not care about order, and a lagging console's
+       oldest unread is what overflow drops first, which is the honest price. */
+    MPPacketHeader h { 0x4946494E, sender, type, (u32)len, timestamp };
+    QueueAppend(inst + 1, "inbox", self.inbox, kPacketQueueSize,
+                self.inboxRead, self.inboxWrite, h, packet, self.frames_dropped);
+    Semaphore_Post(self.frameSem);
+    Mutex_Unlock(MPQueueLock);
+    return len;
+}
+
 int LocalMP::RecvHostPacket(int inst, u8* packet, u64* timestamp)
 {
     /* The console this one is following has left the bus: the game is told its

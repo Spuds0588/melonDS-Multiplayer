@@ -388,6 +388,7 @@ def cmd_dpjoiner(ch, args):
         f" (0 = accepted, non-zero = refused)\n"
         f"  last assoc status {out.get('lastAssocStatus', 0):#06x}, AID {out.get('lastAssocAid', 0):#06x}"
         f" (status 0 with a nonzero AID = the host registered this client)\n"
+        f"  join/scan frames left for the booted game {out.get('requeued', 0)}\n"
         f"  host commands {out.get('commandsRecv', 0)} (last {out.get('lastCommand', 0):#04x}, "
         f"slave flags {out.get('lastCmdSlaveFlags', 0):#06x}) · acks {out.get('acksRecv', 0)}, "
         f"our reply collected {out.get('repliesCollected', 0)} times\n"

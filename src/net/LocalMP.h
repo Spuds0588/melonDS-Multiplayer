@@ -76,6 +76,19 @@ public:
 
     int SendPacket(int inst, u8* data, int len, u64 timestamp);
     int RecvPacket(int inst, u8* data, u64* timestamp);
+    /* Same as RecvPacket, plus the entry's own routing fields. A reader that
+       hands frames back (see RequeuePacket) needs the header the bus filed
+       them under: the body alone does not carry the sender, and rebuilding it
+       from the 802.11 addresses would misattribute relayed frames. */
+    int RecvPacketFull(int inst, u8* data, u64* timestamp, u32* senderOut, u32* typeOut);
+    /* Return a frame this console read to the tail of its own inbox, under its
+       original header. For a reader that must see some classes (a command it
+       answers) but leave others for the console's own game (the beacons a
+       booted Download Play client scans for): consumed-then-restored is still
+       a delivery, and the ring's own overflow counting keeps any loss honest.
+       The frame is already on-wire format (FCS applied at route time), so it
+       is appended verbatim - re-applying the FCS would corrupt its tail. */
+    int RequeuePacket(int inst, u32 sender, u32 type, u8* packet, int len, u64 timestamp);
     int SendCmd(int inst, u8* data, int len, u64 timestamp);
     int SendReply(int inst, u8* data, int len, u64 timestamp, u16 aid);
     int SendAck(int inst, u8* data, int len, u64 timestamp);

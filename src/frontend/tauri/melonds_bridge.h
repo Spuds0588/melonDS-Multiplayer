@@ -511,6 +511,29 @@ void md_tag_current_thread(const char* tag);
 int md_link_send_packet(MDInstance* inst, const void* data, size_t len, uint64_t timestamp);
 int md_link_recv_packet(MDInstance* inst, void* out, size_t cap, uint64_t* timestamp);
 
+/* Same as md_link_recv_packet, plus the entry's own routing fields. A reader
+   that hands frames back with md_link_requeue_packet needs the header the bus
+   filed them under: the body alone does not carry the sender, and rebuilding
+   it from the 802.11 addresses would misattribute relayed frames. `sender` and
+   `type` are the MPPacketHeader SenderID/Type (0=regular 1=CMD 2=reply 3=ack);
+   either out-pointer may be NULL. Same buffer contract as md_link_recv_packet
+   (a frame-size buffer; the bus writes whole or nothing). Returns the body
+   length, 0 when empty. */
+int md_link_recv_packet_full(MDInstance* inst, void* out, size_t cap, uint64_t* timestamp,
+                             uint32_t* sender, uint32_t* type);
+
+/* Return a frame this console read to the tail of its own inbox, under its
+   original header (see LocalMP::RequeuePacket). For a reader that must see
+   some classes but leave others for the console's own game: the booted
+   Download Play joiner answers the host's commands as the firmware stand-in
+   while leaving the beacons its game scans for, because consuming them starves
+   the scan - every frame the drain reads is one the game's CheckRX never sees
+   (both read the same per-slot queue). The frame is already on-wire format and
+   is appended verbatim. Returns `len` on success, 0 when refused (bad slot,
+   detached console, empty or oversize frame). */
+int md_link_requeue_packet(MDInstance* inst, uint32_t sender, uint32_t type,
+                           const void* data, size_t len, uint64_t timestamp);
+
 /* Send an *answer* rather than a broadcast: the bus files it in the answer
    queue of the console this one is following, keyed by `aid`, which is exactly
    where a host's reply window (LocalMP::RecvReplies, reached through

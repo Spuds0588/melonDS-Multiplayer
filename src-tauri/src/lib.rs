@@ -337,6 +337,26 @@ extern "C" {
     // toss (the send side was always declared i32, which is why sends looked
     // reliable while receives looked flaky).
     fn md_link_recv_packet(inst: *mut MDInstance, out: *mut u8, cap: usize, timestamp: *mut u64) -> i32;
+    // Same, plus the entry's routing fields for readers that hand frames back
+    // (see md_link_requeue_packet). `sender`/`type` may be null. `cap` must
+    // hold a whole entry (0x948) - a short buffer reads as empty, never torn.
+    fn md_link_recv_packet_full(
+        inst: *mut MDInstance,
+        out: *mut u8,
+        cap: usize,
+        timestamp: *mut u64,
+        sender: *mut u32,
+        ftype: *mut u32,
+    ) -> i32;
+    // Return a drained frame to this console's own inbox tail, verbatim.
+    fn md_link_requeue_packet(
+        inst: *mut MDInstance,
+        sender: u32,
+        ftype: u32,
+        data: *const u8,
+        len: usize,
+        timestamp: u64,
+    ) -> i32;
     fn md_read_io16(inst: *mut MDInstance, cpu: i32, addr: u32) -> u16;
     fn md_wifi_io_report(inst: *mut MDInstance, out: *mut i8, cap: i32) -> i32;
     fn md_mem_watch(inst: *mut MDInstance, lo: u32, hi: u32) -> i32;
@@ -907,11 +927,52 @@ impl DriverTurnBus {
         }
         out
     }
+    /// Same, with each entry's routing fields, for a reader that hands some
+    /// classes back (see `JoinerBus::requeue`). Same bound, same order.
+    fn drain_full_now(&self) -> Vec<(Vec<u8>, u64, u32, u32)> {
+        let mut out: Vec<(Vec<u8>, u64, u32, u32)> = Vec::new();
+        let mut buf = [0u8; 2048];
+        let mut ts = 0u64;
+        let mut sender = 0u32;
+        let mut ftype = 0u32;
+        while out.len() < 32 {
+            let n = unsafe {
+                md_link_recv_packet_full(
+                    self.ptr,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut ts,
+                    &mut sender,
+                    &mut ftype,
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            out.push((buf[..(n as usize).min(buf.len())].to_vec(), ts, sender, ftype));
+        }
+        out
+    }
+    /// Hand one drained frame back to this console's own inbox tail.
+    fn requeue_now(&self, pkt: &[u8], ts: u64, sender: u32, ftype: u32) -> bool {
+        if pkt.is_empty() {
+            return false;
+        }
+        unsafe {
+            md_link_requeue_packet(self.ptr, sender, ftype, pkt.as_ptr(), pkt.len(), ts) > 0
+        }
+    }
 }
 
 impl dp_joiner::JoinerBus for DriverTurnBus {
     fn drain(&self) -> Option<Vec<(Vec<u8>, u64)>> {
         Some(self.drain_now())
+    }
+    fn drain_full(&self) -> Option<Vec<(Vec<u8>, u64, u32, u32)>> {
+        Some(self.drain_full_now())
+    }
+    fn requeue(&self, pkt: &[u8], ts: u64, sender: u32, ftype: u32) -> bool {
+        self.requeue_now(pkt, ts, sender, ftype)
     }
 
     fn send(&self, data: &[u8], ts: u64) -> Option<i32> {
@@ -2482,6 +2543,7 @@ fn dp_state(session: &Session) -> serde_json::Value {
                 image_total_bytes,
                 transfer,
                 radio_hold,
+                frames_requeued,
             } = &dp.counters;
             serde_json::json!({
                 "present": true,
@@ -2507,6 +2569,7 @@ fn dp_state(session: &Session) -> serde_json::Value {
                 "lastCmdSlaveFlags": last_cmd_slave_flags.load(Ordering::SeqCst),
                 "acksRecv": acks_recv.load(Ordering::SeqCst),
                 "repliesCollected": replies_collected.load(Ordering::SeqCst),
+                "requeued": frames_requeued.load(Ordering::SeqCst),
                 "imagePackets": image_packets.load(Ordering::SeqCst),
                 "imageBytes": image_bytes.load(Ordering::SeqCst),
                 "imageNext": image_next.load(Ordering::SeqCst),

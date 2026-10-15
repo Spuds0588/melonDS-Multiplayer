@@ -1195,6 +1195,51 @@ int md_link_recv_packet(MDInstance* inst, void* out, size_t cap, uint64_t* times
     return got;
 }
 
+int md_link_recv_packet_full(MDInstance* inst, void* out, size_t cap, uint64_t* timestamp,
+                             uint32_t* sender, uint32_t* type)
+{
+    if (!inst || inst->slot < 0 || !out || cap == 0) return 0;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (!g_link_bus) return 0;
+
+    u64 ts = 0;
+    u32 from = 0, kind = 0;
+    // Same buffer contract as md_link_recv_packet: the bus writes the whole
+    // entry or nothing, so the caller passes a frame-size buffer (the joiner
+    // uses 2048, as it always has). No floor is enforced here for exactly the
+    // same reason none is enforced there - and a floor above the caller's
+    // buffer reads as an empty bus, which is what a first cut of this function
+    // did (0x948 against a 2048 buffer: the joiner heard nothing at all).
+    const int got = g_link_bus->RecvPacketFull(inst->slot, (u8*)out, &ts, &from, &kind);
+    if (got > 0)
+    {
+        inst->link_packets_received++;
+        inst->link_bytes_received += (u64)got;
+        inst->link_packets_read_drained++;
+        inst->link_bytes_read_drained += (u64)got;
+        if (timestamp) *timestamp = ts;
+        if (sender) *sender = from;
+        if (type) *type = kind;
+        md::probe_observe(inst, "drain", (const u8*)out, (size_t)got, ts);
+    }
+    return got;
+}
+
+int md_link_requeue_packet(MDInstance* inst, uint32_t sender, uint32_t type,
+                           const void* data, size_t len, uint64_t timestamp)
+{
+    if (!inst || inst->slot < 0 || !data || len == 0) return 0;
+
+    std::lock_guard<std::mutex> lock(g_link_lock);
+    if (!g_link_bus) return 0;
+
+    // A returned frame is not a new delivery: the read counters already fired
+    // when it was drained, so only the bus's own requeue reports. out==len
+    // whole or nothing, like every other path through this lock.
+    return g_link_bus->RequeuePacket(inst->slot, sender, type, (u8*)data, (int)len, timestamp);
+}
+
 int md_probe_arm(MDInstance* inst, const void* expect, size_t len, uint64_t ts)
 {
     if (!inst || !expect || len == 0 || len > sizeof(inst->probe.expect)) return -1;

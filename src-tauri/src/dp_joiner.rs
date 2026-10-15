@@ -64,6 +64,25 @@ pub trait JoinerBus: Send + Sync {
     /// its game idle, and a game's own wireless power cycle turns it false
     /// again - which is why the attachment is re-asserted, not assumed.
     fn receiving(&self) -> bool;
+    /// Everything queued, with each entry's routing fields (bus sender index,
+    /// header type). The stand-in needs them to hand frames back (see
+    /// `requeue`): the body alone does not carry the sender, and rebuilding it
+    /// from the 802.11 addresses would misattribute relayed frames. Defaults
+    /// to `drain` with zeroed fields - enough for the in-process test bus,
+    /// whose requeues never reach a real ring.
+    fn drain_full(&self) -> Option<Vec<(Vec<u8>, u64, u32, u32)>> {
+        self.drain()
+            .map(|v| v.into_iter().map(|(p, t)| (p, t, 0, 0)).collect())
+    }
+    /// Return a frame read by `drain_full` to the tail of this console's own
+    /// inbox, under its original header - so the console's own game reads it
+    /// next. A consumed-then-restored frame is still a delivery (the bus
+    /// counts it at hand-over), and the ring's own overflow counting keeps any
+    /// loss honest. Returns false when there is no console to hand back to;
+    /// the default bus owns none, so tests record the call instead.
+    fn requeue(&self, _pkt: &[u8], _ts: u64, _sender: u32, _ftype: u32) -> bool {
+        false
+    }
 
     /// Hand the completed child image to the console so it can run: write its
     /// segments to the destinations the RSA frame stated, carry the session it
@@ -1030,6 +1049,13 @@ pub struct Counters {
     /// had therefore stopped writing it frames; zero after a boot means the
     /// child's game kept the radio, which is the state the hold exists for.
     pub radio_hold: AtomicU64,
+    /// Frames the stand-in handed back to the booted game after reading them
+    /// (see the requeue in `drain_step`). Post-boot the drain and the game's
+    /// own CheckRX read the same per-slot queue, so every beacon the stand-in
+    /// consumes is one the game's scan never sees; the join/scan set (beacons,
+    /// auth/assoc responses) is restored for the game while the stand-in keeps
+    /// answering polls. Zero on a title whose game joins without them.
+    pub frames_requeued: AtomicU64,
 }
 
 /// The joiner's shared state. `armed` is the one gate; `joiner` says which
@@ -1393,6 +1419,9 @@ pub struct State {
     /// The firmware stand-in's first turn has been logged once (see the
     /// booted arm of `gate_step`).
     noted_standin: bool,
+    /// The first frame handed back to the booted game has been logged once
+    /// (see the requeue in `drain_step`).
+    noted_requeue: bool,
 }
 
 impl Default for State {
@@ -1430,6 +1459,7 @@ impl Default for State {
             image: Image::default(),
             booted: false,
             noted_standin: false,
+            noted_requeue: false,
         }
     }
 }
@@ -1724,13 +1754,47 @@ pub fn step<B: JoinerBus + ?Sized>(bus: &B, dp: &DownloadPlayJoiner, st: &mut St
 /// Owns the read side and nothing else — what it records, the send stage
 /// answers and the transfer machine advances on.
 fn drain_step<B: JoinerBus + ?Sized>(bus: &B, dp: &DownloadPlayJoiner, st: &mut State, us: [u8; 6], now: Instant) {
-    if let Some(packets) = bus.drain() {
-        for (pkt, ts) in &packets {
+    if let Some(packets) = bus.drain_full() {
+        for (pkt, ts, sender, ftype) in &packets {
             // The newest frame's own timestamp is the closest thing to the
             // host's current clock a client can read, and it is what a reply is
-            // stamped with (see REPLY_AHEAD_US).
+            // stamped with (see REPLY_AHEAD_US). Read off every frame,
+            // including ones handed back below - a restored beacon carries the
+            // freshest host clock seen, and the stamp wants exactly that.
             st.rx_ts = *ts;
             match classify(pkt, &us) {
+                Some(Rx::Beacon(_)) | Some(Rx::AuthResponse { .. }) | Some(Rx::AssocResponse { .. })
+                    if st.booted =>
+                {
+                    // Post-boot these frames belong to the booted game, not the
+                    // stand-in. The drain and the game's own CheckRX read the
+                    // same per-slot queue (`RecvPacket` both ways), so a beacon
+                    // consumed here is one the game's scan never sees - and a
+                    // game that scans before it powers up then waits forever
+                    // while the stand-in answers polls for a client that never
+                    // joins (measured: Bomberman's guest `answered 0` with the
+                    // host's `06` rounds starving, while Tetris's guest, which
+                    // associates off the staged parameters, joins and plays).
+                    // Restored to the inbox tail, in arrival order behind the
+                    // frames after them; the stand-in keeps answering polls, so
+                    // the host stays fed while the game scans. The phase and
+                    // AID stay the download's own - the game earns its own
+                    // association now, and adopting its answers here would
+                    // answer the host under two identities at once.
+                    if bus.requeue(pkt, *ts, *sender, *ftype) {
+                        dp.counters.frames_requeued.fetch_add(1, Ordering::SeqCst);
+                        if !st.noted_requeue {
+                            st.noted_requeue = true;
+                            log::info!(
+                                "[dp] leaving the join/scan frames for the booted game: \
+                                 beacons and auth/assoc responses go back to this console's \
+                                 inbox so its scan sees the host while the stand-in keeps \
+                                 answering polls"
+                            );
+                        }
+                    }
+                    continue;
+                }
                 Some(Rx::Beacon(b)) => {
                     let counters = &dp.counters;
                     counters.beacons.fetch_add(1, Ordering::SeqCst);
@@ -2399,6 +2463,8 @@ mod tests {
         listening: AtomicBool,
         /// The image, load map and session the joiner handed over, if it did.
         booted: Mutex<Option<(Vec<u8>, BootInfo, Session)>>,
+        /// Frames the stand-in handed back, in order - the requeue's proof.
+        requeued: Mutex<Vec<Vec<u8>>>,
     }
 
     impl MockBus {
@@ -2411,6 +2477,7 @@ mod tests {
                 wireless: AtomicBool::new(false),
                 listening: AtomicBool::new(false),
                 booted: Mutex::new(None),
+                requeued: Mutex::new(Vec::new()),
             }
         }
         fn push(&self, p: Vec<u8>) {
@@ -2453,6 +2520,10 @@ mod tests {
         }
         fn handoff(&self, image: &[u8], info: &BootInfo, session: &Session) -> bool {
             *self.booted.lock().unwrap() = Some((image.to_vec(), *info, *session));
+            true
+        }
+        fn requeue(&self, pkt: &[u8], _ts: u64, _sender: u32, _ftype: u32) -> bool {
+            self.requeued.lock().unwrap().push(pkt.to_vec());
             true
         }
     }
@@ -2643,6 +2714,43 @@ mod tests {
         step(&bus, &dp, &mut st, Instant::now());
         assert!(bus.sent().is_empty(), "must not steal a live game's bus");
         assert_eq!(dp.counters.beacons.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn booted_standin_leaves_the_join_scan_frames_for_the_game() {
+        // Post-boot the drain and the game's own CheckRX read the same queue:
+        // a beacon the stand-in consumes is one the game's scan never sees, so
+        // a game that scans before it powers up waits forever while the host
+        // starves (Bomberman: guest `answered 0`). The join/scan set goes back
+        // to the inbox; polls stay consumed and answered.
+        let bus = MockBus::new();
+        let dp = DownloadPlayJoiner::new(true, 1);
+        let mut st = State::default();
+        st.booted = true;
+        let beacon = beacon_packet(HOST, 7, &[0x41], &[]);
+        let assoc = assoc_response_packet(US, HOST, 0, 0xC001);
+        bus.push(beacon.clone());
+        bus.push(assoc.clone());
+        bus.push(command_packet(HOST, 0x00));
+        step(&bus, &dp, &mut st, Instant::now());
+        let back = bus.requeued.lock().unwrap().clone();
+        assert_eq!(back, vec![beacon, assoc], "join/scan frames go back, in order");
+        assert_eq!(dp.counters.frames_requeued.load(Ordering::SeqCst), 2);
+        assert_eq!(dp.counters.beacons.load(Ordering::SeqCst), 0, "restored, not tracked");
+        assert_eq!(dp.counters.assoc_recv.load(Ordering::SeqCst), 0);
+        assert!(st.host.is_none(), "the game earns its own association now");
+        assert_eq!(st.phase, Phase::Seek);
+        assert_eq!(dp.counters.commands_recv.load(Ordering::SeqCst), 1, "polls still answered");
+
+        // Pre-boot the same frames are the handshake itself: consumed, tracked.
+        let bus2 = MockBus::new();
+        let dp2 = DownloadPlayJoiner::new(true, 1);
+        let mut st2 = State::default();
+        bus2.push(beacon_packet(HOST, 7, &[0x41], &[]));
+        step(&bus2, &dp2, &mut st2, Instant::now());
+        assert!(bus2.requeued.lock().unwrap().is_empty());
+        assert_eq!(dp2.counters.beacons.load(Ordering::SeqCst), 1);
+        assert!(st2.host.is_some());
     }
 
     #[test]
@@ -3391,23 +3499,31 @@ mod tests {
 
         // The child's own game powers its block off as its bring-up cycles it,
         // which detaches the console underneath the hand-off. While the radio
-        // is off the joiner is the firmware stand-in: it holds the bus, drains
-        // (the game reads nothing while off-radio, so there is nothing to
-        // steal), and answers the host's polls so the host keeps polling
-        // instead of deauthenticating a silent client.
+        // is off the joiner is the firmware stand-in: it holds the bus and
+        // answers the host's polls so the host keeps polling instead of
+        // deauthenticating a silent client. But the drain and the game's own
+        // CheckRX read the same per-slot queue, so the join/scan frames go
+        // back for the game - consuming a beacon here is one the game's scan
+        // never sees, which is what parked Bomberman's guest with `answered 0`.
         bus.listening.store(false, Ordering::SeqCst);
         let sent_before = bus.sent().len();
         let replies_before = bus.replies().len();
-        bus.push(beacon_packet(HOST, 7, &[1], &[]));
+        let beacon = beacon_packet(HOST, 7, &[1], &[]);
+        bus.push(beacon.clone());
         step(&bus, &dp, &mut st, t0 + 7 * RESEND);
         assert!(
             bus.receiving(),
             "a booted client is held on the bus: the router must keep writing it frames"
         );
         assert_eq!(
+            bus.requeued.lock().unwrap().clone(),
+            vec![beacon],
+            "a post-boot beacon goes back to the inbox for the game's scan"
+        );
+        assert_eq!(
             dp.counters.beacons.load(Ordering::SeqCst),
-            2,
-            "the stand-in drains while the game is off-radio: those frames are ones the game cannot read"
+            1,
+            "restored frames are not tracked as heard: only the pre-boot handshake is"
         );
         assert_eq!(bus.sent().len(), sent_before, "a booted joiner sends no management frames");
         assert_eq!(

@@ -113,8 +113,11 @@ const GAME_FIXES: &[GameFixSpec] = &[
               the Battle menu leads straight to a Download host lobby. Same \
               shared joiner (src-tauri/src/dp_joiner.rs), armed by this entry. \
               Host lobby reached live ('Starting a Battle Game! Waiting for \
-              players to enter!'); the transfer itself is unmeasured - \
-              recognized attach point and opt-in, not a working download.",
+              players to enter!'); transfer completes (672764 bytes BOOTED \
+              3/3) but both sides Communication-error post-boot: the host \
+              stops beaconing in battle-sync and this guest image never \
+              direct-assocs off the staged parameters (see compatibility.md \
+              'Bomberman').",
         implemented: false,
         download_play: true,
         source: "compatibility.md 'Bomberman' + logs/bomb_app.log",
