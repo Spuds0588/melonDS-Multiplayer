@@ -75,7 +75,7 @@ jobs:
       #    (`__builtin_trap`, `__aligned__`) and C++20 designated initializers,
       #    which MSVC rejects at /std:c++17. clang-cl emits MSVC-ABI objects and
       #    links with MSVC's linker, so the Rust MSVC toolchain still links it.
-      - name: Prepare the Windows toolchain
+      - name: Install the dirent header (Windows)
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
@@ -83,7 +83,21 @@ jobs:
           # a single-port install is refused (and the manifest would pull Qt).
           vcpkg install --classic dirent:x64-windows
           echo "DIRENT_INCLUDE_DIRS=C:/vcpkg/installed/x64-windows/include" >> "$GITHUB_ENV"
-          echo "MD_GENERATOR=-G|Visual Studio 17 2022|-A|x64|-T|ClangCL" >> "$GITHUB_ENV"
+
+      # The MSVC environment (INCLUDE/LIB/PATH) that clang-cl needs for the
+      # Windows headers and the import libraries. The action also turns on a
+      # developer shell for whatever Visual Studio the runner image carries,
+      # which is why the generator is Ninja rather than a version-named Visual
+      # Studio generator (the image's VS major version changes between images).
+      - name: Set up the MSVC environment (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Check the Windows compiler
+        if: matrix.os == 'windows-latest'
+        run: clang-cl --version
 
       # The C++ core + the multiplayer bridge. Exactly the BUILD.md line, so a
       # local build and a release build are the same build.
@@ -93,10 +107,14 @@ jobs:
           args=()
           if [ -n "${DIRENT_INCLUDE_DIRS:-}" ]; then
             args+=("-DDIRENT_INCLUDE_DIRS=$DIRENT_INCLUDE_DIRS")
-          fi
-          if [ -n "${MD_GENERATOR:-}" ]; then
-            IFS='|' read -r -a gen <<< "$MD_GENERATOR"
-            args+=("${gen[@]}")
+            # Ninja + clang-cl: the compiler the project's own Windows presets
+            # use, with the MSVC ABI and linker the Rust toolchain expects.
+            args+=("-G" "Ninja" "-DCMAKE_C_COMPILER=clang-cl" "-DCMAKE_CXX_COMPILER=clang-cl")
+            # clang-cl's LTO output is LLVM bitcode, which needs lld-link and
+            # llvm-lib to archive and link. Turning IPO off for this job keeps
+            # the Windows link on the same MSVC-compatible path Rust uses; the
+            # core is not slower in any way this app can measure.
+            args+=("-DENABLE_LTO_RELEASE=OFF" "-DENABLE_LTO=OFF")
           fi
           cmake -S . -B build-tauri \
             -DCMAKE_BUILD_TYPE=Release \
