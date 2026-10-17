@@ -62,22 +62,43 @@ jobs:
           workspaces: src-tauri -> target
           key: ${{ matrix.name }}
 
+      # MSVC has no <dirent.h>; the project's own manifest gets one from vcpkg
+      # (`vcpkg.json`, platform windows), and the core's CMake looks for it in
+      # DIRENT_INCLUDE_DIRS. Only that one header-only port is installed here -
+      # the full manifest would drag in Qt, which this build does not use.
+      - name: Install the MSVC dirent shim (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          vcpkg install dirent:x64-windows
+          echo "DIRENT_INCLUDE_DIRS=C:/vcpkg/installed/x64-windows/include" >> "$GITHUB_ENV"
+
       # The C++ core + the multiplayer bridge. Exactly the BUILD.md line, so a
       # local build and a release build are the same build.
       - name: Configure the core
-        run: >
-          cmake -S . -B build-tauri
-          -DCMAKE_BUILD_TYPE=Release
-          -DBUILD_QT_SDL=OFF
-          -DBUILD_TAURI_BRIDGE=ON
-          -DENABLE_OGLRENDERER=OFF
+        shell: bash
+        run: |
+          extra=""
+          if [ -n "${DIRENT_INCLUDE_DIRS:-}" ]; then
+            extra="-DDIRENT_INCLUDE_DIRS=$DIRENT_INCLUDE_DIRS"
+          fi
+          cmake -S . -B build-tauri \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_QT_SDL=OFF \
+            -DBUILD_TAURI_BRIDGE=ON \
+            -DENABLE_OGLRENDERER=OFF \
+            $extra
 
       - name: Build the core and the bridge
         run: cmake --build build-tauri --config Release --parallel
 
+      # The test ROM is generated, not committed (a ROM in the tree is a ROM
+      # nobody may redistribute): build it first, then run the gate.
       - name: Smoke-test the core (Linux)
         if: matrix.os == 'ubuntu-22.04'
-        run: ./build-tauri/md_smoke_test tools/mkdiagrom/diag.nds
+        run: |
+          python3 tools/mkdiagrom/mkdiagrom.py --output tools/mkdiagrom/diag.nds
+          ./build-tauri/md_smoke_test tools/mkdiagrom/diag.nds
 
       - name: Install the Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
