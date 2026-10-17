@@ -94,7 +94,8 @@ the linker output.
 An alpha is built by CI, not on a dev machine: the core has to be compiled by
 each target's own toolchain (MSVC, AppleClang, GCC), and only a runner of that
 OS can do it. `.github/workflows/release-tauri.yml` builds Linux (AppImage,
-.deb), macOS (dmg) and Windows (nsis, msi) on every tag matching `v*-alpha*`,
+.deb), macOS (dmg) and Windows (**nsis** - WiX's MSI refuses a non-numeric
+pre-release identifier like `alpha.3`) on every tag matching `v*-alpha*`,
 run the smoke test on Linux before packaging, and publishes the installers as a
 **pre-release**. It can also be run by hand (`workflow_dispatch`) to shake a
 build out without tagging.
@@ -104,6 +105,14 @@ build out without tagging.
 git tag -a v0.1.5-alpha.3 -m "melonDS Multiplayer 0.1.5-alpha.3"
 git push origin master v0.1.5-alpha.3     # the tag is what starts the build
 ```
+
+Two Windows-specific notes, both learned by building it: the core compiles
+with **clang-cl** (the project's own Windows presets do the same, because MSVC
+rejects `__builtin_trap`, `__aligned__` and the core's C++20 designated
+initializers at `/std:c++17`), and it needs vcpkg's `dirent` header, which
+`vcpkg.json` already declares for Windows. IPO/LTO stays off on that job: 
+clang-cl's LTO output is LLVM bitcode and would need `lld-link` to archive and
+link it.
 
 Builds are unsigned on purpose (an alpha is not distributable as a signed
 release): macOS needs right-click-Open the first time, and Windows SmartScreen
