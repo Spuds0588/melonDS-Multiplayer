@@ -977,6 +977,29 @@ u32 md_run_frame(MDInstance* inst)
     return lines;
 }
 
+/* Drains this console's mixed audio into `out` as interleaved stereo s16.
+
+   melonDS's SPU always runs and always fills its output ring - an emulator with
+   no audio frontend is not an emulator with no audio, it is one whose ring
+   wraps - so the samples are simply there to be read. Until 2026-10-17 nothing
+   in this host read them (the app shipped silent); this is the first sink, and
+   it exists so a remote player can hear the console they are playing.
+
+   `max_frames` counts stereo frames, not s16 values: one frame is four bytes.
+   Returns the number of **s16 values** written (frames * 2), 0 when the ring is
+   empty, or -1 for a bad instance. `out_rate` receives the mixer's rate (the
+   core's default 48 kHz), which the caller must resample for its sink. */
+int md_read_audio(MDInstance* inst, int16_t* out, int max_frames, int* out_rate)
+{
+    if (!inst || !inst->nds || !out || max_frames <= 0) return -1;
+    if (out_rate) *out_rate = 48000;
+
+    const int available = inst->nds->SPU.GetOutputSize();
+    if (available <= 0) return 0;
+    const int frames = available < max_frames ? available : max_frames;
+    return inst->nds->SPU.ReadOutput(out, frames) * 2;
+}
+
 int md_get_screens(MDInstance* inst, const u32** top, const u32** bottom)
 {
     if (!inst || !inst->nds || !top || !bottom) return -1;

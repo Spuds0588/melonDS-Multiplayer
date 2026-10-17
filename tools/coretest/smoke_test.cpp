@@ -1283,6 +1283,42 @@ int main(int argc, char** argv)
               "booting clears the traced FIFO words too, both directions");
     }
 
+    /* ---- audio: the samples an online guest actually hears -------------- */
+
+    /* md_read_audio is the only sink the app has ever had for the SPU's ring
+       (before it, a session ran with the mixer filling a buffer nobody read).
+       Its whole contract is small enough to pin down here: it drains what the
+       core wrote, it reports the mixer's rate, it never claims more s16 values
+       than it was given room for, and a nonsense call is refused instead of
+       writing somewhere. Whether the samples are *audible* needs a game with
+       sound; whether the ring is being filled every frame is exactly what this
+       checks. */
+    {
+        const int frames = 4096;
+        std::vector<int16_t> pcm(frames * 2, 0x7F7F);
+        int rate = 0;
+
+        check(md_read_audio(a, pcm.data(), frames, &rate) > 0,
+              "the console's audio ring has samples after running frames");
+        check(rate == 48000, "the audio read reports the mixer's own rate");
+
+        /* Drain, then run more frames: a ring that was read once and never
+           written again would look identical to a working one. */
+        int guard = 0;
+        while (md_read_audio(a, pcm.data(), frames, &rate) > 0 && guard++ < 64) {}
+        check(guard < 64, "the audio ring drains to empty instead of streaming forever");
+
+        run_frames(a, 2);
+        const int refill = md_read_audio(a, pcm.data(), frames, &rate);
+        check(refill > 0 && refill % 2 == 0 && refill <= frames * 2,
+              "running frames refills it, in whole stereo pairs within the buffer given");
+
+        check(md_read_audio(nullptr, pcm.data(), frames, &rate) == -1,
+              "audio read refuses a null instance");
+        check(md_read_audio(a, pcm.data(), 0, &rate) == -1,
+              "audio read refuses a zero-sized buffer");
+    }
+
     /* ---- shutdown ------------------------------------------------------- */
 
     md_destroy(a);

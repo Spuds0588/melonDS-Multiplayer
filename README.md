@@ -31,9 +31,22 @@ The primary audience is players who want to play multiplayer DS games on a singl
 - **Per-player controls** — keyboard zones or multiple gamepads
 - **Side-by-side display** with configurable layouts (grid, speaker, focus, overlay)
 
-### Secondary Goal: Online Play (Future)
+### Secondary Goal: Online Play
 
-Online multiplayer for remote players is a potential future enhancement, not the core focus. When implemented, remote players would connect via WebRTC to see their assigned screen and send inputs back to the host — similar to how mgba-splitscreen's roadmap mentions a "hosted multiplayer" mode.
+A remote player plays one console of the host's session: the host streams that
+seat its own two screens and that console's audio, and takes back a button mask
+and an optional touch point, over WebRTC (PeerJS). Emulation stays on the host,
+so a guest cannot desync the game. Guests join by six-digit code with host
+approval, or by a single-use magic link, from a plain web page
+(`frontend/guest.html`) that needs no installation and no backend.
+
+It is still the secondary goal, and it has one platform wrinkle: Debian and
+Ubuntu build WebKitGTK without WebRTC, so the Linux app's own window cannot
+host. The Online panel notices that and offers **Open in a browser…** instead:
+the app serves the same UI on loopback and the emulator keeps running in the
+app, so a Linux host plays online from Chrome or Firefox. Windows and macOS
+host in the app window directly. See
+[BUILD.md](./BUILD.md#online-play-remote-players) for what was measured.
 
 ---
 
@@ -61,7 +74,8 @@ Online multiplayer for remote players is a potential future enhancement, not the
 
 ### Play Modes
 - **Local splitscreen** (primary): Multiple players on one machine
-- **Online** (future): Remote players via WebRTC (roadmap item)
+- **Online**: Remote players via WebRTC — one console each, Windows/macOS hosts today
+  (Linux WebKitGTK has no WebRTC; the app says so rather than failing silently)
 
 ---
 
@@ -114,10 +128,15 @@ Online multiplayer for remote players is a potential future enhancement, not the
 - Nintendo DS ROM files
 - BIOS/firmware files (for firmware boot)
 
-### For Remote Players (Future Feature)
-- Any modern web browser
-- Stable internet connection
-- No installation required (when implemented)
+### For Remote Players
+- Any modern web browser with WebRTC (Chrome, Edge, Firefox, Safari)
+- A stable internet connection
+- No installation
+
+### For Hosting on Linux
+- The app, plus a browser with WebRTC for the page (Chrome, Firefox, Edge)
+- Nothing else: the app starts a loopback server and opens the browser for you
+  (Online panel → *Open in a browser…*), because the Linux WebView has no WebRTC
 
 ---
 

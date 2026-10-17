@@ -206,6 +206,13 @@ uint32_t md_run_frame(MDInstance* inst);
    software renderer produces them. Valid until the next md_run_frame(). */
 int md_get_screens(MDInstance* inst, const uint32_t** top, const uint32_t** bottom);
 
+/* Drain this console's audio as interleaved stereo s16. `max_frames` counts
+   stereo frames (4 bytes each); the return value is the number of s16 values
+   written (frames * 2), 0 when nothing is buffered, -1 on a bad instance.
+   `out_rate` receives the mixer's sample rate (the core's 48 kHz default),
+   which a sink has to resample to its own device rate. */
+int md_read_audio(MDInstance* inst, int16_t* out, int max_frames, int* out_rate);
+
 /* -------------------------------------------------------------------- state */
 
 /* Size of the scratch buffer md_save_state() needs. */

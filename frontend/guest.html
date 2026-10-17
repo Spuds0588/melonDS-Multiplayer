@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>melonDS Multiplayer — remote player</title>
+  <!-- The guest page is the other end of an online session: it renders the one
+       console the host streams to this seat (both DS screens, stacked) and
+       sends this player's input back. It needs nothing but two files, which is
+       why it can be hosted anywhere static - the host's invite link points at
+       it. -->
+  <style>
+    :root { color-scheme: dark; --bg:#14161c; --panel:#1d2029; --ink:#e8eaf0; --dim:#8b90a0; --accent:#d40000; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+      align-items: center; justify-content: flex-start; gap: 0.8rem;
+      background: var(--bg); color: var(--ink);
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif; padding: 1rem;
+    }
+    h1 { font-size: 1rem; font-weight: 600; margin: 0.4rem 0 0; }
+    h1::before { content:""; display:inline-block; width:12px; height:12px; margin-right:.5rem; border-radius:3px; background: var(--accent); }
+    #stage { position: relative; width: min(96vw, 560px); }
+    canvas {
+      width: 100%; aspect-ratio: 256 / 384; display: block; background: #000;
+      image-rendering: pixelated; border-radius: 6px; border: 1px solid #2a2e3a;
+      touch-action: none;
+    }
+    #overlay {
+      position: absolute; inset: 0; display: flex; flex-direction: column; gap: .6rem;
+      align-items: center; justify-content: center; text-align: center; padding: 1rem;
+      background: rgba(20,22,28,.86); border-radius: 6px; font-size: .85rem; color: var(--dim);
+    }
+    #overlay[hidden] { display: none; }
+    #overlay b { color: var(--ink); font-weight: 600; }
+    .row { display: flex; gap: .5rem; flex-wrap: wrap; justify-content: center; align-items: center; }
+    button, input {
+      background: #2a2e3a; border: 1px solid #3a3f4f; border-radius: 6px; color: var(--ink);
+      font: .85rem system-ui, sans-serif; padding: .4rem .8rem;
+    }
+    button.primary { background: var(--accent); border-color: #8f0000; }
+    button:disabled { opacity: .45; }
+    input { width: 8rem; text-align: center; letter-spacing: .25em; font-family: ui-monospace, monospace; }
+    #status { font-size: .8rem; color: var(--dim); max-width: 40rem; text-align: center; min-height: 1.2em; }
+    #status.error { color: #ff7a7a; }
+    #keys { font-size: .72rem; color: var(--dim); max-width: 40rem; text-align: center; line-height: 1.6; }
+    #keys b { color: var(--ink); font-weight: 500; }
+    #hud { font-size: .72rem; color: var(--dim); font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <h1>melonDS Multiplayer — remote player</h1>
+  <div class="row">
+    <span id="seat"></span>
+    <button id="sound" title="Browsers only allow audio after a click">Enable sound</button>
+  </div>
+  <div id="stage">
+    <canvas id="screen" width="256" height="384"></canvas>
+    <div id="overlay">
+      <div id="overlay-text">Waiting for the host's stream…</div>
+      <div class="row" id="code-entry">
+        <input id="code" inputmode="numeric" maxlength="6" placeholder="482917" />
+        <button id="join" class="primary">Join</button>
+      </div>
+      <div id="hint">Open the link the host sent you, or type the six-digit join code.</div>
+    </div>
+  </div>
+  <div id="status">not connected</div>
+  <div id="hud"></div>
+  <div id="keys">
+    <b>d-pad</b> WASD / arrows · <b>A</b> J or Z · <b>B</b> K or X · <b>X</b> I · <b>Y</b> U ·
+    <b>L</b> Q · <b>R</b> E · <b>Start</b> Enter · <b>Select</b> Shift · gamepads work too ·
+    tap the lower screen to use the touch screen
+  </div>
+
+  <script src="vendor/peerjs.min.js"></script>
+  <script src="online.js"></script>
+  <script>
+    "use strict";
+    // DS button bits, the same values the host's own keymaps use.
+    const BTN = { A: 1 << 0, B: 1 << 1, SELECT: 1 << 2, START: 1 << 3, RIGHT: 1 << 4,
+                  LEFT: 1 << 5, UP: 1 << 6, DOWN: 1 << 7, R: 1 << 8, L: 1 << 9,
+                  X: 1 << 10, Y: 1 << 11 };
+    const W = 256, H = 192;                 // one DS screen
+    const canvas = document.getElementById("screen");
+    const ctx = canvas.getContext("2d");
+    const overlay = document.getElementById("overlay");
+    const overlayText = document.getElementById("overlay-text");
+    const codeEntry = document.getElementById("code-entry");
+    const statusEl = document.getElementById("status");
+    const hudEl = document.getElementById("hud");
+    const seatEl = document.getElementById("seat");
+
+    function setStatus(text, isError = false) {
+      statusEl.textContent = text;
+      statusEl.classList.toggle("error", isError);
+    }
+
+    // ------------------------------------------------------------------
+    // Video: one JPEG per frame carrying both screens. Decoding is serialized
+    // and only the newest frame is kept while one is in flight, so a slow
+    // connection shows fewer, fresher frames instead of a growing backlog.
+    // ------------------------------------------------------------------
+    let decoding = false, pendingBlob = null, frames = 0, windowStart = 0, fps = 0;
+
+    // PeerJS hands the JPEG back as an ArrayBuffer, not the Blob the host
+    // encoded (its binarypack decoder turns a Blob into raw bytes). Feeding
+    // that to createImageBitmap throws - measured 2026-10-17: 31 frames
+    // arrived, the guest decoded none, and the picture stayed black while the
+    // status line said "connected". Normalise it here, once, and memoise the
+    // size so the HUD counts bytes that actually came over the wire.
+    function asJpeg(data) {
+      if (data instanceof Blob) return data;
+      if (data instanceof ArrayBuffer) return new Blob([data], { type: "image/jpeg" });
+      if (ArrayBuffer.isView(data)) return new Blob([data], { type: "image/jpeg" });
+      return data;
+    }
+
+    async function drawFrame(data) {
+      if (decoding) { pendingBlob = data; return; }
+      decoding = true;
+      try {
+        const bitmap = await createImageBitmap(asJpeg(data));
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        bitmap.close?.();
+        frames++;
+        overlay.hidden = true;
+        const now = performance.now();
+        if (!windowStart || now - windowStart >= 1000) { windowStart = now; fps = 0; }
+        fps++;
+      } catch (err) {
+        console.warn("frame decode failed", err);
+      }
+      decoding = false;
+      if (pendingBlob) { const next = pendingBlob; pendingBlob = null; drawFrame(next); }
+    }
+
+    // ------------------------------------------------------------------
+    // Audio: the host sends ~30ms batches of [u32 rate][stereo s16]. Chunks are
+    // scheduled back to back on the AudioContext clock; if the schedule falls
+    // more than a third of a second behind, it is reset rather than allowed to
+    // drift, which keeps the lag a guest hears bounded and small.
+    // ------------------------------------------------------------------
+    let audioCtx = null, nextAudioTime = 0, audioChunks = 0;
+
+    function enableSound() {
+      if (!audioCtx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) { setStatus("this browser has no audio support", true); return false; }
+        audioCtx = new Ctx();
+      }
+      audioCtx.resume().catch(() => {});
+      return true;
+    }
+    document.getElementById("sound").addEventListener("click", () => {
+      if (enableSound()) setStatus("sound on");
+    });
+
+    function playAudio(bytes) {
+      if (!audioCtx || bytes.length < 8) return;
+      const rate = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true);
+      if (!rate) return;
+      const pcm = new Int16Array(bytes.buffer, bytes.byteOffset + 4, ((bytes.length - 4) / 2) | 0);
+      const count = (pcm.length / 2) | 0;
+      if (!count) return;
+      const buffer = audioCtx.createBuffer(2, count, rate);
+      const left = buffer.getChannelData(0), right = buffer.getChannelData(1);
+      for (let i = 0; i < count; i++) {
+        left[i] = pcm[i * 2] / 32768;
+        right[i] = pcm[i * 2 + 1] / 32768;
+      }
+      const source = audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+      const now = audioCtx.currentTime;
+      if (nextAudioTime < now + 0.04 || nextAudioTime > now + 0.35) nextAudioTime = now + 0.04;
+      source.start(nextAudioTime);
+      nextAudioTime += buffer.duration;
+      audioChunks++;
+    }
+
+    // ------------------------------------------------------------------
+    // Input: keyboard and gamepads produce one bitmask, plus an optional touch
+    // position on the lower screen, and both travel together in every message
+    // (the host applies them as one state, so a key can never lift a pen).
+    // ------------------------------------------------------------------
+    const KEY_BITS = {
+      KeyW: BTN.UP, ArrowUp: BTN.UP, KeyS: BTN.DOWN, ArrowDown: BTN.DOWN,
+      KeyA: BTN.LEFT, ArrowLeft: BTN.LEFT, KeyD: BTN.RIGHT, ArrowRight: BTN.RIGHT,
+      KeyJ: BTN.A, KeyZ: BTN.A, KeyK: BTN.B, KeyX: BTN.B, KeyI: BTN.X, KeyU: BTN.Y,
+      KeyQ: BTN.L, KeyE: BTN.R, Enter: BTN.START, ShiftLeft: BTN.SELECT, ShiftRight: BTN.SELECT,
+      Space: BTN.START, Backspace: BTN.SELECT,
+    };
+    const PAD_BUTTONS = [
+      [0, BTN.A], [1, BTN.B], [2, BTN.X], [3, BTN.Y],
+      [4, BTN.L], [6, BTN.L], [5, BTN.R], [7, BTN.R],
+      [8, BTN.SELECT], [9, BTN.START],
+      [12, BTN.UP], [13, BTN.DOWN], [14, BTN.LEFT], [15, BTN.RIGHT],
+    ];
+    const PAD_DEADZONE = 0.5;
+
+    const held = new Set();
+    let padMask = 0;
+    let touch = null;          // [x, y] on the bottom screen, or null
+    let lastSent = "";
+
+    function mask() {
+      let m = padMask;
+      for (const code of held) m |= KEY_BITS[code] || 0;
+      return m >>> 0;
+    }
+
+    function push() {
+      const m = mask();
+      const sig = `${m}:${touch ? touch.join(",") : "-"}`;
+      if (sig === lastSent) return;
+      lastSent = sig;
+      window.mdOnline.sendInput(m, touch);
+    }
+
+    window.addEventListener("keydown", (e) => {
+      if (/^(INPUT|TEXTAREA)$/.test(e.target.tagName)) return;
+      if (KEY_BITS[e.code] && !e.repeat) { held.add(e.code); push(); e.preventDefault(); }
+    });
+    window.addEventListener("keyup", (e) => {
+      if (held.delete(e.code)) { push(); e.preventDefault(); }
+    });
+    window.addEventListener("blur", () => { held.clear(); padMask = 0; push(); });
+
+    function pollPads() {
+      const pads = navigator.getGamepads ? [...navigator.getGamepads()].filter((p) => p && p.connected) : [];
+      let m = 0;
+      for (const gp of pads) {
+        for (const [btn, bit] of PAD_BUTTONS) {
+          const b = gp.buttons[btn];
+          if (b && (b.pressed || b.value >= PAD_DEADZONE)) m |= bit;
+        }
+        const ax = gp.axes[0] ?? 0, ay = gp.axes[1] ?? 0;
+        if (ax <= -PAD_DEADZONE) m |= BTN.LEFT;
+        else if (ax >= PAD_DEADZONE) m |= BTN.RIGHT;
+        if (ay <= -PAD_DEADZONE) m |= BTN.UP;
+        else if (ay >= PAD_DEADZONE) m |= BTN.DOWN;
+      }
+      if (m !== padMask) { padMask = m; push(); }
+      requestAnimationFrame(pollPads);
+    }
+
+    // Touch: the stream is both screens stacked, so a press on the lower half
+    // is a pen at the matching point of the DS's 256x192 touch screen; the
+    // upper half just sends the current buttons.
+    // The stream is both screens stacked, so canvas coordinates map to a DS
+    // point by halving the height. A drag stays on the touch screen even when
+    // the pointer wanders onto the top half, because that is what a thumb on
+    // the lower screen does.
+    function locate(e) {
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.round((e.clientX - rect.left) / rect.width * W);
+      const y = Math.round((e.clientY - rect.top) / rect.height * (H * 2));
+      return [Math.max(0, Math.min(W - 1, x)), Math.max(0, Math.min(H - 1, y - H))];
+    }
+    let dragging = false;
+    canvas.addEventListener("pointerdown", (e) => {
+      enableSound();
+      const rect = canvas.getBoundingClientRect();
+      const y = Math.round((e.clientY - rect.top) / rect.height * (H * 2));
+      if (y >= H) { touch = locate(e); dragging = true; }
+      canvas.setPointerCapture?.(e.pointerId);
+      push();
+    });
+    canvas.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      touch = locate(e);
+      push();
+    });
+    const lift = () => { dragging = false; if (touch) { touch = null; push(); } };
+    canvas.addEventListener("pointerup", lift);
+    canvas.addEventListener("pointercancel", lift);
+    canvas.addEventListener("pointerleave", lift);
+    function enableSoundIfSuspended() { if (audioCtx && audioCtx.state === "suspended") audioCtx.resume().catch(() => {}); }
+
+    // ------------------------------------------------------------------
+    // Join
+    // ------------------------------------------------------------------
+    function report(text, isError = false) {
+      setStatus(text, isError);
+      window.__guestStatus = text;
+    }
+
+    document.getElementById("join").addEventListener("click", () => {
+      const code = (document.getElementById("code").value || "").replace(/\D/g, "");
+      if (code.length !== 6) { report("a join code is six digits", true); return; }
+      const url = new URL(window.location.href);
+      url.search = "";
+      url.hash = "";
+      url.searchParams.set("online", "join");
+      url.searchParams.set("code", code);
+      window.location.href = url.href;
+    });
+    document.getElementById("code").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") document.getElementById("join").click();
+    });
+
+    // A browser without WebRTC cannot reach the host at all, and PeerJS phrases
+    // that as "the current browser does not support WebRTC" - true, but it does
+    // not tell the player what to do about it.
+    const hasWebRTC = typeof RTCPeerConnection === "function";
+    const params = new URLSearchParams(window.location.search);
+    window.__guestStatus = "not connected";
+    if (!hasWebRTC) {
+      overlayText.innerHTML = "<b>This browser has no WebRTC</b>";
+      report("this browser cannot reach the host - try Chrome, Edge, Firefox or Safari", true);
+    } else if (params.get("online") === "join") {
+      codeEntry.hidden = true;
+      overlayText.innerHTML = "<b>Connecting to the host…</b>";
+      report("connecting…");
+    } else {
+      overlayText.innerHTML = "<b>No session yet</b>";
+      report("enter the host's join code");
+    }
+
+    window.mdOnline.init({
+      status: (text) => report(text, /unavailable|declined|invalid|expired|refused|disconnected|failed|full|busy/i.test(text)),
+      welcome: (msg) => {
+        seatEl.textContent = `Player ${msg.player + 1}`;
+        document.title = `melonDS Multiplayer — Player ${msg.player + 1}`;
+        overlay.hidden = true;
+        enableSound();
+      },
+      frame: (data) => {
+        const jpeg = asJpeg(data);
+        window.mdOnline.noteGuestFrame(jpeg.size || data.byteLength || 0);
+        drawFrame(jpeg);
+      },
+      audio: (bytes) => playAudio(bytes),
+      error: () => { overlay.hidden = false; },
+    });
+
+    // Guest-side health, readable from a test driver: fps, seat and whether a
+    // frame has ever arrived.
+    setInterval(() => {
+      const s = window.mdOnline.stats();
+      hudEl.textContent = s.role === "guest"
+        ? `${fps} fps · ${Math.round((s.guest.bytes / 1024))} KB · seat ${s.guest.seat == null ? "-" : s.guest.seat + 1} · audio ${audioChunks}`
+        : "idle";
+      window.__guestHud = { fps, ...s };
+    }, 1000);
+    pollPads();
+  </script>
+</body>
+</html>

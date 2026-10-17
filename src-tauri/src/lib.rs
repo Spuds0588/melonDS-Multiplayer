@@ -21,6 +21,9 @@ mod game_profile;
 // exist, so its link path is unchanged.
 mod dp_frames;
 mod dp_joiner;
+// The same frontend, served to a browser the user already has: the way online
+// play is hosted on a platform whose WebView has no WebRTC (see the module).
+mod browser_host;
 
 use parking_lot::{Condvar, Mutex, RwLock};
 use tauri::Manager;
@@ -380,6 +383,7 @@ extern "C" {
     // management frames from it, so the host's answer comes back to a console
     // that exists on the bus.
     fn md_console_mac(inst: *mut MDInstance, out: *mut u8) -> i32;
+    fn md_read_audio(inst: *mut MDInstance, out: *mut i16, max_frames: i32, out_rate: *mut i32) -> i32;
     fn md_console_name(inst: *mut MDInstance, out: *mut i8, cap: i32) -> i32;
     fn md_link_attached(inst: *mut MDInstance) -> i32;
     // Boot a single-card Download Play child image on this console: write the
@@ -2701,12 +2705,15 @@ fn dp_state(session: &Session) -> serde_json::Value {
 /// BGRA-in-memory bytes, which is exactly what a canvas ImageData wants after
 /// the frontend handles the alpha channel). Raw bytes keep a 60fps read at tens
 /// of MB/s instead of JSON's gigahertz of commas.
-#[tauri::command]
-fn get_frames(state: tauri::State<'_, AppState>) -> Result<tauri::ipc::Response, String> {
+///
+/// Split out of the command so the browser host (`browser_host.rs`) can put the
+/// identical payload on its own wire: the two transports must not drift, and
+/// the page decodes one format regardless of which one it arrived on. No session
+/// means an empty body, which is what tells the frontend to show the placeholder.
+fn frames_payload(state: &AppState) -> Vec<u8> {
     let current = state.session.read();
     let Some(session) = current.as_ref() else {
-        // No session: empty body tells the frontend to show the placeholder.
-        return Ok(tauri::ipc::Response::new(Vec::new()));
+        return Vec::new();
     };
 
     let mut payload = Vec::with_capacity(session.players * (8 + MD_SCREEN_BYTES * 2));
@@ -2719,7 +2726,77 @@ fn get_frames(state: tauri::State<'_, AppState>) -> Result<tauri::ipc::Response,
             payload.extend_from_slice(&[r, g, b, a.max(0xFF)]);
         }
     }
-    Ok(tauri::ipc::Response::new(payload))
+    payload
+}
+
+#[tauri::command]
+fn get_frames(state: tauri::State<'_, AppState>) -> Result<tauri::ipc::Response, String> {
+    Ok(tauri::ipc::Response::new(frames_payload(state.inner())))
+}
+
+/// One fetch of audio, in the same shape as `get_frames`: a header, then one
+/// chunk per requested console. Polled by the frontend only while online play
+/// is hosting, so a local session pays nothing for a stream nobody is watching.
+///
+/// Layout (little endian): `u32 rate`, `u32 seatCount`, then per seat
+/// `u32 seat`, `u32 byteLen`, `byteLen` bytes of interleaved stereo s16.
+const MD_AUDIO_MAX_FRAMES: usize = 8192; // ~170ms at 48kHz; a DS frame is ~1092
+
+/// The bytes `get_audio` answers with (see the layout note above). Split out of
+/// the command for the same reason as `frames_payload`.
+fn audio_payload(state: &AppState, seats: &[u32]) -> Vec<u8> {
+    let current = state.session.read();
+    let Some(session) = current.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut samples = [0i16; MD_AUDIO_MAX_FRAMES * 2];
+    let mut rate: i32 = 48000;
+    let mut chunks: Vec<(u32, Vec<u8>)> = Vec::with_capacity(seats.len());
+    for &seat in seats {
+        let Some(inst) = session.instances.get(seat as usize) else {
+            continue;
+        };
+        let n = unsafe {
+            md_read_audio(
+                inst.ptr,
+                samples.as_mut_ptr(),
+                MD_AUDIO_MAX_FRAMES as i32,
+                &mut rate,
+            )
+        };
+        if n <= 0 {
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(n as usize * 2);
+        for value in &samples[..n as usize] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        chunks.push((seat, bytes));
+    }
+
+    let mut payload = Vec::with_capacity(
+        8 + chunks.iter().map(|(_, b)| 8 + b.len()).sum::<usize>(),
+    );
+    payload.extend_from_slice(&(rate as u32).to_le_bytes());
+    payload.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+    for (seat, bytes) in chunks {
+        payload.extend_from_slice(&seat.to_le_bytes());
+        payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&bytes);
+    }
+    payload
+}
+
+#[tauri::command]
+fn get_audio(
+    state: tauri::State<'_, AppState>,
+    seats: Vec<u32>,
+) -> Result<tauri::ipc::Response, String> {
+    Ok(tauri::ipc::Response::new(audio_payload(
+        state.inner(),
+        &seats,
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3193,6 +3270,52 @@ fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
     log::info!("quitting");
     app.exit(0);
     Ok(())
+}
+
+/// Serve the app's own UI on loopback, for a browser to open. This is how a
+/// Linux host plays online at all: its WebView has no WebRTC, but Chrome and
+/// Firefox do (see browser_host.rs).
+#[tauri::command]
+fn browser_host_start() -> Result<serde_json::Value, String> {
+    let host = browser_host::start()?;
+    let url = browser_host::url_for(&host);
+    log::warn!(
+        "browser host listening on 127.0.0.1:{} - it carries the emulator's own \
+         command interface, so the token in the URL is the credential",
+        host.port
+    );
+    Ok(serde_json::json!({ "port": host.port, "url": url }))
+}
+
+/// Hands the URL to the desktop's browser. Failure is not fatal: the panel
+/// shows the URL either way, and the user can paste it.
+#[tauri::command]
+fn browser_host_open(url: String) -> Result<(), String> {
+    // MD_BROWSER names a browser explicitly (a test does that, and so does
+    // anybody whose default browser is the one without WebRTC).
+    let explicit = std::env::var("MD_BROWSER").ok().filter(|s| !s.is_empty());
+    let attempts: Vec<(&str, Vec<&str>)> = match explicit.as_deref() {
+        Some(browser) => vec![(browser, vec![url.as_str()])],
+        None if cfg!(target_os = "macos") => vec![("open", vec![url.as_str()])],
+        None if cfg!(target_os = "windows") => vec![
+            ("cmd", vec!["/C", "start", "", url.as_str()]),
+        ],
+        None => vec![
+            ("xdg-open", vec![url.as_str()]),
+            ("gio", vec!["open", url.as_str()]),
+        ],
+    };
+    let mut last = String::new();
+    for (program, args) in attempts {
+        match std::process::Command::new(program).args(args).spawn() {
+            Ok(_) => {
+                log::info!("browser host: opened {url} with {program}");
+                return Ok(());
+            }
+            Err(err) => last = format!("{program}: {err}"),
+        }
+    }
+    Err(format!("could not open a browser ({last}) - the URL is in the panel"))
 }
 
 /// Initial UI layout config. The persisted frontend layout choice (Tab key,
@@ -5257,6 +5380,41 @@ fn spawn_control_server(app: tauri::AppHandle) {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// WebKitGTK ships WebRTC compiled in and switched off.
+///
+/// `WebKitSettings:enable-webrtc` has no positive default (it is FALSE, and
+/// turning it on is also what enables media-stream), and wry never touches it -
+/// so a Linux Tauri window is a browser with no `RTCPeerConnection` at all.
+/// PeerJS reports that exactly as "The current browser does not support
+/// WebRTC", which reads like an old browser rather than a setting. Measured on
+/// 2026-10-17 against WebKitGTK 2.52.6: `typeof RTCPeerConnection` was
+/// `undefined` in a secure context (`tauri://localhost`), and defined after
+/// this call.
+///
+/// WebView2 (Windows) and WKWebView (macOS) expose WebRTC by default and need
+/// nothing here, which is why this is the one platform-gated line in the host.
+#[cfg(target_os = "linux")]
+fn enable_webrtc(window: &tauri::WebviewWindow) {
+    use webkit2gtk::{SettingsExt, WebViewExt};
+    // The closure runs on the main thread, which is where GTK objects may be
+    // touched; `inner()` hands back a clone of the WebKitWebView the window
+    // owns, not a borrowed pointer.
+    let ok = window
+        .with_webview(|webview| {
+            match webview.inner().settings() {
+                Some(settings) => {
+                    settings.set_enable_webrtc(true);
+                    log::info!("webview: WebRTC enabled for online play");
+                }
+                None => log::warn!("webview: WebKitWebView has no settings object"),
+            }
+        })
+        .is_ok();
+    if !ok {
+        log::warn!("webview: could not reach the webview to enable WebRTC");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
@@ -5283,6 +5441,7 @@ pub fn run() {
             per_game_state,
             set_per_game_fix,
             get_frames,
+            get_audio,
             set_input,
             link_status,
             link_selftest,
@@ -5294,9 +5453,19 @@ pub fn run() {
             ui_config,
             ui_heartbeat,
             frontend_log,
+            browser_host_start,
+            browser_host_open,
             md_ctrl_report,
         ])
         .setup(|app| {
+            // Before any page script runs a health check worth believing: the
+            // setting has to be in place for `RTCPeerConnection` to exist when
+            // online.js looks for it at load. See enable_webrtc.
+            #[cfg(target_os = "linux")]
+            match app.get_webview_window("main") {
+                Some(window) => enable_webrtc(&window),
+                None => log::warn!("webview: no 'main' window to enable WebRTC on"),
+            }
             try_autostart(app.handle());
             Ok(())
         })
@@ -5318,6 +5487,10 @@ pub fn run() {
 
     // Opt-in test-drive channel (MD_CONTROL_PORT): off in normal runs.
     spawn_control_server(app.handle().clone());
+
+    // The browser host is started on demand (the Online panel's button), but it
+    // needs the handle before it can run a single command.
+    browser_host::attach(app.handle().clone());
 
     // Window and exit events are the difference between "the user closed it"
     // and "it died": a clean close leaves a line here, a crash leaves none.

@@ -1,0 +1,83 @@
+# Publish the remote-player page that online-play invite links point at.
+#
+# A magic link is a URL a host sends to a friend. The friend's browser needs to
+# load something before it can talk to the host: `guest.html`, the transport it
+# uses (`online.js`) and the vendored PeerJS build. That is exactly three files,
+# with no backend, no build step and no secrets, so GitHub Pages serves them.
+#
+# Publishing the whole `frontend/` directory would also publish `index.html`,
+# the desktop app's own UI, which cannot run in a browser (it talks to the
+# emulator over Tauri's IPC). Only the three guest files are staged.
+#
+# The host app defaults its invite base to
+#   https://<owner>.github.io/<repo>/guest.html
+# and lets it be overridden in the Online panel, so this workflow is what makes
+# one-click invites work out of the box.
+name: Deploy guest page to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'frontend/guest.html'
+      - 'frontend/online.js'
+      - 'frontend/vendor/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          # Enable Pages (Actions build type) on the first run, so this needs no
+          # manual repository setting.
+          enablement: true
+      - name: Stage the guest page
+        run: |
+          set -eu
+          mkdir -p staged/vendor
+          cp frontend/guest.html staged/
+          cp frontend/online.js staged/
+          cp frontend/vendor/peerjs.min.js staged/vendor/
+          # A landing page, so the site root is not a 404 for someone who trims
+          # the URL back to the directory.
+          cat > staged/index.html <<'HTML'
+          <!DOCTYPE html>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>melonDS Multiplayer — remote player</title>
+          <style>
+            body { font: 1rem/1.5 system-ui, sans-serif; max-width: 34rem; margin: 3rem auto; padding: 0 1rem; }
+            code { background: #eee; padding: .1rem .3rem; border-radius: 3px; }
+          </style>
+          <h1>melonDS Multiplayer</h1>
+          <p>This page is the remote-player end of an online session. Open the invite
+          link the host sent you, or go to <code>guest.html</code> and type the
+          six-digit join code the host read out.</p>
+          <p><a href="guest.html">Continue to the join page</a></p>
+          HTML
+          ls -R staged
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: staged
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

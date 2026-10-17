@@ -89,6 +89,110 @@ wrong archive layout - it probes `Release/`, `RelWithDebInfo/` and the flat
 directory in that order, so a new generator is a branch there, not a puzzle in
 the linker output.
 
+### Online play (remote players)
+
+A remote player plays *one* console of the host's session, over the internet.
+The host stays authoritative and keeps running every console: it streams that
+seat its own two screens (composited into one 256x384 JPEG, latest frame wins)
+and its own console's audio, and takes back nothing but a button mask and an
+optional touch point. Emulation never happens twice, so a guest cannot desync
+the game, and a guest that falls behind drops frames instead of slowing anyone.
+
+Transport is PeerJS (WebRTC DataChannels) with the vendored build at
+`frontend/vendor/peerjs.min.js`; only the signalling handshake touches the
+public broker, payloads go peer to peer. Two doors into a session:
+
+* **Join code.** The host reads out six digits; the guest opens the guest page,
+types them, and the host approves the request by hand. The code is derived from
+the peer id and carries no secret, so approval is what actually admits a guest.
+* **Magic link.** One capability per seat, minted when hosting starts: the token
+travels in the URL *fragment* (never a referrer), is good for one use and ten
+minutes, and is checked against that seat's own invite. Send P2's link to P2;
+consuming it does not consume P3's.
+
+Both end at the same page: `frontend/guest.html`, which needs `online.js` and
+the vendored PeerJS next to it and nothing else - no backend, no build step.
+`.github/workflows/pages.yml` publishes those three files to GitHub Pages, and
+the host's Online panel defaults its invite base to
+`https://spuds0588.github.io/melonDS-Multiplayer/guest.html`, with a field to
+point it at your own copy instead (remembered in `localStorage`). Without a
+base URL the join code still works - only the clickable link needs the page.
+
+**A WebView without WebRTC hosts in a browser instead.** WebRTC is not a given:
+Debian and Ubuntu build `webkit2gtk` with `ENABLE_WEB_RTC` off, so a Linux
+window has PeerJS loaded, no `RTCPeerConnection`, and any host attempt fails
+with a sentence that sounds like an ancient browser. Measured on 2026-10-17 with
+a 25-line plain WebKitGTK program (no Tauri involved) against 2.52.6: with
+`enable-webrtc` set to TRUE the page still reported
+`typeof RTCPeerConnection === undefined`. Windows (WebView2) and macOS
+(WKWebView) do expose WebRTC, so hosting works in the app window there. The app
+also sets `WebKitSettings:enable-webrtc` at startup (`enable_webrtc` in
+`src-tauri/src/lib.rs`, the one platform-gated line in the host): WebKitGTK
+ships that setting *off* by default, so on a distro that does compile WebRTC in,
+the app turns it on rather than assuming it. Such a distro also needs
+`gstreamer1.0-plugins-bad` (`webrtcbin`) and `gstreamer1.0-nice` (`nicesrc`) at
+runtime.
+
+For the case that is left - a WebView with no WebRTC at all - the Online panel
+has **Open in a browser…**. That starts `browser_host.rs`: a loopback HTTP +
+WebSocket server that serves the *same* frontend (embedded in the binary with
+`include_str!`, so no directory has to exist next to the executable) and carries
+the same command interface. `frontend/browser-host.js` defines
+`window.__TAURI__.core.invoke` on top of that socket, so `index.html` does not
+know which backend it is talking to: same command names, same arguments, same
+payloads, and the two bulk reads (`get_frames`, `get_audio`) still go as raw
+bytes - eight bytes of request id in a binary WebSocket frame, then the payload
+the Tauri IPC would have carried. The emulator never moves: every console keeps
+running in the app, and the browser is only a view and a transport.
+
+Three properties are load-bearing, because a socket that can start emulators and
+press their buttons is worth being careful with: it binds `127.0.0.1` only, it
+listens only after the user asks for it, and every command needs a token minted
+at start that travels only inside the URL the app opens (a page that guesses the
+port gets `403`, and the page strips the token out of the address bar as soon as
+it has read it). The server hands out exactly five embedded files and never
+opens a path from a request - `curl` for `/etc/passwd` answers `404`. Two
+environment knobs exist for testing: `MD_BROWSER_PORT` pins the port instead of
+letting the OS choose, and `MD_BROWSER` names the browser to launch (default
+`xdg-open`, `open` on macOS, `start` on Windows). `MD_ROM_DIR` is where the
+Browse button looks in browser mode, since a browser cannot open a file dialog
+on someone else's disk - it lists `.nds` files as suggestions for the ROM field
+instead (`list_roms`).
+
+What was verified, and how. First the transport, with the app's own `online.js`
+driving three synthetic consoles in a browser host: two real browsers joined
+through the public broker - one by magic link and one by join code plus host
+approval - and both received decoded video and audio, while a keypress in a
+guest arrived at the host as `input p2: 0x1` (the A button). Then the whole
+thing, on Linux, with the emulator in the app: the app was started with three
+console threads on the diagnostic ROM, `browser_host_start` answered with
+`http://127.0.0.1:35343/?token=…`, Chromium opened it and adopted the running
+session, **Host online** in that page produced a join code and a peer id, a
+second browser tab joined by code (host approval included) and decoded the
+streamed screen, and a held A on that guest moved the *emulated* console's own
+keypad read - the diag ROM publishes what its console sees from the keypad at
+`0x02FFF01C`, read here through `tools/appctl.py mem`: `00000000 -> 00000001`
+on console 2, back to `00000000` on release, with consoles 1 and 3 still reading
+zero. The loopback transport measured 47 reads/s at 1.13 MB per read (~53 MB/s)
+when called in a tight loop.
+
+Two real bugs came out of that test and are fixed: PeerJS delivers the JPEG as
+an **ArrayBuffer**, not the Blob the host encoded, so the guest now normalises
+before `createImageBitmap` (before the fix: 31 frames arrived, none decoded,
+black screen, "connected" in the status line); and a guest's touch drag needs
+`pointermove`, not just a press.
+
+Not verified: frame rate under a real game. The stream loop is built so slow
+hardware costs frames rather than latency, but the numbers measured here came
+from a sandboxed browser whose JPEG encode was pathological (1.9s per 256x384
+frame, and `requestAnimationFrame` throttled to 2/s in a preview panel that was
+not the focused tab), so no frame-rate claim is being made.
+
+One more gap worth naming: the host's own players are still silent. The SPU's
+ring is read for the first time by this feature (`md_read_audio` in
+`src/frontend/tauri/Bridge.cpp`, `get_audio` in `src-tauri/src/lib.rs`, both
+covered by the smoke test), but nothing plays it locally yet.
+
 ### Cutting an alpha release
 
 An alpha is built by CI, not on a dev machine: the core has to be compiled by

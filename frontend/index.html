@@ -4,7 +4,10 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <!-- ipc / http://ipc.localhost are Tauri v2's IPC transports (webkitgtk / WebView2). -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost" />
+  <!-- wss://0.peerjs.com is the signalling broker online play uses; the media
+       itself is peer-to-peer and never touches it. Blocking it costs nothing
+       but online play (the transport reports "Online unavailable"). -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost wss://0.peerjs.com https://0.peerjs.com" />
   <title>melonDS Multiplayer</title>
   <style>
     /* melonDS Multiplayer shell styles. Dark theme; each player's console is a
@@ -206,6 +209,26 @@
     #pergame label { display: flex; align-items: center; gap: 0.4rem; color: var(--ink); cursor: pointer; }
     #pergame .code { font: 0.78rem ui-monospace, monospace; color: var(--dim); }
     #pergame .name { color: var(--ink); font-weight: 500; }
+    /* Online panel: the join code, the per-seat invite links, and any join
+       requests waiting on the host's own decision. */
+    #online {
+      display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap;
+      padding: 0.45rem 1.1rem; background: #171a20;
+      border-bottom: 1px solid #2a2e3a; font-size: 0.78rem; color: var(--dim);
+    }
+    #online[hidden] { display: none; }
+    #online .state { color: var(--ink); }
+    #online b { color: var(--ink); font: 0.85rem ui-monospace, monospace; letter-spacing: 0.15em; }
+    #online input[type="text"] {
+      background: #101218; border: 1px solid #2a2e3a; border-radius: 6px; color: var(--ink);
+      font: 0.72rem ui-monospace, monospace; padding: 0.2rem 0.4rem; width: 26rem;
+    }
+    #online label { display: flex; align-items: center; gap: 0.4rem; }
+    #online button { font-size: 0.72rem; padding: 0.2rem 0.5rem; }
+    #online .seat { display: inline-flex; gap: .35rem; align-items: center; margin-right: .6rem; }
+    #online .seat.live { color: #7ee0a2; }
+    #online .pending { color: #ffd479; }
+    #online a { color: #9fc4ff; }
   </style>
 </head>
 <body>
@@ -218,12 +241,18 @@
         <option value="3">3 players</option>
         <option value="4">4 players</option>
       </select>
-      <input type="text" id="rom" spellcheck="false"
+      <input type="text" id="rom" spellcheck="false" list="romlist"
              placeholder="path to .nds ROM" />
+      <!-- Filled by the Browse button in browser-host mode, where there is no
+           native file dialog: the suggestions are what the app found on disk. -->
+      <datalist id="romlist"></datalist>
       <button id="browse" title="Choose a ROM file">Browse…</button>
       <button id="start" class="primary">Start</button>
       <button id="stop" disabled>Stop</button>
       <button id="selftest" disabled title="Check the link between consoles: a test packet each way when no game has wireless on, otherwise a safe bus resync kick (injecting frames into a live lobby disturbs the game)">Link test</button>
+      <button id="online-start" title="Stream each player their own console over the internet (PeerJS), and take their input back">Host online</button>
+      <button id="online-stop" disabled title="Close the online session">Stop hosting</button>
+      <button id="online-browser" title="Run this UI in a real browser: online play is PeerJS, which needs WebRTC, and the Linux WebView has none. The emulator keeps running in the app either way.">Open in a browser…</button>
       <select id="view" title="Screen layout (1-screen: 3-4 players are a 2x2 grid; 2-screen: one row)">
         <option value="flip" selected>View: 1 screen (Tab peeks)</option>
         <option value="side">View: 2 screens</option>
@@ -238,6 +267,24 @@
     </label>
     <span id="pergame-detail">—</span>
   </div>
+  <!-- Online play: the host's own session, streamed seat by seat. Hidden until
+       somebody asks for it, because a local session pays nothing for a stream
+       nobody is watching. -->
+  <div id="online" hidden>
+    <span class="state" id="online-state">offline</span>
+    <span id="online-code-box" hidden>
+      join code <b id="online-code">------</b>
+    </span>
+    <label id="online-base-box" hidden>
+      guest page
+      <input type="text" id="online-base" spellcheck="false"
+             placeholder="https://…/guest.html — a static copy of frontend/guest.html" />
+    </label>
+    <span id="online-seats"></span>
+    <span id="online-browser-url" hidden></span>
+    <span id="online-links" hidden></span>
+    <span id="online-pending" hidden></span>
+  </div>
   <main id="consoles"></main>
   <footer>
     Local splitscreen host — one emulated console per player on the native
@@ -248,6 +295,13 @@
     that console's touch screen; the mouse is the pen on it at all times,
     shown or not.
   </footer>
+  <!-- Vendored, not from a CDN: the app is offline-first and its CSP allows no
+       third-party script origin (see the meta tag above). -->
+  <script src="vendor/peerjs.min.js"></script>
+  <script src="online.js"></script>
+  <!-- No-op inside the desktop window (the Tauri API is already there); in a
+       browser it defines the invoke() this page runs on. See browser-host.js. -->
+  <script src="browser-host.js"></script>
   <script>
     "use strict";
     // Tauri injects window.__TAURI__ (withGlobalTauri). Outside the app — e.g.
@@ -255,7 +309,13 @@
     // placeholder animation instead of crashing.
     const Tauri = window.__TAURI__ ?? null;
     const invoke = Tauri ? Tauri.core.invoke : null;
+    // Two kinds of backend look the same from here: the desktop window (native
+    // dialog available) and browser-host mode, where the page runs in the
+    // user's own browser because this WebView has no WebRTC, and the app serves
+    // it over loopback (see browser-host.js). The second has no native dialog
+    // but does have `list_roms`, so Browse still does something useful.
     const hasDialog = !!(Tauri && Tauri.dialog && Tauri.dialog.open);
+    const inBrowserHost = !!(Tauri && window.__mdBrowserHost);
 
     const W = 256, H = 192, PX = W * H, BPS = PX * 4;
 
@@ -321,6 +381,13 @@
     // the numpad digits) switch it. Switching releases everything held so a
     // half-pressed direction never carries across consoles.
     let active = 0;
+
+    // Which consoles are played by somebody else (online play, see the online
+    // block below). A remote seat's input comes down the connection and its
+    // local keyboard/pad is ignored, so two people racing one console cannot
+    // both be right about what is held.
+    const remoteSeats = new Set();
+    const remoteInput = [];
 
     // Layout modes: "flip" = one screen per card, top by default, hold-to-
     // peek the touch screen (the default; classic splitscreen). "side" =
@@ -589,7 +656,13 @@
       // The keyboard half is filtered through this console's zone (a code in
       // no zone moves nothing); the pad half is a complete DS pad already and
       // needs no zone to exist.
-      mask = (mask & playerMask(p)) | (c.padButtons >>> 0);
+      //
+      // A console played online has exactly one source of truth instead: the
+      // remote player's own state, which replaced this console's mask the
+      // moment they took the seat.
+      mask = remoteSeats.has(p)
+        ? (remoteInput[p] ? remoteInput[p].buttons >>> 0 : 0)
+        : (mask & playerMask(p)) | (c.padButtons >>> 0);
       c.buttons = mask;
       await pushInput(p);
     }
@@ -608,6 +681,7 @@
       if (!session) return [];
       const out = [];
       for (let p = 0; p < session.keymaps.length; p++) {
+        if (remoteSeats.has(p)) continue;   // that console belongs to a remote player
         if (maskFor(p, code)) out.push(p);
       }
       return out;
@@ -819,7 +893,7 @@
         }
       };
       wrap.addEventListener("pointerdown", (e) => {
-        if (p !== active) return; // pen belongs to the selected console
+        if (p !== active || remoteSeats.has(p)) return; // pen belongs to the selected console
         if (layoutMode === "side" && e.target === c().top) return;
         e.preventDefault();
         try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
@@ -829,7 +903,7 @@
         pushInput(p);
       });
       wrap.addEventListener("pointermove", (e) => {
-        if (p !== active) return;
+        if (p !== active || remoteSeats.has(p)) return;
         if (layoutMode === "side" && e.target === c().top && !c().pen.down) return;
         const xy = toDs(e);
         if (!xy) return;
@@ -840,7 +914,7 @@
         if (down) pushInput(p);
       });
       const up = (e) => {
-        if (p !== active) return;
+        if (p !== active || remoteSeats.has(p)) return;
         if (e) { try { wrap.releasePointerCapture(e.pointerId); } catch (_) {} }
         clearPen();
         pushInput(p);
@@ -1133,7 +1207,7 @@
       el("selftest").disabled = !running || !session || session.players < 2;
       el("players").disabled = running;
       el("rom").disabled = running;
-      el("browse").disabled = running || !hasDialog;
+      el("browse").disabled = running || !(hasDialog || inBrowserHost);
     }
 
     async function start() {
@@ -1170,6 +1244,15 @@
 
     async function stop() {
       if (!invoke) return;
+      // A session is what is being streamed, so it cannot outlive it quietly.
+      if (hasOnline && window.mdOnline.isHost()) {
+        window.mdOnline.stop();
+        for (let seat = 0; seat < canvases.length; seat++) releaseSeat(seat);
+        hostCode = null;
+        el("online-stop").disabled = true;
+        el("online-start").disabled = false;
+        renderOnline();
+      }
       try { await invoke("stop_session"); } catch (err) { console.error(err); }
       session = null;
       running = false;
@@ -1265,6 +1348,369 @@
     }
 
     // ------------------------------------------------------------------
+    // Online play: this machine hosts, remote players play one console each.
+    //
+    // The host is unchanged by any of it: it emulates the same consoles, the
+    // link between them is the same virtual Wi-Fi, and a remote player's input
+    // lands in exactly the state a local one's does. What is added is a stream
+    // out (that seat's two screens as one JPEG, that console's audio) and a
+    // stream in (buttons plus an optional touch point).
+    //
+    // The invite links point at a static copy of `frontend/guest.html`, so the
+    // host has to say where that copy lives - it is a page, not something this
+    // app can serve to a stranger's browser. Without it the join code still
+    // works; with it, one click is a magic link.
+    // ------------------------------------------------------------------
+    const onlineEl = el("online");
+    const onlineState = el("online-state");
+    const onlineCodeEl = el("online-code");
+    const onlineCodeBox = el("online-code-box");
+    const onlineBaseBox = el("online-base-box");
+    const onlineBase = el("online-base");
+    const onlineSeats = el("online-seats");
+    const onlineLinks = el("online-links");
+    const onlinePending = el("online-pending");
+    const onlineBrowserUrl = el("online-browser-url");
+    const hasOnline = typeof window.mdOnline === "object" && window.mdOnline !== null;
+    // WebRTC is not a given even in a modern WebView: WebKitGTK compiles it out
+    // on Debian and Ubuntu (ENABLE_WEB_RTC is off in their webkit2gtk builds),
+    // so a Linux window has PeerJS loaded, no RTCPeerConnection, and every host
+    // attempt fails with a sentence that sounds like an ancient browser. Say so
+    // up front instead, and leave local splitscreen (which needs none of this)
+    // completely untouched.
+    const hasWebRTC = typeof RTCPeerConnection === "function";
+
+    // One capability per seat, as in the sister project: consuming P2's link
+    // does not consume P3's, and a link that leaks is still bounded by expiry.
+    const invites = new Map();          // seat -> { token, expires, consumed }
+    const INVITE_TTL_MS = 10 * 60 * 1000;
+    let hostCode = null;                // the code the broker handed us, for the panel
+
+    function randomToken(size = 24) {
+      const bytes = new Uint8Array(size);
+      crypto.getRandomValues(bytes);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    // Where the guest page lives. The default is this repo's GitHub Pages copy,
+    // published by .github/workflows/pages.yml from the same guest.html in the
+    // bundle; a host running their own copy overrides it here and the override
+    // is remembered. Nothing about the invite depends on it being this URL -
+    // only the click does, so an empty field is a working join code and no link.
+    const DEFAULT_GUEST_PAGE = "https://spuds0588.github.io/melonDS-Multiplayer/guest.html";
+
+    function guestPageBase() {
+      try {
+        const saved = localStorage.getItem("guestPage");
+        return saved === null ? DEFAULT_GUEST_PAGE : saved.trim();
+      } catch (_) { return DEFAULT_GUEST_PAGE; }
+    }
+
+    function inviteUrl(seat) {
+      const invite = invites.get(seat);
+      const base = guestPageBase();
+      if (!base || !invite || invite.consumed) return null;
+      const url = new URL(base, window.location.href);
+      url.search = "";
+      url.hash = "";
+      url.searchParams.set("online", "join");
+      url.searchParams.set("peer", window.mdOnline.stats().peerId || "");
+      url.searchParams.set("player", String(seat));
+      url.searchParams.set("players", String(canvases.length));
+      url.searchParams.set("expires", String(invite.expires));
+      // Bearer data rides in the fragment: browsers never put it in a referrer.
+      url.hash = new URLSearchParams({
+        // The file name, not the path: the guest is told which game, not
+        // where the host keeps it.
+        session: session ? String(session.rom).split(/[\\/]/).pop() : "",
+        token: invite.token,
+        player: String(seat),
+      }).toString();
+      return url.href;
+    }
+
+    function newInvites() {
+      invites.clear();
+      const expires = Date.now() + INVITE_TTL_MS;
+      for (let seat = 1; seat < canvases.length; seat++) {
+        invites.set(seat, { token: randomToken(), expires, consumed: false });
+      }
+    }
+
+    // Per-seat audio, drained from the core by a poller of its own: the SPU's
+    // ring is the buffer, so the poller never needs to be the frame clock.
+    const audioQueue = new Map();       // seat -> [{ rate, bytes }]
+    let audioPolling = false;
+
+    function takeAudio(seat) {
+      const queue = audioQueue.get(seat);
+      if (!queue || !queue.length) return null;
+      const chunks = queue.splice(0, queue.length);
+      let total = 4;
+      for (const c of chunks) total += c.bytes.length;
+      const out = new Uint8Array(total);
+      new DataView(out.buffer).setUint32(0, chunks[0].rate, true);
+      let off = 4;
+      for (const c of chunks) { out.set(c.bytes, off); off += c.bytes.length; }
+      return out;
+    }
+
+    async function pollOnlineAudio() {
+      if (!hasOnline || !window.mdOnline.isHost()) { audioPolling = false; return; }
+      const seats = [...remoteSeats];
+      if (seats.length && invoke) {
+        try {
+          const buf = await invoke("get_audio", { seats });
+          if (buf instanceof ArrayBuffer && buf.byteLength >= 8) {
+            const dv = new DataView(buf);
+            const rate = dv.getUint32(0, true);
+            let off = 4;
+            const count = dv.getUint32(off, true); off += 4;
+            for (let i = 0; i < count; i++) {
+              const seat = dv.getUint32(off, true); off += 4;
+              const len = dv.getUint32(off, true); off += 4;
+              const bytes = new Uint8Array(buf.slice(off, off + len)); off += len;
+              if (!bytes.length) continue;
+              const queue = audioQueue.get(seat) || [];
+              queue.push({ rate, bytes });
+              // ~200ms of backlog is already more than a jitter buffer needs;
+              // past that the oldest is dropped rather than sent late.
+              while (queue.length > 12) queue.shift();
+              audioQueue.set(seat, queue);
+            }
+          }
+        } catch (err) {
+          report("warn", `get_audio failed: ${err}`);
+        }
+      }
+      setTimeout(pollOnlineAudio, 20);
+    }
+
+    function applyRemoteInput(seat, buttons, touch) {
+      const c = canvases[seat];
+      if (!c) return;
+      remoteSeats.add(seat);
+      remoteInput[seat] = { buttons: buttons >>> 0 };
+      if (touch) {
+        c.pen.x = Math.max(0, Math.min(W - 1, touch[0]));
+        c.pen.y = Math.max(0, Math.min(H - 1, touch[1]));
+        c.pen.down = true;
+      } else {
+        c.pen.down = false;
+      }
+      sendButtons(seat);
+    }
+
+    function releaseSeat(seat) {
+      const c = canvases[seat];
+      remoteSeats.delete(seat);
+      remoteInput[seat] = null;
+      audioQueue.delete(seat);
+      if (c) { c.pen.down = false; sendButtons(seat); }
+      invites.delete(seat);
+    }
+
+    function renderOnline(state) {
+      if (!hasOnline) return;
+      onlineEl.hidden = false;
+      const startButton = el("online-start");
+      // Asking for a browser from inside the browser is noise.
+      el("online-browser").hidden = inBrowserHost || !invoke;
+      if (!hasWebRTC) {
+        onlineState.textContent = "this WebView has no WebRTC - host in a browser instead";
+        startButton.disabled = true;
+        startButton.title = "Hosting needs WebRTC. This Linux WebView (WebKitGTK) is built without it, " +
+          "so use \"Open in a browser\": the emulator stays here, the page and its connection move " +
+          "to Chrome or Firefox. Local splitscreen is unaffected either way.";
+        return;
+      }
+      onlineBaseBox.hidden = false;
+      const role = state ? state.role : window.mdOnline.stats().role;
+      onlineState.textContent = role === "host"
+        ? `hosting · ${state ? state.seats.length : 0} of ${canvases.length - 1} seats taken`
+        : role === "guest" ? "guest" : "offline";
+      onlineCodeBox.hidden = role !== "host";
+      if (state && state.code) hostCode = state.code;
+      if (hostCode) onlineCodeEl.textContent = hostCode;
+      onlineSeats.innerHTML = "";
+      for (let seat = 1; seat < canvases.length; seat++) {
+        const span = document.createElement("span");
+        span.className = "seat" + (remoteSeats.has(seat) ? " live" : "");
+        span.textContent = remoteSeats.has(seat)
+          ? `P${seat + 1} online`
+          : `P${seat + 1} free`;
+        onlineSeats.append(span);
+      }
+      onlineLinks.hidden = role !== "host";
+      onlineLinks.innerHTML = "";
+      if (role === "host") {
+        if (!guestPageBase()) {
+          onlineLinks.textContent = "set the guest page URL once and every invite becomes a clickable link";
+        } else {
+          for (let seat = 1; seat < canvases.length; seat++) {
+            const url = inviteUrl(seat);
+            if (!url) continue;
+            const a = document.createElement("a");
+            a.href = url;
+            a.textContent = `invite P${seat + 1}`;
+            a.title = "right-click and copy this link";
+            const copy = document.createElement("button");
+            copy.textContent = "copy";
+            copy.addEventListener("click", async () => {
+              try { await navigator.clipboard.writeText(url); copy.textContent = "copied"; }
+              catch (_) { copy.textContent = "select it"; }
+            });
+            const wrap = document.createElement("span");
+            wrap.className = "seat";
+            wrap.append(a, copy);
+            onlineLinks.append(wrap);
+          }
+        }
+      }
+      const pending = state ? state.pending : [];
+      onlinePending.hidden = !pending.length;
+      onlinePending.textContent = "";
+      for (const request of pending) {
+        const span = document.createElement("span");
+        span.className = "pending";
+        span.textContent = `P${request.suggested + 1} wants to join — `;
+        const yes = document.createElement("button");
+        yes.textContent = "accept";
+        yes.addEventListener("click", () => window.mdOnline.approveRequest(request.id));
+        const no = document.createElement("button");
+        no.textContent = "decline";
+        no.addEventListener("click", () => window.mdOnline.denyRequest(request.id, "declined"));
+        span.append(yes, no);
+        onlinePending.append(span);
+      }
+    }
+
+    if (hasOnline) {
+      window.mdOnline.init({
+        status: (text) => setStatus(text, /unavailable|declined|invalid|expired|refused/i.test(text)),
+        hostState: renderOnline,
+        seatJoined: (seat) => {
+          remoteSeats.add(seat);
+          renderOnline();
+          startAudioPoll();
+        },
+        seatLeft: (seat, wasConnected) => {
+          releaseSeat(seat);
+          renderOnline();
+          setStatus(wasConnected ? `Player ${seat + 1} disconnected - their console is local again` : "", false, 4000);
+        },
+        input: (seat, buttons, touch) => applyRemoteInput(seat, buttons, touch),
+        // Pulled by the transport's own 30fps stream loop, not pushed: a slow
+        // link slows the stream and never the emulation.
+        frameSource: (seat) => {
+          const c = canvases[seat];
+          return c ? { top: c.top, bottom: c.bottom } : null;
+        },
+        audioSource: (seat) => takeAudio(seat),
+        checkInvite: (seat, token) => {
+          const invite = invites.get(seat);
+          if (!invite) return { ok: false, reason: "This player invite is no longer valid" };
+          if (Date.now() >= invite.expires) return { ok: false, reason: "This player invite has expired" };
+          if (invite.consumed) return { ok: false, reason: "This player invite has already been used" };
+          if (invite.token !== token) return { ok: false, reason: "This player invite is not valid" };
+          return { ok: true };
+        },
+        consumeInvite: (seat) => {
+          const invite = invites.get(seat);
+          if (invite) { invite.consumed = true; invite.token = null; }
+          renderOnline();
+        },
+      });
+      el("online-base").addEventListener("change", () => {
+        try { localStorage.setItem("guestPage", onlineBase.value.trim()); } catch (_) {}
+        renderOnline();
+      });
+      onlineBase.value = guestPageBase();
+    }
+
+    // The panel has to be painted once at load, because every other call to
+    // renderOnline comes from a host event: on a WebView without WebRTC there
+    // can never be one, and in browser-host mode the button that would be
+    // redundant here has to go away before the user sees it.
+    if (hasOnline && (!hasWebRTC || inBrowserHost)) renderOnline();
+
+    // ------------------------------------------------------------------
+    // Browser host: the app serves this same page on loopback, so it can be
+    // opened where WebRTC exists. The emulator does not move - every console
+    // keeps running in the app, and browser-host.js carries the commands.
+    // ------------------------------------------------------------------
+    function showBrowserHostUrl(url) {
+      onlineBrowserUrl.hidden = false;
+      onlineBrowserUrl.innerHTML = "";
+      const link = document.createElement("a");
+      link.href = url;
+      link.textContent = url;
+      link.title = "open this in Chrome or Firefox (the token in it is the credential, so do not share it)";
+      const copy = document.createElement("button");
+      copy.textContent = "copy";
+      copy.addEventListener("click", async () => {
+        try { await navigator.clipboard.writeText(url); copy.textContent = "copied"; }
+        catch (_) { copy.textContent = "select it"; }
+      });
+      onlineBrowserUrl.append(link, copy);
+      window.__browserHostUrl = url;
+    }
+
+    el("online-browser").addEventListener("click", async () => {
+      if (!invoke) { setStatus("the browser host needs the app's backend", true); return; }
+      try {
+        const res = await invoke("browser_host_start");
+        showBrowserHostUrl(res.url);
+        setStatus(`browser host listening on 127.0.0.1:${res.port} - opening your browser; if nothing happens, open the URL in the panel`);
+        try {
+          await invoke("browser_host_open", { url: res.url });
+        } catch (err) {
+          setStatus(String(err), true);
+        }
+      } catch (err) {
+        setStatus(String(err), true);
+      }
+    });
+
+    function startAudioPoll() {
+      if (audioPolling || !hasOnline) return;
+      audioPolling = true;
+      pollOnlineAudio();
+    }
+
+    el("online-start").addEventListener("click", async () => {
+      if (!hasOnline) { setStatus("the online transport did not load (vendor/peerjs.min.js)", true); return; }
+      if (!hasWebRTC) {
+        setStatus("online hosting needs WebRTC, which this WebView is built without " +
+          "(Linux WebKitGTK ships it disabled) - local splitscreen does not need it", true);
+        return;
+      }
+      if (!session) { setStatus("start a session first: the host streams the consoles it is already running", true); return; }
+      el("online-start").disabled = true;
+      setStatus("online: asking the broker for a join code…");
+      // One capability per guest seat, minted before anybody can knock.
+      newInvites();
+      const code = await window.mdOnline.startHost(canvases.length);
+      el("online-start").disabled = Boolean(code);
+      el("online-stop").disabled = !code;
+      if (!code) return;
+      hostCode = code;
+      renderOnline();
+      setStatus(`online: hosting · join code ${code} · each guest plays one console`, false, 8000);
+    });
+
+    el("online-stop").addEventListener("click", () => {
+      if (!hasOnline) return;
+      window.mdOnline.stop();
+      for (let seat = 0; seat < canvases.length; seat++) releaseSeat(seat);
+      hostCode = null;
+      el("online-stop").disabled = true;
+      el("online-start").disabled = false;
+      renderOnline();
+      setStatus("online: stopped — every console is local again");
+    });
+
+    // ------------------------------------------------------------------
     // Toolbar wiring
     // ------------------------------------------------------------------
 
@@ -1322,13 +1768,43 @@
         report("error", `set_per_game_fix failed: ${err}`);
       }
     });
+    // A browser cannot open a file dialog onto someone else's disk, so Browse
+    // asks the app what ROMs are near the path already typed (or the app's own
+    // directory) and offers them as suggestions. Same list semantics as the
+    // native dialog: pick one, it lands in the field.
+    async function browseInBrowser() {
+      const typed = el("rom").value.trim();
+      const dir = typed.includes("/") ? typed.slice(0, typed.lastIndexOf("/")) : "";
+      const res = await invoke("list_roms", { dir });
+      const list = el("romlist");
+      list.innerHTML = "";
+      for (const rom of (res && res.roms) || []) {
+        const option = document.createElement("option");
+        option.value = rom;
+        list.append(option);
+      }
+      if (!res || !res.roms || !res.roms.length) {
+        setStatus(`no .nds files found in ${(res && res.dir) || "that directory"} - type a path, or set MD_ROM_DIR where the app starts`, true);
+        return;
+      }
+      el("rom").focus();
+      setStatus(`${res.roms.length} ROM(s) from ${res.dir} - start typing, or use the arrow keys`);
+    }
+
     el("browse").addEventListener("click", async () => {
-      if (!hasDialog) return;
-      const path = await Tauri.dialog.open({
-        multiple: false,
-        filters: [{ name: "Nintendo DS ROM", extensions: ["nds", "dsi", "ids", "srl", "bin"] }],
-      });
-      if (typeof path === "string" && path) el("rom").value = path;
+      try {
+        if (hasDialog) {
+          const path = await Tauri.dialog.open({
+            multiple: false,
+            filters: [{ name: "Nintendo DS ROM", extensions: ["nds", "dsi", "ids", "srl", "bin"] }],
+          });
+          if (typeof path === "string" && path) el("rom").value = path;
+          return;
+        }
+        if (inBrowserHost) await browseInBrowser();
+      } catch (err) {
+        setStatus(String(err), true);
+      }
     });
 
     // ------------------------------------------------------------------
@@ -1346,6 +1822,15 @@
     if (!invoke) {
       setStatus("browser preview — start the desktop app to emulate");
     } else {
+      if (inBrowserHost) {
+        // The socket is what everything on this page goes through, so a bridge
+        // that never opened has to be visible rather than looking like a window
+        // with a sleeping backend.
+        window.addEventListener("md-bridge-closed", (e) => {
+          setStatus(`browser host: ${e.detail}`, true);
+        });
+        setStatus("browser host session — the emulator is in the app; this page drives it");
+      }
       setStatus("ready — pick a ROM and press Start");
       // Layout default: the user's persisted choice, else MD_SHOW_BOTTOM (which
       // selects the side view for a first run), else flip. Old "side-by-side"

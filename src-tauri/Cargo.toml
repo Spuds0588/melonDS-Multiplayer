@@ -1,6 +1,6 @@
 [package]
 name = "melonDS-Multiplayer"
-version = "0.1.5-alpha.3"
+version = "0.1.5-alpha.4"
 description = "DS emulator with splitscreen multiplayer support"
 authors = ["melonDS-Multiplayer Team"]
 edition = "2021"
@@ -21,6 +21,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tower-http = { version = "0.5", features = ["fs", "cors"] }
 uuid = { version = "1.0", features = ["v4"] }
+# The browser host's WebSocket handshake (browser_host.rs): RFC 6455 identifies
+# the session by base64(sha1(key . GUID)). Both are tiny, and hand-rolling a hash
+# to avoid them would be the wrong kind of saving.
+sha1 = "0.10"
+base64 = "0.22"
 parking_lot = "0.12"
 thiserror = "1.0"
 log = "0.4"
@@ -31,3 +36,11 @@ env_logger = "0.11"
 # vanished window (see install_crash_handlers).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Online play needs the WebView to expose WebRTC. WebKitGTK compiles it in but
+# ships it OFF (`WebKitSettings:enable-webrtc` defaults to FALSE) and wry does
+# not touch the setting, so the app flips it itself at startup - see
+# enable_webrtc in lib.rs. The crate is the same webkit2gtk-4.1 the window is
+# built on, so this only links what is already loaded.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "2.0", features = ["v2_40"] }
