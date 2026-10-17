@@ -62,11 +62,20 @@ jobs:
           workspaces: src-tauri -> target
           key: ${{ matrix.name }}
 
-      # MSVC has no <dirent.h>; the project's own manifest gets one from vcpkg
-      # (`vcpkg.json`, platform windows), and the core's CMake looks for it in
-      # DIRENT_INCLUDE_DIRS. Only that one header-only port is installed here -
-      # the full manifest would drag in Qt, which this build does not use.
-      - name: Install the MSVC dirent shim (Windows)
+      # Windows needs two things the other two platforms do not:
+      #
+      #  * <dirent.h>. The core uses it for directory walks and MSVC has none;
+      #    the project's own manifest already answers that with vcpkg's dirent
+      #    port (`vcpkg.json`, platform windows), and the core looks for it in
+      #    DIRENT_INCLUDE_DIRS. Only that header-only port is installed here -
+      #    the full manifest would pull in Qt, which this build does not use.
+      #  * clang-cl rather than cl.exe. The project's own Windows presets
+      #    (CMakePresets.json `base-windows`) compile with clang for exactly the
+      #    reason this job found: parts of the core use GCC/Clang builtins
+      #    (`__builtin_trap`, `__aligned__`) and C++20 designated initializers,
+      #    which MSVC rejects at /std:c++17. clang-cl emits MSVC-ABI objects and
+      #    links with MSVC's linker, so the Rust MSVC toolchain still links it.
+      - name: Prepare the Windows toolchain
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
@@ -74,22 +83,27 @@ jobs:
           # a single-port install is refused (and the manifest would pull Qt).
           vcpkg install --classic dirent:x64-windows
           echo "DIRENT_INCLUDE_DIRS=C:/vcpkg/installed/x64-windows/include" >> "$GITHUB_ENV"
+          echo "MD_GENERATOR=-G|Visual Studio 17 2022|-A|x64|-T|ClangCL" >> "$GITHUB_ENV"
 
       # The C++ core + the multiplayer bridge. Exactly the BUILD.md line, so a
       # local build and a release build are the same build.
       - name: Configure the core
         shell: bash
         run: |
-          extra=""
+          args=()
           if [ -n "${DIRENT_INCLUDE_DIRS:-}" ]; then
-            extra="-DDIRENT_INCLUDE_DIRS=$DIRENT_INCLUDE_DIRS"
+            args+=("-DDIRENT_INCLUDE_DIRS=$DIRENT_INCLUDE_DIRS")
+          fi
+          if [ -n "${MD_GENERATOR:-}" ]; then
+            IFS='|' read -r -a gen <<< "$MD_GENERATOR"
+            args+=("${gen[@]}")
           fi
           cmake -S . -B build-tauri \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_QT_SDL=OFF \
             -DBUILD_TAURI_BRIDGE=ON \
             -DENABLE_OGLRENDERER=OFF \
-            $extra
+            "${args[@]}"
 
       - name: Build the core and the bridge
         run: cmake --build build-tauri --config Release --parallel
