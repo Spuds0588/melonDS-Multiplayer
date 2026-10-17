@@ -15,7 +15,9 @@ composite (console N occupies x [(N-1)*256, N*256), bottom screen at y 192..383)
     ARENA   the page's own green check,    x 205..223 y 163..183 >= 12
     HUNTER  the seven hunter discs,        x 4..252   y 124..150  >= 100
     ROSTER  the roster's own ADD BOT ring, x 216..254 y 148..186 >= 50
-    INGAME  the match HUD's ink,           x 0..256   y 0..32     > 800
+    INGAME  the match HUD's ink,           x 0..256   y 0..32     > 800,
+            with a *dark* 3D view above it (top screen mean <= 72 of 255);
+            a bright splash there instead is MENU, not a match (2026-10-16d)
             *and* a colourful top screen,   x 0..256   y 0..192   >= 10000
     DIALOG  the bottom screen's HUD ink without a colourful top screen
     UNKNOWN nothing matched, or two pages matched - a frame caught mid-transition
@@ -99,9 +101,15 @@ ICONS_MIN = 100
 ADDBOT_MIN = 50
 INKTOP_MIN = 800
 TOPCOLOUR_MIN = 3000
+# A match's top screen is a rendered 3D view, so it is *dark*: 2.3-61.9 mean
+# luminance over the match frames this file is checked against, against
+# 82.2-216.8 on this title's own menu frames (2026-10-16d). Without this the
+# menus read as INGAME - they carry HUD-sized ink on the bottom screen and a
+# bright splash above it.
+TOPMEAN_MAX = 72
 PILL_MIN = 300
 
-PAGES = ("MODE", "ARENA", "HUNTER", "ROSTER", "INGAME", "DIALOG", "UNKNOWN")
+PAGES = ("MODE", "ARENA", "HUNTER", "ROSTER", "INGAME", "DIALOG", "MENU", "UNKNOWN")
 
 
 def orange(p):
@@ -130,7 +138,18 @@ def probes(shot, col):
         px, (x0, y0, x1, y1) = img.load(), box
         return sum(1 for y in range(y0, y1) for x in range(x0, x1) if ok(px[x, y]))
 
+    def mean_luma(img, box):
+        px, (x0, y0, x1, y1) = img.load(), box
+        total = n = 0
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                r, g, b = px[x, y]
+                total += 0.299 * r + 0.587 * g + 0.114 * b
+                n += 1
+        return total / n if n else 0.0
+
     return {
+        "topmean": mean_luma(top, TOPS),
         "discs": count(bot, DISCS, orange),
         "arenachk": count(bot, ARENACHK, green),
         "icons": count(bot, ICONS, orange),
@@ -153,7 +172,12 @@ def classify(d):
     if d["inktop"] > INKTOP_MIN:
         # The HUD's ink is on the bottom screen in a match *and* in a message box
         # drawn over the in-match HUD; only a match has the 3D view above it.
-        return "INGAME" if d["topcolour"] >= TOPCOLOUR_MIN else "DIALOG"
+        if d["topcolour"] < TOPCOLOUR_MIN:
+            return "DIALOG"
+        # ...and that view is *dark*. This title's own menu screens carry
+        # HUD-sized bottom ink and a bright splash above it, which is how they
+        # read as INGAME until 2026-10-16d.
+        return "INGAME" if d["topmean"] <= TOPMEAN_MAX else "MENU"
     if d["arenachk"] >= ARENACHK_MIN:
         return "ARENA"
     if d["discs"] >= DISC_MIN:
@@ -178,7 +202,7 @@ def line(shot, col):
     r = describe(shot, col)
     return ("page={page} pill={pill} icons={icons} addbot={addbot} "
             "arenachk={arenachk} discs={discs} inktop={inktop} "
-            "topcolour={topcolour}").format(**r)
+            "topcolour={topcolour} topmean={topmean:.1f}").format(**r)
 
 
 # The labelled frames this classifier is checked against, all in logs/shots. Every
@@ -192,28 +216,25 @@ def line(shot, col):
 # match 30 s in), mph2_match_a and healthy2 (two earlier matches), mph3_picks and
 # ref_transition (both frames that the previous absence-based rule read as ROSTER).
 EXPECTED = [
-    ("F_start.png", 0, "ROSTER"),                # roster listing a second player
-    ("st1.png", 0, "ROSTER"),                    # live lobby, one player, pill=0
-    ("sw.png", 0, "ROSTER"),                     # live lobby, two players
-    # The roster *with a bot added on it* - the frame the old order called HUNTER:
-    # the ADD BOT ring's own rows overlap the hunter-disc band, so a roster that
-    # lists a bot measured icons=164 against the ring's 94 (v0.1.9bk, the host's
-    # roster one tap after ADD BOT; kept under its own name for this reason).
-    ("v9i_probe1.png", 0, "ROSTER"),
-    ("healthy2.png", 0, "INGAME"),               # the known two-console match HUD
-    ("healthy2.png", 1, "INGAME"),
-    ("ref_mode.png", 0, "MODE"),                 # MODE tab over the BATTLE disc grid
-    ("ref_arena.png", 0, "ARENA"),               # ARENA sliders + green tick
-    ("ref_transition.png", 0, "UNKNOWN"),        # caught between ARENA and HUNTER
-    # The message box that a bottom-screen-only probe calls a match: the host's own
-    # "THERE ARE NOT ENOUGH PLAYERS TO CONTINUE" from this pass's live attempt.
-    ("stm.png", 0, "DIALOG"),
-    ("stm2.png", 0, "DIALOG"),
-    ("stm2.png", 1, "DIALOG"),
-    # The other side of that threshold: a real two-console match's briefing screen,
-    # whose dark arena reads 6388 colourful pixels against the dialog's 915.
-    ("ctl2.png", 0, "INGAME"),
-    ("ctl2.png", 1, "INGAME"),
+    # Rebuilt 2026-10-16d on frames that are in logs/shots *now*, and a missing
+    # reference is a failure rather than a skip: the previous list had gone
+    # 18-for-18 missing, so "0 wrong" was 0 checks and this instrument could not
+    # fail. The frames it dropped (F_start, st1, sw, v9i_probe1, healthy2,
+    # ref_mode, ref_arena, ref_transition, stm, stm2, ctl2) went with the run
+    # logs; the next live lobby should save their equivalents under those names.
+    ("mph2_match_a.png", 0, "INGAME"),            # a real two-console match HUD
+    ("mph2_match_a.png", 1, "INGAME"),            # the guest's own column
+    # This title's own menu screens: the frames the topmean ceiling exists for.
+    ("mph4_00_title.png", 1, "MENU"),
+    ("mph4_00_title.png", 2, "MENU"),
+    ("mph4_00_title.png", 3, "MENU"),
+    ("mph4_01_multicard.png", 2, "MENU"),
+    # The menu frames whose bottom ink is below the HUD floor can never be MENU;
+    # what they must not be is a match either.
+    ("mph4_01_multicard.png", 1, "NOT_INGAME"),
+    ("mph4_01_multicard.png", 3, "NOT_INGAME"),
+    ("mph3_match_a.png", 0, "NOT_MENU"),
+    ("mph3_match_a.png", 1, "NOT_MENU"),
 ]
 # The pill is the roster's own join test, so it is asserted too: a roster that
 # lists only the host offers nothing to tap, a two-player one does. "none" means
@@ -221,10 +242,10 @@ EXPECTED = [
 # still has orange near that region (the ARENA sliders read 104). What has to hold
 # is that only a second player's roster reaches the tap threshold.
 PILL_EXPECTED = [
-    ("st1.png", 0, "none"),                      # one player: no START GAME
-    ("ref_transition.png", 0, "none"),           # not a roster at all
-    ("F_start.png", 0, "present"),               # two players: START GAME
-    ("sw.png", 0, "present"),                    # two players: START GAME
+    # Empty on purpose (2026-10-16d): the roster frames that carried the pill
+    # assertions were deleted with the run logs. A live lobby that lists a second
+    # player should save one and restore the two assertions here (one player:
+    # none, two players: present).
 ]
 
 
@@ -233,17 +254,24 @@ def selftest(shots="logs/shots"):
     for name, col, want in EXPECTED:
         path = os.path.join(shots, name)
         if not os.path.exists(path):
-            print(f"SKIP {name} (not present)")
+            bad += 1
+            print(f"FAIL {name} c{col}: reference frame not present (a skipped check is not a passing one)")
             continue
         r = describe(path, col)
         got = r["page"]
-        ok = got == want
+        if want == "NOT_MENU":
+            ok = got != "MENU"
+        elif want == "NOT_INGAME":
+            ok = got != "INGAME"
+        else:
+            ok = got == want
         bad += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name} c{col}: page={got} want={want} {r}")
     for name, col, want in PILL_EXPECTED:
         path = os.path.join(shots, name)
         if not os.path.exists(path):
-            print(f"SKIP {name} (not present)")
+            bad += 1
+            print(f"FAIL {name} c{col}: reference frame not present")
             continue
         r = describe(path, col)
         ok = r["pill"] >= PILL_MIN if want == "present" else r["pill"] < PILL_MIN

@@ -380,7 +380,7 @@ def cmd_dpjoiner(ch, args):
     out_line = (
         f"download-play joiner: console {out['joiner']}, "
         f"{'armed' if out['armed'] else 'DISARMED'}\n"
-        f"  beacons {out['beacons']} · auth sent {out['authSent']} / recv {out['authRecv']} · "
+        f"  beacons {out['beacons']} (served {out.get('beaconsServed', 0)} while the host was silent) · auth sent {out['authSent']} / recv {out['authRecv']} · "
         f"assoc sent {out['assocSent']} / recv {out['assocRecv']} · "
         f"replies sent {out.get('repliesSent', 0)} · "
         f"other host frames {out['hostFrames']}\n"

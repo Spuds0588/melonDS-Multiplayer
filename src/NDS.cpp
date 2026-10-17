@@ -924,6 +924,16 @@ void NDS::RecordPcVisit(int cpu, u32 pc, u32 lr)
     if (PcTraceN < kPcTraceRing) PcTraceN++;
 }
 
+/* How deep the path trace prints its visit tail when the caller's buffer allows
+   it. The recorder keeps kPcTraceRing (262144) visits - hundreds of emulated
+   frames at this console's measured ~640 visits a frame - and a fixed 320-row
+   tail is about half a frame, which put the very decision a leave is read for
+   behind the idle loop the ARM7 works through afterwards (found 2026-10-16,
+   see compatibility.md). 3072 rows fit the control channel's 256 KiB report
+   buffer with room to spare; the count below is derived from `cap` anyway, so a
+   smaller caller simply gets a smaller tail instead of a cut row. */
+static const int kPcTraceTail = 3072;
+
 int NDS::FormatPcTrace(char* out, size_t cap) const
 {
     if (!out || cap < 128) return -1;
@@ -978,8 +988,12 @@ int NDS::FormatPcTrace(char* out, size_t cap) const
 
     /* The tail, with the state each visit ran on: pc lr cpsr r0 r1 r2 r3. This
        is the report's whole point - the branch's own inputs, not a guess about
-       them - so it is printed for the last few hundred visits. */
-    const int tail = kept < 320 ? kept : 320;
+       them - so it is printed as deep as the caller's buffer allows. */
+    const int row = 68;   /* a visit row: 4 indent + 7 eight-digit words + 6
+                             spaces + a newline */
+    int tail = (kept < kPcTraceTail) ? kept : kPcTraceTail;
+    if (n + 128 + tail * row > (int)cap) tail = ((int)cap - n - 128) / row;
+    if (tail < 0) tail = 0;
     put("  last %d visit(s), in order (pc lr cpsr r0 r1 r2 r3):\n", tail);
     for (int k = kept - tail; k < kept; k++)
     {
@@ -987,6 +1001,10 @@ int NDS::FormatPcTrace(char* out, size_t cap) const
         put("    %08X %08X %08X %08X %08X %08X %08X\n",
             e.pc, e.lr, e.cpsr, e.r0, e.r1, e.r2, e.r3);
     }
+
+    /* A truncated report and a short run must not look alike: `put` stops at
+       cap-1, so reaching it means rows were dropped. */
+    if (n >= (int)cap - 1) return -1;
 
     return n;
 }

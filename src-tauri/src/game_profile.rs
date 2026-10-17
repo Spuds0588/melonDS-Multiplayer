@@ -123,6 +123,20 @@ const GAME_FIXES: &[GameFixSpec] = &[
         source: "compatibility.md 'Bomberman' + logs/bomb_app.log",
     },
     GameFixSpec {
+        code: "A8TE",
+        name: "Mario Party DS",
+        fix: "Single-card Download Play only (2-4 players, no multi-card mode \
+              in the cartridge): the multiplayer menu is Download Play from one \
+              card. Same shared joiner (src-tauri/src/dp_joiner.rs), armed by \
+              this entry: it answers the host's beacon, name phase, RSA frame \
+              and data stream. No route into the host screen has been driven yet \
+              - recognized attach point and opt-in, not a measured working \
+              download.",
+        implemented: false,
+        download_play: true,
+        source: "GBATEK 'List of DS Download Play Games' + compatibility.md",
+    },
+    GameFixSpec {
         code: "ASFE",
         name: "Star Fox Command",
         fix: "Single-card Download Play only: the game's Recruitment screen is the \
@@ -261,7 +275,7 @@ mod tests
                 assert!(!p.download_play_joiner(), "{code}");
             }
         }
-        for code in ["ASFE", "ASME", "ATRE", "ABME"] {
+        for code in ["ASFE", "ASME", "ATRE", "ABME", "A8TE"] {
             let on = resolve(code, true).unwrap();
             assert!(on.download_play, "{code} is a single-card Download Play title");
             assert!(on.download_play_joiner(), "{code}");

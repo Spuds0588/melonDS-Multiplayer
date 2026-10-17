@@ -127,10 +127,17 @@ struct MDInstance
     /* Identity on the virtual air. Every instance boots the same firmware, so
        the per-console offset has to be applied by the host; MELN keeps the
        firmware MAC as loaded so the offset can be re-derived on every boot
-       instead of compounding (see apply_console_mac). */
+       instead of compounding (see apply_console_mac). The user name is the
+       other half of that identity and is kept the same way. */
     melonDS::MacAddress console_mac = {};
     melonDS::MacAddress firmware_mac = {};
     bool firmware_mac_valid = false;
+    /* The name this console advertises to the other consoles (see
+       apply_console_mac): "Player 1".."Player 4", the same string the
+       Download Play stand-in reports. Readable through md_console_name. */
+    char16_t firmware_nickname[10] = {};
+    melonDS::u16 firmware_nickname_len = 0;
+    bool firmware_nickname_valid = false;
 
     /* scratch buffer for md_load_state() so the caller's buffer stays const */
     std::vector<u8> state_scratch;
@@ -476,11 +483,53 @@ void apply_console_mac(MDInstance* inst)
     firmware.GetHeader().MacAddr = inst->console_mac;
     firmware.UpdateChecksums();
 
+    /* The other half of the same identity: the console's *user name*.
+
+       Every instance boots the same firmware, so all of them carry the same
+       name, and a title whose lobby lists the players it can see shows one name
+       for every console it is talking to. Measured in this fork's own Tetris DS
+       multi-card session: three guests associated with distinct MACs and
+       distinct AIDs (1, 2, 3), each polled by the host at full rate (`mask
+       000E`) with every reply credited (70,857 hand-overs across the three
+       AIDs, logs/m4_tetris3.log.gz) - and each earlier guest's own game wrote
+       `deauth sent ... reason 0003` a few seconds after the next one appeared,
+       in join order, while the newest survived. The name is the one identity
+       the four consoles still shared, so it is the one thing to make distinct
+       before any conclusion about the games' own state machines is worth
+       drawing. Applied only past the first console, exactly like the MAC: slot
+       0 keeps the firmware's own name, so single-console behaviour is
+       untouched. */
+    /* The name is the *player*, for every slot including the first: the DS
+       nickname field holds ten characters, so "Player 1".."Player 4" fit with
+       room to spare. A supplied firmware image's own nickname is replaced too
+       - four consoles booting one image all carry the same name, and a room
+       whose list reads "melonDS" four times is a room nothing in it can tell
+       apart (the same reason every console gets its own MAC above). */
+    char16_t name[10] = {};
+    melonDS::u16 namelen = 0;
+    for (const char* c = "Player "; *c && namelen < 9; c++)
+        name[namelen++] = (char16_t)(u8)*c;
+    name[namelen++] = (char16_t)(u'1' + (id & 0x0F));
+    for (melonDS::u16 i = namelen; i < 10; i++) name[i] = 0;
+
+    for (melonDS::u16 i = 0; i < 10; i++) inst->firmware_nickname[i] = name[i];
+    inst->firmware_nickname_len = namelen;
+    inst->firmware_nickname_valid = true;
+
+    for (auto& ud : firmware.GetUserData())
+    {
+        memcpy(ud.Nickname, name, sizeof(name));
+        ud.NameLength = namelen;
+        ud.UpdateChecksum(); /* the header's checksum does not cover this block */
+    }
+
     const melonDS::MacAddress& m = inst->console_mac;
     std::fprintf(stderr,
-                 "[melonDS bridge] %s: wireless MAC %02X:%02X:%02X:%02X:%02X:%02X (%s)\n",
+                 "[melonDS bridge] %s: wireless MAC %02X:%02X:%02X:%02X:%02X:%02X (%s), "
+                 "user name %u chars\n",
                  inst->name.c_str(), m[0], m[1], m[2], m[3], m[4], m[5],
-                 (id > 0) ? "offset from the shared firmware MAC" : "firmware MAC");
+                 (id > 0) ? "offset from the shared firmware MAC" : "firmware MAC",
+                 (unsigned)namelen);
 }
 
 MDInstance* md_create(int console_type, const char* name)
@@ -1553,6 +1602,35 @@ int md_console_mac(MDInstance* inst, unsigned char* out6)
     if (!inst->firmware_mac_valid) return -1;
     std::memcpy(out6, inst->console_mac.data(), 6);
     return 0;
+}
+
+int md_console_name(MDInstance* inst, char* out, int cap)
+{
+    if (!inst || !out || cap <= 0) return -1;
+    if (!inst->firmware_nickname_valid) return -1;
+
+    /* Read back out of the firmware the guests actually read, not out of a copy
+       the bridge kept: this is the name that appears in a game's room list, so
+       a reader has to see the same bytes a game sees. UTF-16 -> UTF-8; the
+       field is Latin-1-safe ASCII in practice ("Player N"). */
+    const auto& ud = inst->nds->GetFirmware().GetEffectiveUserData();
+    melonDS::u16 n = ud.NameLength;
+    if (n > 10) n = 10;
+    int written = 0;
+    for (melonDS::u16 i = 0; i < n; i++)
+    {
+        char32_t c = ud.Nickname[i];
+        char utf8[4];
+        int len = 0;
+        if (c < 0x80) { utf8[0] = (char)c; len = 1; }
+        else if (c < 0x800) { utf8[0] = (char)(0xC0 | (c >> 6)); utf8[1] = (char)(0x80 | (c & 0x3F)); len = 2; }
+        else { utf8[0] = (char)(0xE0 | (c >> 12)); utf8[1] = (char)(0x80 | ((c >> 6) & 0x3F)); utf8[2] = (char)(0x80 | (c & 0x3F)); len = 3; }
+        if (written + len >= cap) break;
+        std::memcpy(out + written, utf8, (size_t)len);
+        written += len;
+    }
+    out[written] = 0;
+    return written;
 }
 
 /* ---------------------------------------------------------------- diagnostics */

@@ -1,0 +1,128 @@
+# Alpha release: the desktop app, built on all three operating systems and
+# published as a GitHub pre-release.
+#
+# Why CI does this and a developer machine cannot: the Tauri host links against
+# a C++ core built by CMake (see BUILD.md), and that core has to be compiled by
+# each target's own toolchain - MSVC on Windows, AppleClang on macOS, GCC on
+# Linux. Tags matching `v*-alpha*` and manual runs both go through the same
+# three jobs, so an alpha is never assembled from one platform's guess about
+# another's link line (src-tauri/build.rs carries the per-platform half).
+#
+# The Linux job also runs the core smoke test before packaging: it is the only
+# job cheap enough to do so, and it is the gate that says the bridge a release
+# is built around actually boots a console.
+name: Alpha release
+
+on:
+  push:
+    tags:
+      - "v*-alpha*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            name: linux-x86_64
+            bundles: appimage,deb
+          - os: macos-14
+            name: macos-arm64
+            bundles: dmg
+          - os: windows-latest
+            name: windows-x86_64
+            bundles: nsis,msi
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The Tauri host needs webkit2gtk-4.1 (Tauri v2), plus the usual
+      # packaging tools AppImage/deb bundling shells out to.
+      - name: Install Linux packaging dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libfuse2 rpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.name }}
+
+      # The C++ core + the multiplayer bridge. Exactly the BUILD.md line, so a
+      # local build and a release build are the same build.
+      - name: Configure the core
+        run: >
+          cmake -S . -B build-tauri
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_QT_SDL=OFF
+          -DBUILD_TAURI_BRIDGE=ON
+          -DENABLE_OGLRENDERER=OFF
+
+      - name: Build the core and the bridge
+        run: cmake --build build-tauri --config Release --parallel
+
+      - name: Smoke-test the core (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        run: ./build-tauri/md_smoke_test tools/mkdiagrom/diag.nds
+
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build the app bundle
+        run: cargo tauri build --bundles ${{ matrix.bundles }}
+        working-directory: src-tauri
+        env:
+          # macOS signing/notarisation: an alpha is unsigned on purpose. The
+          # flag keeps the bundler from looking for an identity that is not
+          # there, which would otherwise fail the job.
+          CI: "true"
+          APPLE_SIGNING_IDENTITY: "-"
+
+      - name: Collect the installers
+        shell: bash
+        run: |
+          mkdir -p out
+          find src-tauri/target/release/bundle -type f \
+            \( -name "*.AppImage" -o -name "*.deb" -o -name "*.dmg" \
+               -o -name "*.msi" -o -name "*.exe" \) -exec cp {} out/ \;
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: melonDS-Multiplayer-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish the pre-release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List what will be published
+        run: find artifacts -type f | sort
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          files: artifacts/**/*

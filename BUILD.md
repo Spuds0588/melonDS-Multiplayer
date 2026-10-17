@@ -61,7 +61,56 @@ cargo build --release --manifest-path src-tauri/Cargo.toml # now it relinks
 strings src-tauri/target/release/melonDS-Multiplayer | grep -c 'a string you just added'
 ```
 
-What exists today (0.1.5-alpha.1): the app is a working two-player host. Pick
+### Building on macOS and Windows
+
+The core build is the same CMake line on every platform, with `--config
+Release` for MSVC's multi-config generator:
+
+```bash
+cmake -S . -B build-tauri -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_QT_SDL=OFF -DBUILD_TAURI_BRIDGE=ON -DENABLE_OGLRENDERER=OFF
+cmake --build build-tauri --config Release --parallel
+cargo tauri build            # from src-tauri/, bundles the host
+```
+
+The C++ half is portable already (`src/frontend/tauri/CMakeLists.txt` links
+`ole32 comctl32 wsock32 ws2_32` on Windows and skips `-lm`/`dl` on Apple), and
+`src-tauri/build.rs` carries the per-platform *link* half, which is where the
+three platforms actually differ:
+
+| platform | archives | what the final link adds |
+| --- | --- | --- |
+| Linux | `lib{melonds_bridge,core,teakra}.a` | `-fuse-ld=bfd` (GCC LTO), `-rdynamic`, `-lstdc++ -lm`, `stdc++/m/dl/rt` |
+| macOS | the same `.a` files | `-lc++`; no `-fuse-ld`, no `-rdynamic` (GNU-ld flags Apple's linker rejects) |
+| Windows | `{melonds_bridge,core,teakra}.lib` under `Release/` | nothing: MSVC's `.lib`s carry their own `/DEFAULTLIB` records |
+
+If a platform fails to link with `undefined symbol: md_*`, `build.rs` found the
+wrong archive layout - it probes `Release/`, `RelWithDebInfo/` and the flat
+directory in that order, so a new generator is a branch there, not a puzzle in
+the linker output.
+
+### Cutting an alpha release
+
+An alpha is built by CI, not on a dev machine: the core has to be compiled by
+each target's own toolchain (MSVC, AppleClang, GCC), and only a runner of that
+OS can do it. `.github/workflows/release-tauri.yml` builds Linux (AppImage,
+.deb), macOS (dmg) and Windows (nsis, msi) on every tag matching `v*-alpha*`,
+run the smoke test on Linux before packaging, and publishes the installers as a
+**pre-release**. It can also be run by hand (`workflow_dispatch`) to shake a
+build out without tagging.
+
+```bash
+# bump the version in src-tauri/{Cargo.toml,tauri.conf.json}, then:
+git tag -a v0.1.5-alpha.3 -m "melonDS Multiplayer 0.1.5-alpha.3"
+git push origin master v0.1.5-alpha.3     # the tag is what starts the build
+```
+
+Builds are unsigned on purpose (an alpha is not distributable as a signed
+release): macOS needs right-click-Open the first time, and Windows SmartScreen
+will warn. Nothing else about the app differs between the platforms - same
+frontend, same bridge, same core.
+
+What exists today (0.1.5-alpha.3): the app is a working two-to-four-player host. Pick
 a ROM, a player count, press Start; each player gets a top+bottom console
 rendered from the real emulator core, lockstepped and paced to DS speed
 (59.8fps), with keyboard + mouse-touch input and a "Link test" button that
@@ -1120,7 +1169,8 @@ tools/appctl.py window --name desktop      # whole screen via spectacle, app win
 tools/appctl.py render logs/shots/lobby.png --cols 120         # any PNG back to ASCII (no app needed)
 tools/appctl.py press a --player 1 --ms 120
 tools/appctl.py touch 128 95 --ms 150      # pen down at a DS coordinate
-tools/appctl.py index 2 && tools/appctl.py tap KeyA   # real key events, real keymap
+tools/appctl.py tap KeyJ                      # a real key event on console 1's zone (KeyJ is its A)
+tools/appctl.py tap Comma                     # ... and console 2's zone (Comma is its A)
 tools/appctl.py click '#start'             # click UI by CSS selector
 tools/appctl.py advance --player 1 --frames 300   # wait for the console to actually run
 tools/appctl.py wifiio --player 1          # what player 1's game reads out of the block, writes into it, and says over IPC

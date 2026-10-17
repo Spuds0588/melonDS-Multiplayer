@@ -19,6 +19,7 @@ mod game_profile;
 // The synthesized client half of single-card Download Play. Present only for a
 // title whose profile says `download_play`; on every other title it does not
 // exist, so its link path is unchanged.
+mod dp_frames;
 mod dp_joiner;
 
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -379,6 +380,7 @@ extern "C" {
     // management frames from it, so the host's answer comes back to a console
     // that exists on the bus.
     fn md_console_mac(inst: *mut MDInstance, out: *mut u8) -> i32;
+    fn md_console_name(inst: *mut MDInstance, out: *mut i8, cap: i32) -> i32;
     fn md_link_attached(inst: *mut MDInstance) -> i32;
     // Boot a single-card Download Play child image on this console: write the
     // header/ARM9/ARM7 segments to the RSA destinations, set the DS-Download-
@@ -1076,6 +1078,11 @@ impl dp_joiner::JoinerBus for InstanceJoinerBus {
         unsafe { md_link_attached(self.inst.ptr) == 1 }
     }
 
+    fn own_slot(&self) -> Option<u32> {
+        let slot = unsafe { md_link_slot(self.inst.ptr) };
+        (slot >= 0).then_some(slot as u32)
+    }
+
     /// The whole turn, handed to the console's driver thread in one op. `now`
     /// is not passed through: the turn is stamped where it runs, so the reply
     /// schedule and the clock it is measured against share one home.
@@ -1085,6 +1092,17 @@ impl dp_joiner::JoinerBus for InstanceJoinerBus {
         st: &Arc<std::sync::Mutex<dp_joiner::State>>,
         _now: std::time::Instant,
     ) {
+        // A console that stopped (power-off, error screen) answers no turns:
+        // retire the loop instead of queueing into a dead driver, which is
+        // the `did not answer a joiner turn` warning once per turn. The
+        // driver loop exits on this same reason, so a nonzero reason here
+        // always means the other side is gone, never merely slow.
+        if unsafe { md_stop_reason(self.inst.ptr) } != MD_STOP_NONE {
+            if st.lock().unwrap().retire() {
+                log::info!("download-play joiner: console stopped; retiring the joiner loop");
+            }
+            return;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         self.inst.link_ops.lock().push(LinkOp::JoinerTurn {
             state: st.clone(),
@@ -1221,28 +1239,85 @@ fn default_flip_key(player: usize) -> &'static str {
     "ShiftRight"
 }
 
-/// Keyboard bindings for a player's console. Every player gets the same
-/// default keys: one keyboard drives whichever session is selected (digits
-/// 1-4 in the frontend switch between them), so per-player keyboard zones
-/// (the old P2 arrows+numpad) are wrong until someone owns per-session
-/// remapping. Remapping is a Phase 2 todo; when it lands, these become just
-/// the defaults it edits.
+/// Keyboard bindings for a player's console: **one disjoint zone per console**,
+/// because local splitscreen is several people at one keyboard, each with their
+/// own keys. The frontend routes a key to the console whose zone names it (a
+/// code in no zone moves nothing), which is what makes four players independent
+/// - until 2026-10-15 all four consoles carried this same list and every key
+/// drove only the console the mouse had selected, so a second player's presses
+/// landed on player 1's console and stopped there (measured on a four-console
+/// diag session: four players' zone keys held at once moved console 1's own
+/// keypad mask to `0x000000C3` and left consoles 2-4 reading zero).
+///
+/// Each zone is a complete DS pad so any console can be played alone. The
+/// selector digits (`Digit1..4`) pick the console the *mouse and peek* act on,
+/// and are deliberately absent from every zone; `Numpad1..4` are not selectors
+/// any more because 2/4/6/8 are console 3's d-pad.
+///
+/// Remapping is still a Phase 2 todo; these are the defaults it will edit.
 fn default_keymap(player: usize) -> Vec<(&'static str, u32)> {
-    let _ = player;
-    vec![
-        ("KeyA", MD_BTN_LEFT),
-        ("KeyD", MD_BTN_RIGHT),
-        ("KeyW", MD_BTN_UP),
-        ("KeyS", MD_BTN_DOWN),
-        ("KeyJ", MD_BTN_A),
-        ("KeyK", MD_BTN_B),
-        ("KeyU", MD_BTN_Y),
-        ("KeyI", MD_BTN_X),
-        ("KeyQ", MD_BTN_L),
-        ("KeyE", MD_BTN_R),
-        ("Space", MD_BTN_START),
-        ("ShiftLeft", MD_BTN_SELECT),
-    ]
+    match player {
+        // Console 1: WASD cluster, right hand on J K / U I.
+        0 => vec![
+            ("KeyW", MD_BTN_UP),
+            ("KeyA", MD_BTN_LEFT),
+            ("KeyS", MD_BTN_DOWN),
+            ("KeyD", MD_BTN_RIGHT),
+            ("KeyJ", MD_BTN_A),
+            ("KeyK", MD_BTN_B),
+            ("KeyU", MD_BTN_Y),
+            ("KeyI", MD_BTN_X),
+            ("KeyQ", MD_BTN_L),
+            ("KeyE", MD_BTN_R),
+            ("Space", MD_BTN_START),
+            ("ShiftLeft", MD_BTN_SELECT),
+        ],
+        // Console 2: arrow keys, right-hand punctuation row.
+        1 => vec![
+            ("ArrowUp", MD_BTN_UP),
+            ("ArrowLeft", MD_BTN_LEFT),
+            ("ArrowDown", MD_BTN_DOWN),
+            ("ArrowRight", MD_BTN_RIGHT),
+            ("Comma", MD_BTN_A),
+            ("Period", MD_BTN_B),
+            ("Semicolon", MD_BTN_Y),
+            ("Slash", MD_BTN_X),
+            ("BracketLeft", MD_BTN_L),
+            ("BracketRight", MD_BTN_R),
+            ("Enter", MD_BTN_START),
+            ("Backslash", MD_BTN_SELECT),
+        ],
+        // Console 3: the numeric keypad, d-pad on 8/2/4/6.
+        2 => vec![
+            ("Numpad8", MD_BTN_UP),
+            ("Numpad4", MD_BTN_LEFT),
+            ("Numpad2", MD_BTN_DOWN),
+            ("Numpad6", MD_BTN_RIGHT),
+            ("Numpad0", MD_BTN_A),
+            ("NumpadDecimal", MD_BTN_B),
+            ("Numpad7", MD_BTN_Y),
+            ("Numpad9", MD_BTN_X),
+            ("NumpadDivide", MD_BTN_L),
+            ("NumpadMultiply", MD_BTN_R),
+            ("NumpadEnter", MD_BTN_START),
+            ("NumpadSubtract", MD_BTN_SELECT),
+        ],
+        // Console 4: TFGH cluster, O/P/N/M buttons.
+        _ => vec![
+            ("KeyT", MD_BTN_UP),
+            ("KeyF", MD_BTN_LEFT),
+            ("KeyG", MD_BTN_DOWN),
+            ("KeyH", MD_BTN_RIGHT),
+            ("KeyO", MD_BTN_A),
+            ("KeyP", MD_BTN_B),
+            ("KeyN", MD_BTN_Y),
+            ("KeyM", MD_BTN_X),
+            ("KeyZ", MD_BTN_L),
+            ("KeyX", MD_BTN_R),
+            ("KeyV", MD_BTN_START),
+            ("KeyC", MD_BTN_SELECT),
+        ],
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -1588,6 +1663,12 @@ fn start_session_inner(
             return Err("failed to stamp diagnostic identity block".into());
         }
     }
+
+    // What each console calls itself on the air. The games' own room lists print
+    // this string, so it is logged once per session: a room that still shows one
+    // name four times is visible in the log, not only in the game.
+    let console_names: Vec<String> = instances.iter().map(|i| read_console_name(i)).collect();
+    log::info!("console names: {}", console_names.join(", "));
 
     let title = read_title(&instances[0]);
     let game_code = read_game_code(&instances[0]);
@@ -2071,7 +2152,26 @@ fn start_session_inner(
     // to be the host), so every other title's link path is untouched; within
     // that title it is armed by the same Settings switch as every other
     // per-game behavior (GameProfile::download_play_joiner).
-    let (dp, dp_thread) = match per_game.as_ref().filter(|p| p.download_play && n >= 2) {
+    //
+    // **Two consoles only** (2026-10-15). The joiner exists for this project's
+    // measured single-card route, which is a two-console configuration: console
+    // 1 hosts, console 2's radio plays a Download Play client. Arming it in a
+    // three- or four-console session puts that synthesized client on the *last*
+    // console, where it is a fourth radio with no game of its own - and it does
+    // not sit idle. Measured on Tetris DS (ATRE) with four consoles and the
+    // shipped defaults (`logs/r2_tetris.log.gz`): as soon as console 1's room came
+    // up, console 4's joiner heard its beacon on channel 13, answered it
+    // (`the host registered this client: association status 0000, AID C001`) and
+    // pulled console 1's own game into its Download Play engine - the host's
+    // next frames are a DP NameRequest, an RSA frame stating 1,004,732 bytes and
+    // a stream of image packets whose first payload is `NINTENDO` - while two
+    // real consoles sat in the same room as AIDs 2 and 3 (`mask 0006`). The
+    // room was hosting a download instead of hosting the room. With the joiner
+    // disarmed (`logs/r2b_tetris.log.gz`, the Settings switch, nothing else
+    // changed) only the two real consoles associate and no download starts. A
+    // session of 3-4 consoles is a link session: the user has that many carts,
+    // which is what the phantom client takes away.
+    let (dp, dp_thread) = match per_game.as_ref().filter(|p| p.download_play && n == 2) {
         None => (None, None),
         Some(profile) => {
             let joiner = n - 1;
@@ -2153,6 +2253,20 @@ fn read_game_code(inst: &Instance) -> String {
     let mut buf = [0i8; 8];
     let rc = unsafe { md_rom_game_code(inst.ptr, buf.as_mut_ptr(), buf.len()) };
     if rc != 0 {
+        return String::new();
+    }
+    let bytes: Vec<u8> = buf.iter().take_while(|b| **b != 0).map(|b| *b as u8).collect();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+/// The name this console advertises to the others ("Player 1".."Player 4"),
+/// read back out of the firmware the guest itself reads - see
+/// `apply_console_mac` and `md_console_name`. Empty before a ROM is loaded, and
+/// when a build's bridge predates the accessor.
+fn read_console_name(inst: &Instance) -> String {
+    let mut buf = [0i8; 32];
+    let rc = unsafe { md_console_name(inst.ptr, buf.as_mut_ptr(), buf.len() as i32) };
+    if rc < 0 {
         return String::new();
     }
     let bytes: Vec<u8> = buf.iter().take_while(|b| **b != 0).map(|b| *b as u8).collect();
@@ -2516,7 +2630,7 @@ fn dp_state(session: &Session) -> serde_json::Value {
     match session.dp.as_ref() {
         None => serde_json::json!({
             "present": false,
-            "note": "this title has no download-play joiner (only a profile with download_play gets one)",
+            "note": "this session has no download-play joiner (a profile with download_play, and a two-console session, are both required)",
         }),
         Some(dp) => {
             let Counters {
@@ -2544,6 +2658,7 @@ fn dp_state(session: &Session) -> serde_json::Value {
                 transfer,
                 radio_hold,
                 frames_requeued,
+                beacons_served,
             } = &dp.counters;
             serde_json::json!({
                 "present": true,
@@ -2570,6 +2685,7 @@ fn dp_state(session: &Session) -> serde_json::Value {
                 "acksRecv": acks_recv.load(Ordering::SeqCst),
                 "repliesCollected": replies_collected.load(Ordering::SeqCst),
                 "requeued": frames_requeued.load(Ordering::SeqCst),
+                "beaconsServed": beacons_served.load(Ordering::SeqCst),
                 "imagePackets": image_packets.load(Ordering::SeqCst),
                 "imageBytes": image_bytes.load(Ordering::SeqCst),
                 "imageNext": image_next.load(Ordering::SeqCst),
@@ -2642,6 +2758,7 @@ fn link_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, S
         let mut stats = MDLinkStats::default();
         unsafe { md_link_stats(inst.ptr, &mut stats) };
         players.push(serde_json::json!({
+            "name": read_console_name(inst),
             "frames": unsafe { md_frame_counter(inst.ptr) },
             "packetsSent": stats.packets_sent,
             "packetsReceived": stats.packets_received,
@@ -5232,4 +5349,80 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// The keyboard zones are what makes four players at one keyboard
+    /// independent, so the property that matters is that no code appears in two
+    /// zones: a shared code would drive both consoles at once, and the whole
+    /// point of the change is that each player's press reaches their own
+    /// console and only it.
+    #[test]
+    fn default_keymaps_are_disjoint_and_complete()
+    {
+        let maps: Vec<Vec<(&str, u32)>> = (0..4).map(default_keymap).collect();
+
+        for (p, km) in maps.iter().enumerate()
+        {
+            assert_eq!(km.len(), 12, "console {} has {} bindings, not 12", p + 1, km.len());
+            let mut bits: Vec<u32> = km.iter().map(|(_, b)| *b).collect();
+            bits.sort_unstable();
+            bits.dedup();
+            assert_eq!(bits.len(), 12, "console {} binds the same button twice", p + 1);
+        }
+
+        for a in 0..maps.len()
+        {
+            for b in (a + 1)..maps.len()
+            {
+                for (code, _) in &maps[a]
+                {
+                    assert!(
+                        !maps[b].iter().any(|(c, _)| c == code),
+                        "'{code}' is in console {}'s zone and console {}'s - one key cannot drive two consoles",
+                        a + 1,
+                        b + 1
+                    );
+                }
+            }
+        }
+    }
+
+    /// A zone must be a whole DS pad, not a partial one: four players on one
+    /// keyboard each need their own d-pad and all eight buttons, or someone
+    /// cannot play.
+    #[test]
+    fn every_zone_has_the_whole_pad()
+    {
+        let want = [
+            MD_BTN_A,
+            MD_BTN_B,
+            MD_BTN_X,
+            MD_BTN_Y,
+            MD_BTN_L,
+            MD_BTN_R,
+            MD_BTN_START,
+            MD_BTN_SELECT,
+            MD_BTN_UP,
+            MD_BTN_DOWN,
+            MD_BTN_LEFT,
+            MD_BTN_RIGHT,
+        ];
+        for p in 0..4
+        {
+            let km = default_keymap(p);
+            for bit in want
+            {
+                assert!(
+                    km.iter().any(|(_, b)| *b == bit),
+                    "console {} has no binding for button bit {bit:#x}",
+                    p + 1
+                );
+            }
+        }
+    }
 }

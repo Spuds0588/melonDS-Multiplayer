@@ -592,6 +592,14 @@ int md_dp_boot(MDInstance* inst, const void* image, size_t len,
    console has booted yet. */
 int md_console_mac(MDInstance* inst, unsigned char* out6);
 
+/* The name this console advertises on the air ("Player 1".."Player 4"): the
+   firmware nickname every instance boots with, which is what a game's own room
+   list shows for each console it can see. Read back out of the firmware the
+   guest reads, so a reader sees the same bytes a game sees. `out` is NUL-
+   terminated UTF-8; returns the byte count written, or -1 before a ROM load
+   (no identity yet). */
+int md_console_name(MDInstance* inst, char* out, int cap);
+
 /* Whether this console is on the bus right now (1/0; -1 when there is no bus).
    A console whose radio is off is not attached and the router writes it
    nothing, so a reader that attaches at the bus level (md_link_test_attach)

@@ -80,14 +80,26 @@
       font: 0.8rem system-ui, sans-serif;
       padding: 0.35rem;
     }
+    /* The card layout is a grid whose column count comes from the view mode
+       and the player count (see applyLayout):
+         1-screen view - 1-2 players in one row, 3-4 in the standard 2x2 that
+                         four-player splitscreen games use;
+         2-screen view - every player in a single row, so all four consoles
+                         show both screens side by side.
+       It replaced a wrapping flex row, which arranged four cards by whatever
+       happened to fit the window width (2026-10-17). */
     main {
       flex: 1;
-      display: flex;
+      display: grid;
       gap: 1rem;
       padding: 1rem;
-      align-items: flex-start; /* hug content: flip cards are shorter than stacked ones */
+      align-items: start;
       justify-content: center;
-      flex-wrap: wrap;
+      grid-template-columns: repeat(var(--cols, 2), minmax(0, 1fr));
+      width: 100%;
+      max-width: var(--maxw, 820px);
+      margin: 0 auto;
+      overflow: auto;
     }
     .console {
       background: var(--panel);
@@ -97,9 +109,10 @@
       display: flex;
       flex-direction: column;
       gap: 0.5rem;
-      min-width: 280px;
-      max-width: 360px;
-      flex: 1;
+      /* The grid decides the width; a min-width here would stop four cards
+         from fitting one row on a 1280px window. */
+      min-width: 0;
+      max-width: none;
     }
     .console h2 {
       font-size: 0.85rem;
@@ -148,6 +161,25 @@
     .console .pen-cursor.on { display: block; }
     .console .hint { font-size: 0.72rem; color: var(--dim); line-height: 1.5; }
     .console .hint b { color: var(--ink); font-weight: 500; }
+    /* Gamepad row: which physical pad drives this console. Auto-assigned as
+       pads connect (in connect order, to the lowest free player); the picker
+       reassigns without unplugging anything. */
+    .console .padrow {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.72rem;
+      color: var(--dim);
+    }
+    .console .padrow .padname {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .console .padrow.live .padname { color: #7ee0a2; }
+    .console .padrow select { font-size: 0.7rem; padding: 0.15rem 0.2rem; max-width: 9rem; }
     /* The card the keyboard currently drives (digits 1-4 switch it). */
     .console.active { border-color: var(--accent); }
     .console.active h2 span:first-child { color: var(--accent); font-weight: 600; }
@@ -192,9 +224,9 @@
       <button id="start" class="primary">Start</button>
       <button id="stop" disabled>Stop</button>
       <button id="selftest" disabled title="Check the link between consoles: a test packet each way when no game has wireless on, otherwise a safe bus resync kick (injecting frames into a live lobby disturbs the game)">Link test</button>
-      <select id="view" title="Screen layout">
-        <option value="flip" selected>View: top (Tab peeks)</option>
-        <option value="side">View: both screens</option>
+      <select id="view" title="Screen layout (1-screen: 3-4 players are a 2x2 grid; 2-screen: one row)">
+        <option value="flip" selected>View: 1 screen (Tab peeks)</option>
+        <option value="side">View: 2 screens</option>
       </select>
     </div>
     <span class="status" id="status">bridge: not connected</span>
@@ -210,9 +242,11 @@
   <footer>
     Local splitscreen host — one emulated console per player on the native
     bridge (src/frontend/tauri/melonds_bridge.h), linked over melonDS virtual
-    Wi-Fi. Keys 1-4 switch which console the keyboard drives; hold Shift-Right
-    (or press Tab) to peek at that console's touch screen; the mouse is the
-    pen on it at all times, shown or not.
+    Wi-Fi. Gamepads are picked up as they connect and assigned to players in
+    order (the picker under each console reassigns one); keys 1-4 switch which
+    console the keyboard drives; hold Shift-Right (or press Tab) to peek at
+    that console's touch screen; the mouse is the pen on it at all times,
+    shown or not.
   </footer>
   <script>
     "use strict";
@@ -320,14 +354,25 @@
     // Console cards
     // ------------------------------------------------------------------
 
+    // Every code the default zones carry, because a hint that reads
+    // "BracketLeft" is a key nobody can find (2026-10-15, after the zones
+    // became per-console: four cards each showing their own list).
     const KEY_LABELS = {
       KeyW: "W", KeyA: "A", KeyS: "S", KeyD: "D",
       KeyJ: "J", KeyK: "K", KeyU: "U", KeyI: "I", KeyQ: "Q", KeyE: "E",
+      KeyT: "T", KeyF: "F", KeyG: "G", KeyH: "H",
+      KeyO: "O", KeyP: "P", KeyN: "N", KeyM: "M",
+      KeyZ: "Z", KeyX: "X", KeyC: "C", KeyV: "V",
+      KeyL: "L",
       Space: "Space", ShiftLeft: "LShift", ShiftRight: "RShift",
       ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→",
-      Numpad1: "Num1", Numpad2: "Num2", Numpad3: "Num3", Numpad4: "Num4",
-      Numpad5: "Num5",
-      Numpad0: "Num0", NumpadEnter: "NumEnter", PageUp: "PgUp", PageDown: "PgDn",
+      Comma: ",", Period: ".", Semicolon: ";", Slash: "/", Quote: "'",
+      BracketLeft: "[", BracketRight: "]", Backslash: "\\", Enter: "Enter",
+      Numpad0: "Num0", Numpad1: "Num1", Numpad2: "Num2", Numpad3: "Num3",
+      Numpad4: "Num4", Numpad5: "Num5", Numpad6: "Num6", Numpad7: "Num7",
+      Numpad8: "Num8", Numpad9: "Num9", NumpadDecimal: "Num.",
+      NumpadDivide: "Num/", NumpadMultiply: "Num*", NumpadSubtract: "Num-",
+      NumpadEnter: "NumEnter", PageUp: "PgUp", PageDown: "PgDn",
     };
 
     function buildCards(n) {
@@ -366,23 +411,45 @@
         hint.className = "hint";
         hint.textContent = "no session";
 
+        // Which physical gamepad drives this console. Filled in by
+        // refreshPadOptions(); the picker is the manual half of the automatic
+        // assignment (pads claim the lowest free player as they connect).
+        const padrow = document.createElement("div");
+        padrow.className = "padrow";
+        const padname = document.createElement("span");
+        padname.className = "padname";
+        padname.textContent = "no gamepad";
+        const padpick = document.createElement("select");
+        padpick.className = "padpick";
+        padpick.title = "which gamepad drives this console";
+        padpick.addEventListener("change", () => assignFromPicker(p, padpick.value));
+        padrow.append(padname, padpick);
+
         wrap.append(top, bottom, cursor);
-        card.append(title, wrap, hint);
+        card.append(title, wrap, hint, padrow);
         consolesEl.append(card);
 
         const ctxTop = top.getContext("2d");
         const ctxBottom = bottom.getContext("2d");
         canvases.push({
           card, wrap, top, bottom, ctxTop, ctxBottom, fps, hint, cursor,
+          padrow, padname, padpick,
           imgTop: ctxTop.createImageData(W, H),
           imgBot: ctxBottom.createImageData(W, H),
-          seq: -1n, frames: 0, buttons: 0,
+          seq: -1n, frames: 0, buttons: 0, padButtons: 0,
           peeking: false,          // hold-to-peek state (flip mode)
           pen: { x: 0, y: 0, down: false }, // logical pen position on the 256x192 pad
         });
 
         wireTouch(wrap, p);
       }
+      consolesEl.dataset.players = String(n);
+      // Keep the assignments that still have a player; a start with more
+      // players lets the automatic pass fill the new ones.
+      padAssign = Array.from({ length: n }, (_, i) => padAssign[i] ?? -1);
+      padIds = Array.from({ length: n }, (_, i) => padIds[i] ?? null);
+      padOff = Array.from({ length: n }, (_, i) => padOff[i] ?? false);
+      syncPads();
       applyLayout();
     }
 
@@ -466,7 +533,11 @@
     }
 
     // ------------------------------------------------------------------
-    // Input: one keyboard, the selected console (digits 1-4 switch it)
+    // Input: one keyboard, one zone per console. A key drives every console
+    // whose own keymap names it; digits 1-4 pick the console the mouse and the
+    // peek act on. (Before: all consoles shared one keymap and every key drove
+    // the selected console only - four players at one keyboard all moved
+    // player 1, or moved nothing while another console was selected.)
     // ------------------------------------------------------------------
 
     const held = new Map(); // code -> bitmask contribution (active sessions only)
@@ -513,7 +584,12 @@
       for (const [code, bit] of held.entries()) {
         if ((bit >>> 0) && maskFor(p, code)) mask |= bit;
       }
-      mask &= playerMask(p);
+      // A gamepad and a keyboard can drive the same console; whichever is
+      // pressed wins, and either release leaves the other's buttons alone.
+      // The keyboard half is filtered through this console's zone (a code in
+      // no zone moves nothing); the pad half is a complete DS pad already and
+      // needs no zone to exist.
+      mask = (mask & playerMask(p)) | (c.padButtons >>> 0);
       c.buttons = mask;
       await pushInput(p);
     }
@@ -523,28 +599,44 @@
       return session.keymaps[p].reduce((m, [, bit]) => m | bit, 0);
     }
 
-    // Which console a digit key selects: Digit1..4 / Numpad1..4 -> 0..3, else -1.
+    // Every console whose own zone names this key. Local splitscreen is several
+    // people at one keyboard, so a press belongs to the console that binds it,
+    // not to the console the mouse has selected. If two zones ever carry the
+    // same code (after remapping), both consoles get it - one key, two players
+    // - which is visible rather than silently dropped.
+    function ownersOf(code) {
+      if (!session) return [];
+      const out = [];
+      for (let p = 0; p < session.keymaps.length; p++) {
+        if (maskFor(p, code)) out.push(p);
+      }
+      return out;
+    }
+
+    // Which console a digit key selects: Digit1..4 -> 0..3, else -1. The numpad
+    // digits are console 3's own keys (2/4/6/8 are its d-pad), so they cannot
+    // also be selectors - a key can only be one thing.
     function digitIndex(code) {
-      const m = /^(?:Digit|Numpad)([1-4])$/.exec(code);
+      const m = /^Digit([1-4])$/.exec(code);
       return m ? Number(m[1]) - 1 : -1;
     }
 
     function setActive(i) {
       if (i === active || !canvases[i]) return;
-      // Release everything held on the old console: a direction held while
-      // switching must not stay latched there (the keyup will land on the
-      // new console, which never had it down). The pen goes with it: the
-      // pointer handlers ignore every console but the selected one, so a
-      // console left holding its pen across a switch would never see the
-      // lift that releases it (the old code cleared the guest's pen here by
-      // accident, by sending `touch: null` from a button update).
-      held.clear();
+      // The pen goes with the selection: the pointer handlers ignore every
+      // console but the selected one, so a console left holding its pen across
+      // a switch would never see the lift that releases it. Buttons stay where
+      // they are - a key belongs to the console whose zone names it, so the
+      // keyup lands on the same console the keydown did. Clearing `held` here
+      // used to release another player's held direction (measured 2026-10-15:
+      // console 1 reading UP `0x40` with KeyW down, a second player pressing
+      // Digit2, console 1 back to zero while the key was still physically
+      // down, and no press left to bring it back).
       const prev = canvases[active];
       if (prev && prev.pen.down) {
         prev.pen.down = false;
         prev.cursor.classList.remove("on");
       }
-      sendButtons(active);
       active = i;
       for (let p = 0; p < canvases.length; p++) {
         canvases[p].card.classList.toggle("active", p === active);
@@ -594,10 +686,10 @@
         updatePeek("Tab", true);
         return;
       }
-      const bit = maskFor(active, e.code);
-      if (bit) {
-        held.set(e.code, bit);
-        sendButtons(active);
+      const owners = ownersOf(e.code);
+      if (owners.length) {
+        held.set(e.code, maskFor(owners[0], e.code));
+        for (const p of owners) sendButtons(p);
         e.preventDefault();
         return;
       }
@@ -608,23 +700,25 @@
       // Delete BEFORE sending: the reverse order left a direction latched ON
       // after every tap (the d-pad kept walking - v0.1.8b regression).
       const wasHeld = held.delete(e.code);
-      const bit = maskFor(active, e.code);
-      if (bit) {
-        sendButtons(active);
+      const owners = ownersOf(e.code);
+      if (owners.length) {
+        for (const p of owners) sendButtons(p);
         e.preventDefault();
       } else if (wasHeld) {
-        sendButtons(active);
+        // Defensive: a code that left every zone while it was held (a session
+        // change) still has to be released everywhere.
+        for (let p = 0; p < canvases.length; p++) sendButtons(p);
       }
       updatePeek(e.code, false);
     });
 
     // Focus lost mid-hold would leave buttons stuck and cards peeking forever.
     window.addEventListener("blur", () => {
+      // Focus is not something a console can see, so every player's held keys
+      // are released on every console - not only the selected one.
       held.clear();
-      if (canvases[active]) {
-        canvases[active].peeking = false;
-        sendButtons(active);
-      }
+      for (let p = 0; p < canvases.length; p++) sendButtons(p);
+      if (canvases[active]) canvases[active].peeking = false;
       peekViaTab = false;
       applyLayout();
     });
@@ -633,7 +727,7 @@
     // instead of deciding for themselves what a key name means. The
     // vocabulary is exactly what the two handlers above dispatch on, in that
     // order: a digit selects a console, Tab and the peek key drive the peek,
-    // and anything else has to be in the selected console's keymap (which is
+    // and anything else has to be in some console's keymap (which is
     // per-session data from the backend). Keeping it here is what stops the
     // two from drifting - the channel used to dispatch any string and report
     // success, so `key Bogus` was silently accepted (history.md v0.1.9ab).
@@ -641,7 +735,7 @@
       digitIndex(code) >= 0 ||
       code === "Tab" ||
       code === flipKeyFor(active) ||
-      maskFor(active, code) !== 0;
+      ownersOf(code).length > 0;
 
     window.__mdselect = (p) => {
       if (!canvases[p]) return `player ${p + 1} has no console`;
@@ -757,6 +851,223 @@
     }
 
     // ------------------------------------------------------------------
+    // Gamepads: one physical pad per console.
+    //
+    // Assignment is automatic by default: a pad that appears claims the
+    // lowest player that has none, so plugging four pads in before Start is
+    // all a four-player couch needs. The picker under each console overrides
+    // that (or turns a player's pad off), and the choice is remembered by
+    // gamepad id - not by index, which differs between sessions and between
+    // two pads of the same model.
+    //
+    // Buttons map by position, the way the DS's own face is laid out: south
+    // (A / ✕) is the DS A, east is B, west is X, north is Y. Both the d-pad
+    // and the left stick drive the DS d-pad, and the triggers double the
+    // shoulder buttons. Nothing here reaches the emulator by itself: a pad
+    // produces the same button mask a key does and goes through
+    // sendButtons(), so keyboard and pad can drive one console together.
+    // ------------------------------------------------------------------
+    const PAD_BUTTONS = [
+      [0, 1 << 0],   // south -> A
+      [1, 1 << 1],   // east  -> B
+      [2, 1 << 10],  // west  -> X
+      [3, 1 << 11],  // north -> Y
+      [4, 1 << 9],   // LB    -> L
+      [6, 1 << 9],   // LT    -> L
+      [5, 1 << 8],   // RB    -> R
+      [7, 1 << 8],   // RT    -> R
+      [8, 1 << 2],   // Back / View / Share -> Select
+      [9, 1 << 3],   // Start -> Start
+      [12, 1 << 6],  // d-pad up
+      [13, 1 << 7],  // down
+      [14, 1 << 5],  // left
+      [15, 1 << 4],  // right
+    ];
+    const PAD_DEADZONE = 0.5;   // stick travel that counts as a d-pad press
+    const PAD_STORE = "padAssign";
+
+    let padAssign = [];   // player -> gamepad index, -1 = none
+    let padIds = [];      // player -> gamepad id, for remembering the choice
+    let padOff = [];      // player -> the picker's "off" was chosen
+    let padSeen = [];     // ids of the pads seen last poll, to notice hot-plug
+
+    function connectedPads() {
+      const out = [];
+      if (!navigator.getGamepads) return out;
+      for (const gp of navigator.getGamepads()) if (gp && gp.connected) out.push(gp);
+      return out;
+    }
+
+    // The browser's own name for the pad, minus the vendor/product noise in
+    // parentheses, plus the session's index so two identical pads can still be
+    // told apart while the window is open.
+    function padLabel(gp) {
+      const name = gp.id.replace(/\s*\([^)]*\)\s*/g, " ").trim() || "gamepad";
+      return `${name} #${gp.index + 1}`;
+    }
+
+    function padMask(gp) {
+      let m = 0;
+      for (const [btn, bit] of PAD_BUTTONS) {
+        const b = gp.buttons[btn];
+        if (b && (b.pressed || b.value >= PAD_DEADZONE)) m |= bit;
+      }
+      const ax = gp.axes[0] ?? 0, ay = gp.axes[1] ?? 0;
+      if (ax <= -PAD_DEADZONE) m |= 1 << 5;
+      else if (ax >= PAD_DEADZONE) m |= 1 << 4;
+      if (ay <= -PAD_DEADZONE) m |= 1 << 6;
+      else if (ay >= PAD_DEADZONE) m |= 1 << 7;
+      return m;
+    }
+
+    function loadPadAssign() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(PAD_STORE) || "null");
+        return Array.isArray(saved) ? saved : [];
+      } catch (_) { return []; }
+    }
+    function savePadAssign() {
+      try { localStorage.setItem(PAD_STORE, JSON.stringify(padIds)); } catch (_) {}
+    }
+
+    // Reconcile the assignments with the pads that are actually plugged in:
+    // drop ones that went away, then claim unassigned pads, preferring the
+    // player the pad was remembered for. Called when the set of pads changes
+    // and whenever the consoles are rebuilt (a start can add players).
+    function syncPads(pads) {
+      pads = pads || connectedPads();
+      const byIndex = new Map(pads.map((g) => [g.index, g]));
+      const n = canvases.length;
+
+      for (let p = 0; p < n; p++) {
+        if (padAssign[p] >= 0 && !byIndex.has(padAssign[p])) {
+          padAssign[p] = -1;
+          padIds[p] = null;
+          const c = canvases[p];
+          if (c && c.padButtons) { c.padButtons = 0; if (session) sendButtons(p); }
+        }
+      }
+
+      const stored = loadPadAssign();
+      for (const gp of pads) {
+        if (padAssign.indexOf(gp.index) >= 0) continue;
+        let p = stored.indexOf(gp.id);
+        if (p < 0 || p >= n || padOff[p] || (padAssign[p] >= 0 && padAssign[p] !== gp.index)) {
+          p = -1;
+          for (let q = 0; q < n; q++) if (!padOff[q] && padAssign[q] < 0) { p = q; break; }
+        }
+        if (p < 0) continue; // more pads than consoles: stays unassigned
+        // One pad drives one console.
+        for (let q = 0; q < n; q++) if (q !== p && padAssign[q] === gp.index) padAssign[q] = -1;
+        padAssign[p] = gp.index;
+        padIds[p] = gp.id;
+        savePadAssign();
+      }
+      refreshPadOptions(pads);
+    }
+
+    function refreshPadOptions(pads) {
+      pads = pads || connectedPads();
+      const byIndex = new Map(pads.map((g) => [g.index, g]));
+      canvases.forEach((c, p) => {
+        const gp = byIndex.get(padAssign[p] ?? -1);
+        c.padrow.classList.toggle("live", !!gp);
+        c.padname.textContent = gp
+          ? `🎮 ${padLabel(gp)}`
+          : padOff[p]
+            ? "🎮 off"
+            : pads.length ? "🎮 unassigned" : "🎮 no gamepad";
+        const want = padOff[p] ? "none" : gp ? String(gp.index) : "auto";
+        // Rebuild the list only when the pads or the choice moved: rewriting
+        // it every poll closes the dropdown the user is aiming at.
+        const sig = pads.map((g) => `${g.index}:${g.id}`).join("|") + "#" + want;
+        if (c.padpick.dataset.sig === sig) return;
+        c.padpick.dataset.sig = sig;
+        c.padpick.innerHTML = "";
+        const add = (value, label) => {
+          const o = document.createElement("option");
+          o.value = value;
+          o.textContent = label;
+          c.padpick.append(o);
+        };
+        add("auto", "auto");
+        add("none", "off");
+        for (const g of pads) add(String(g.index), padLabel(g));
+        c.padpick.value = want;
+      });
+    }
+
+    async function assignFromPicker(p, value) {
+      if (value === "none") {
+        padOff[p] = true;
+        padAssign[p] = -1;
+        padIds[p] = null;
+        const c = canvases[p];
+        if (c && c.padButtons) { c.padButtons = 0; if (session) await sendButtons(p); }
+        savePadAssign();
+        refreshPadOptions();
+        return;
+      }
+      padOff[p] = false;
+      if (value === "auto") {
+        // Give the pick back to the automatic pass, then let it run now. A pad
+        // whose index is this player's number is the one that player would
+        // have been given first, so take it when it is free.
+        padAssign[p] = -1;
+        padIds[p] = null;
+        const own = connectedPads().find(
+          (g) => g.index === p && padAssign.indexOf(g.index) < 0,
+        );
+        if (own) { padAssign[p] = own.index; padIds[p] = own.id; }
+      } else {
+        const gp = connectedPads().find((g) => String(g.index) === value);
+        if (!gp) { refreshPadOptions(); return; }
+        for (let q = 0; q < canvases.length; q++) {
+          if (q !== p && padAssign[q] === gp.index) {
+            padAssign[q] = -1;
+            const other = canvases[q];
+            if (other && other.padButtons) { other.padButtons = 0; if (session) sendButtons(q); }
+          }
+        }
+        padAssign[p] = gp.index;
+        padIds[p] = gp.id;
+      }
+      savePadAssign();
+      syncPads();
+    }
+
+    // One poll for every pad: read each assigned pad, and only push when its
+    // mask actually changed, so a held direction costs nothing. This is also
+    // the keyboard pump's frame clock (60Hz in the app), and it is the only
+    // thing that notices a pad appearing when the browser does not fire
+    // gamepadconnected (Chrome waits for the first button press).
+    function stepPads() {
+      const pads = connectedPads();
+      const ids = pads.map((g) => `${g.index}:${g.id}`).join("|");
+      if (ids !== padSeen.join("|")) {
+        padSeen = pads.map((g) => `${g.index}:${g.id}`);
+        syncPads(pads);
+      }
+      const byIndex = new Map(pads.map((g) => [g.index, g]));
+      canvases.forEach((c, p) => {
+        const gp = byIndex.get(padAssign[p] ?? -1);
+        const m = gp ? padMask(gp) : 0;
+        if (m !== c.padButtons) {
+          c.padButtons = m;
+          if (session) sendButtons(p);
+        }
+      });
+    }
+
+    function pollPads() {
+      stepPads();
+      requestAnimationFrame(pollPads);
+    }
+
+    window.addEventListener("gamepadconnected", () => syncPads());
+    window.addEventListener("gamepaddisconnected", () => syncPads());
+
+    // ------------------------------------------------------------------
     // Layout: flip (top + hold-to-peek) vs side (both screens)
     // ------------------------------------------------------------------
 
@@ -776,6 +1087,17 @@
     function applyLayout() {
       document.body.classList.toggle("mode-side", layoutMode === "side");
       el("view").value = layoutMode;
+      // Column count, and the widest the row is allowed to get:
+      //   1-screen view, 3-4 players -> 2 columns, the standard 2x2;
+      //   1-screen view, 1-2 players -> one row of that many;
+      //   2-screen view              -> one row of every player.
+      const n = canvases.length || 1;
+      const cols = layoutMode === "side" ? n : Math.min(n, 2);
+      consolesEl.style.setProperty("--cols", String(cols));
+      consolesEl.style.setProperty(
+        "--maxw",
+        cols >= 3 ? "1900px" : cols === 2 ? "820px" : "420px",
+      );
       for (let p = 0; p < canvases.length; p++) {
         const c = canvases[p];
         const peek = layoutMode === "flip" && c.peeking;
@@ -860,37 +1182,34 @@
 
     function applyKeymapHints() {
       if (!session) return;
-      // One keyboard, one keymap: every card shows the same controls plus
-      // its own selector digit.
+      // Each card shows its OWN console's zone. One shared hint per run was the
+      // same keys for the wrong console: every console used to carry the same
+      // keymap and only the selected one heard it.
       session.keymaps.forEach((km, p) => {
         const c = canvases[p];
         if (!c) return;
-        if (p === 0) {
-          const groups = [];
-          for (const [code, bit] of km) {
-            const label = KEY_LABELS[code] ?? code;
-            const name =
-              bit === (1 << 4) || bit === (1 << 5) || bit === (1 << 6) || bit === (1 << 7) ? "dpad" :
-              bit === (1 << 0) ? "A" : bit === (1 << 1) ? "B" :
-              bit === (1 << 10) ? "X" : bit === (1 << 11) ? "Y" :
-              bit === (1 << 8) ? "L" : bit === (1 << 9) ? "R" :
-              bit === (1 << 3) ? "Start" : "Select";
-            const g = groups.find((x) => x.name === name);
-            if (g) g.keys.push(label); else groups.push({ name, keys: [label] });
-          }
-          const peekLabel = KEY_LABELS[flipKeyFor(0)] ?? flipKeyFor(0) ?? "—";
-          const controls = groups.map((g) => `<b>${g.name}</b> ${g.keys.join(" ")}`).join(" · ");
-          session._controlsHint = controls;
+        const groups = [];
+        for (const [code, bit] of km) {
+          const label = KEY_LABELS[code] ?? code;
+          const name =
+            bit === (1 << 4) || bit === (1 << 5) || bit === (1 << 6) || bit === (1 << 7) ? "dpad" :
+            bit === (1 << 0) ? "A" : bit === (1 << 1) ? "B" :
+            bit === (1 << 10) ? "X" : bit === (1 << 11) ? "Y" :
+            bit === (1 << 8) ? "R" : bit === (1 << 9) ? "L" :
+            bit === (1 << 3) ? "Start" : "Select";
+          const g = groups.find((x) => x.name === name);
+          if (g) g.keys.push(label); else groups.push({ name, keys: [label] });
         }
-        // With one console there is nothing to switch to, and "keys 1-1 switch
-        // console" is nonsense to read (2026-09-29 playtest).
+        const controls = groups.map((g) => `<b>${g.name}</b> ${g.keys.join(" ")}`).join(" · ");
+        // With one console there is nothing to select and "keys 1-1" is
+        // nonsense to read (2026-09-29 playtest).
         const switcher = session.players > 1
-          ? `<b>keys 1-${session.players}</b> switch console · `
+          ? `<b>keys 1-${session.players}</b> pick the console the mouse drives · `
           : "";
         c.hint.innerHTML =
           switcher +
-          (session._controlsHint ?? "") +
-          ` · mouse = touch · <b>peek</b> (hold) / Tab`;
+          controls +
+          ` · pad or keys · mouse = touch · <b>peek</b> (hold) / Tab`;
       });
     }
 
@@ -1096,6 +1415,7 @@
     }
 
     pump();
+    pollPads();
   </script>
 </body>
 </html>

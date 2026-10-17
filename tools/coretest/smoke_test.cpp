@@ -227,11 +227,32 @@ int main(int argc, char** argv)
     check(std::memcmp(mac_a, mac_b, 6) != 0 && std::memcmp(mac_b, mac_c, 6) != 0 &&
           std::memcmp(mac_a, mac_c, 6) != 0,
           "console MACs differ per slot");
+    /* The other half of that identity, and the one a game's own room list
+       prints: the nickname. Four consoles booting one firmware image all carry
+       the image's name, so the bridge sets each one to its player number. The
+       check reads it through the bridge - the same path a reader uses - rather
+       than trusting the write. */
+    {
+        char name_a[32] = { 0 }, name_b[32] = { 0 }, name_c[32] = { 0 };
+        check(md_console_name(a, name_a, sizeof(name_a)) > 0 &&
+              md_console_name(b, name_b, sizeof(name_b)) > 0 &&
+              md_console_name(c, name_c, sizeof(name_c)) > 0,
+              "console names read back through the bridge");
+        check(std::strcmp(name_a, "Player 1") == 0 &&
+              std::strcmp(name_b, "Player 2") == 0 &&
+              std::strcmp(name_c, "Player 3") == 0,
+              "each console advertises its own player number as its name");
+        check(std::strcmp(name_a, "melonDS") != 0,
+              "the firmware's shared default nickname is no longer advertised");
+    }
     {
         MDInstance* fresh = md_create(0, "never-booted");
         unsigned char none[6] = { 0 };
+        char no_name[32] = { 0 };
         check(fresh && md_console_mac(fresh, none) != 0,
               "a console with no ROM has no MAC to hand out");
+        check(fresh && md_console_name(fresh, no_name, sizeof(no_name)) != 0,
+              "a console with no ROM has no name to hand out");
         md_destroy(fresh);
     }
 
