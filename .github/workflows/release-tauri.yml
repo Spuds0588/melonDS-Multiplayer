@@ -38,7 +38,9 @@ jobs:
             bundles: dmg
           - os: windows-latest
             name: windows-x86_64
-            bundles: nsis,msi
+            # NSIS only: the MSI (WiX) target rejects a non-numeric
+            # pre-release identifier, so 0.1.5-alpha.3 cannot be an MSI.
+            bundles: nsis
 
     steps:
       - uses: actions/checkout@v4
