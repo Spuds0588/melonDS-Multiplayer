@@ -195,9 +195,8 @@ covered by the smoke test), but nothing plays it locally yet.
 
 ### Cutting an alpha release
 
-An alpha is built by CI, not on a dev machine: the core has to be compiled by
-each target's own toolchain (MSVC, AppleClang, GCC), and only a runner of that
-OS can do it. `.github/workflows/release-tauri.yml` builds Linux (AppImage,
+An alpha can be built by CI, and that is where the macOS installer comes from:
+`.github/workflows/release-tauri.yml` builds Linux (AppImage,
 .deb), macOS (dmg) and Windows (**nsis** - WiX's MSI refuses a non-numeric
 pre-release identifier like `alpha.3`) on every tag matching `v*-alpha*`,
 run the smoke test on Linux before packaging, and publishes the installers as a
@@ -222,6 +221,64 @@ Builds are unsigned on purpose (an alpha is not distributable as a signed
 release): macOS needs right-click-Open the first time, and Windows SmartScreen
 will warn. Nothing else about the app differs between the platforms - same
 frontend, same bridge, same core.
+
+#### Cross-building the Windows installer on Linux
+
+The Windows installer does not need a Windows machine. clang-cl can compile the
+C++ half against the MSVC headers and import libraries that `cargo-xwin`
+downloads, Rust builds for `x86_64-pc-windows-msvc` through the same SDK, and
+`makensis` writes the NSIS installer natively on Linux. This is how
+`0.1.5-alpha.4`'s Windows asset was produced locally, and it links to the same
+16.0 MB executable CI builds.
+
+```bash
+# toolchain, target, and a dirent.h for MSVC (any copy of tronkko/dirent's
+# header works; it only has to exist for FATStorage.cpp)
+cargo install --locked cargo-xwin
+rustup target add x86_64-pc-windows-msvc
+
+# xwin prints the toolchain file it generated, along with the SDK paths
+cargo-xwin env --target x86_64-pc-windows-msvc | grep CMAKE_TOOLCHAIN
+
+```
+
+Then, with that toolchain file and a directory holding `dirent.h`:
+
+```bash
+cmake -S . -B build-tauri-win -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=<cargo-xwin's x86_64-pc-windows-msvc-toolchain.cmake> \
+  -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_QT_SDL=OFF -DBUILD_TAURI_BRIDGE=ON -DENABLE_OGLRENDERER=OFF \
+  -DENABLE_LTO_RELEASE=OFF -DENABLE_LTO=OFF \
+  -DDIRENT_INCLUDE_DIRS=<directory with dirent.h>
+cmake --build build-tauri-win --target melonds_bridge -j$(nproc)
+ln -s build-tauri-win build-tauri   # build.rs reads build-tauri/ by design
+cd src-tauri && cargo-xwin build --release --target x86_64-pc-windows-msvc
+npx @tauri-apps/cli build --runner cargo-xwin \
+  --target x86_64-pc-windows-msvc --bundles nsis
+```
+
+Two failures are specific to this cross build and both are understood:
+
+* `error: use of undeclared identifier '_XCR_XFEATURE_ENABLED_MASK'`
+  (`src/dolphin/x64CPUDetect.cpp`). Under clang-cl on Windows, `<intrin.h>` is
+  clang's, which pulls in `xsaveintrin.h` and the constant with it. Here
+  clang-cl's include search finds the SDK's `intrin.h` first, which does not.
+  Pass `-D_XCR_XFEATURE_ENABLED_MASK=0` in `CMAKE_CXX_FLAGS` (the value both
+  headers define).
+* `Error: reading stub ".../Stubs/zlib-x86-unicode"`. The bundler deliberately
+  removes `NSISDIR`/`NSISCONFDIR` from `makensis`'s environment, so `makensis`
+  falls back to the path compiled into it. A distro `makensis` points at
+  `/usr/share/nsis`; a portable tree has to be built from NSIS source with
+  `PREFIX_DATA` set to its own `share/nsis`, e.g.
+  `scons makensis PREFIX_DATA=/opt/nsis/share/nsis SKIPUTILS=all SKIPPLUGINS=all SKIPSTUBS=all`.
+
+The build needs `clang-cl`, `lld-link`, `llvm-lib`, `llvm-rc` (LLVM 19's
+`/usr/lib/llvm-19/bin` has them under their plain names) and `ninja` on `PATH`.
+The resulting `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/\*.exe`
+is the same asset the release workflow uploads. Its executable imports only
+system DLLs: the CRT is linked statically, so no VC++ redistributable is needed.
 
 What exists today (0.1.5-alpha.3): the app is a working two-to-four-player host. Pick
 a ROM, a player count, press Start; each player gets a top+bottom console
