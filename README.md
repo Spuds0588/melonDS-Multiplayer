@@ -16,6 +16,8 @@ A Tauri-based desktop application that runs multiple linked melonDS emulator ins
 
 > **Note:** This is a fork of the [melonDS](https://github.com/melonDS-emu/melonDS) emulator, adapted for splitscreen multiplayer functionality. Inspired by the success of [mgba-splitscreen](https://github.com/Spuds0588/mgba-splitscreen).
 
+**[Web version → spuds0588.github.io/melonDS-Multiplayer](https://spuds0588.github.io/melonDS-Multiplayer/)** — the remote-player page, running in any browser with no install. Open the invite link a host sends you, or type the six-digit code the host reads out. Emulation stays on the host's machine, so play starts from the desktop app.
+
 ---
 
 ## About
@@ -38,7 +40,8 @@ seat its own two screens and that console's audio, and takes back a button mask
 and an optional touch point, over WebRTC (PeerJS). Emulation stays on the host,
 so a guest cannot desync the game. Guests join by six-digit code with host
 approval, or by a single-use magic link, from a plain web page
-(`frontend/guest.html`) that needs no installation and no backend.
+([the web version](https://spuds0588.github.io/melonDS-Multiplayer/), source in
+`frontend/guest.html`) that needs no installation and no backend.
 
 It is still the secondary goal, and it has one platform wrinkle: Debian and
 Ubuntu build WebKitGTK without WebRTC, so the Linux app's own window cannot
@@ -131,7 +134,7 @@ host in the app window directly. See
 ### For Remote Players
 - Any modern web browser with WebRTC (Chrome, Edge, Firefox, Safari)
 - A stable internet connection
-- No installation
+- No installation — just [the web version](https://spuds0588.github.io/melonDS-Multiplayer/)
 
 ### For Hosting on Linux
 - The app, plus a browser with WebRTC for the page (Chrome, Firefox, Edge)
