@@ -4989,7 +4989,6 @@ grid** four-player splitscreen games use. 2-screen view: **every player in a
 *This phase is optional and not the core focus. Only pursue if there's demand.*
 
 ### Todo
-- [ ] Push the guest page, so the published `online.js` carries the join reasons and the ping/pong liveness (nothing else reaches a real guest)
 - [ ] Release a console's buttons when the *host page* disappears (reload, closed tab): the page owns the masks, and today the last remote press stays held
 - [ ] Testing with players on real networks (everything measured so far is two ends on one machine)
 
@@ -5003,6 +5002,7 @@ grid** four-player splitscreen games use. 2-screen view: **every player in a
 - [x] Input routing back from remote players (measured: a guest's A press moves that console's own keypad register `03FF` -> `03FE` -> `03FF`)
 - [x] Connection management UI (join code with host approval, per-seat invite links, seat chips, pending requests)
 - [x] A foreground guest joins the browser host by code and by invite link from the published page, decodes the stream and drives its console — v0.1.9dq, [history.md](./history.md#L3065)
+- [x] The guest page is deployed and verified: `guest.html`, `online.js` and `vendor/peerjs.min.js` on Pages are byte-identical to the tree (sha256), the page boots with no console errors, and a published-page guest joined the host by code, decoded the stream, moved its console's keypad register and was dropped 6.1 s after it left
 
 ---
 
