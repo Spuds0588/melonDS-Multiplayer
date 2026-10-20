@@ -1960,6 +1960,36 @@ conflict, and it is the tiebreak when a design choice is otherwise even:
 - **Every claim under this rule is a measurement:** 4 linked consoles, frame time
   and fps per console, on the weakest machine available.
 
+**The per-core-budget table, measured 2026-10-20 (history.md v0.1.9ds).** The app
+and the WebKit web process together, inside a systemd user scope with
+`CPUQuota=N00%` (a `taskset` pin on the app alone leaves the display path
+outside the budget, so it is not the model used here), same MKDS title/attract
+and `diag.nds` recipes. Each cell is the five-second-window range over the run /
+tree cores / painted fps; MKDS's attract has a light phase (menu, 60 even on one
+core) and a heavy one (the 3D race), so the range is the honest number:
+
+| CPU budget | 1 console | 2 consoles | 4 consoles |
+| --- | --- | --- | --- |
+| 1 core (MKDS) | 52.0-60.0 / 0.92 / 54 | 35.2-60.0 / 0.98 / 28 + 18 | 20.8-43.0 / 1.00 / 28 + 18 |
+| 2 cores (MKDS) | **59.6-60.0** / 0.96 / 59 | 44.8-60.0 / 1.66 / 57 + 30 | 29.4-60.0 / 1.94 / 26 + 18 |
+| 4 cores (MKDS) | **59.6-60.0** / 0.95 / 59 | 56.2-60.0 / 1.85 / 57 + 31 | 35.2-60.0 / 3.49 / 38 + 30 |
+| 8 cores (MKDS) | **59.6-60.0** / 0.87 / 60 | **59.0-60.0** / 1.73 / 59 + 31 | 39.8-60.0 / 3.87 / 42 + 31 |
+| 1 core (`diag.nds`) | 59.8-60.0 / 0.52 / 60 | **59.4-60.0** / 0.76 / 60 + 30 | 48.2-49.6 / 1.00 / 39 + 24 (3 consoles 56.4-59.8) |
+| 2 and 4 cores (`diag.nds`) | — | — | **59.8-60.2** / 1.31 / 60 + 30 |
+
+**The answer per budget** — largest count holding ~59.9 through the worst scene:
+**MKDS 0 consoles at 1 core, 1 at 2 cores, 1 at 4 (two dip to 56 in the race), 2
+at 8; `diag.nds` 2 at 1 core and 4 at 2 or 4.** **Why four MKDS consoles do not
+fit, measured rather than guessed:** at four consoles on the whole box each
+console ran 45.7 fps with its own thread at 0.85-0.90 cores - **19-20 ms of CPU
+per frame** - while the main thread took 0.24 and the link's ReceiveQueue 0.23,
+3.97 cores of 8 in total. A 60 fps frame is due every 16.7 ms, so one console's
+own run-loop thread is already over the budget in that scene: extra cores clean
+up the page's and the driver's share (the painted rate at four goes 26 → 38 → 42
+from 2 to 8 cores) but cannot lift the consoles. **The lever the rule needs is
+per-console frame cost, not a bigger core budget** - the same box holds four
+`diag.nds` consoles on two cores and cannot hold four MKDS ones on eight.
+
 ### Instruments to build first (every milestone needs them)
 
 - [x] **IPC FIFO traffic counters, counted where a word moves.** **Built
@@ -2422,10 +2452,34 @@ NSMB is the working half. These close the other two and the drop:
       and after the rebuild: a single frame pull fell from **13.0/34.3/70.1 ms**
       (1/2/4 consoles) to **7.6/14.8/27.6 ms**, and the painted rate at four
       consoles from **16 fps to 29-31** for **3.21 cores instead of 3.57**, with
-      every console still at 59. What this item still owes: the *joined*
-      four-console room's ten-minute distribution on the performance profile, and
-      a weakest-machine arm — this box is a 4-core/8-thread i5-8350U, not a low-end
-      target.
+      every console still at 59. **The per-core-budget arm is now measured too
+      (history.md v0.1.9ds, the table under the hardware rule):** full speed fits
+      one MKDS console in two cores and two in eight, and never four — because
+      one console's frame in the 3D race costs **19-20 ms of its own thread**,
+      over the 16.7 ms a 60 fps frame allows, with four consoles using only 3.97
+      of 8 cores. The light `diag.nds` ROM holds four consoles on two cores, so
+      the lever is **per-console frame cost**, not the core budget.
+      What this item still owes: the *joined* four-console room's ten-minute
+      distribution on the performance profile, a weakest-machine arm (this box is
+      a 4-core/8-thread i5-8350U, not a low-end target), and whether a joined
+      room hits the same 19-20 ms per-frame ceiling.
+- [x] **Say it when the machine is over budget (2026-10-20, history.md
+      v0.1.9ds).** The state a player on weak hardware cannot diagnose from the
+      picture: at a one-core quota with two MKDS consoles the game ran 41 fps
+      while the picture showed 15-28, the consoles stayed in exact lockstep, the
+      watchdog stayed quiet, input landed — and the status line went on reading
+      "link up 30s". The page now derives each console's emulated rate from the
+      frame counter `link_status` already reports and names the shortfall in the
+      status line (`over budget: game 41 fps, picture 15 fps · this machine
+      cannot hold 2 consoles at full speed`), after three consecutive seconds and
+      only while it holds; it is deliberately quiet between 55 and 59.9 fps so a
+      capable machine's scene dip does not cry wolf.
+- [ ] **Local audio.** There is none: the SPU is only drained by `get_audio`,
+      which the page polls while hosting online, so a local four-player session is
+      silent (found 2026-10-20 while looking for an audio stall under a one-core
+      budget, history.md v0.1.9ds). Under the hardware rule this also has to be
+      cheap: one mixer, one output device, per-console volume rather than four
+      audio graphs.
 - [ ] **Input at 4.** Four keyboard zones, four gamepads, each player's own flip
       key, and no way for one player's input to reach another console — which is
       the `appctl.py --player` item above
