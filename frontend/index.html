@@ -1348,6 +1348,41 @@
     }
 
     let fpsTimer = 0;
+
+    // Over budget: the game's own rate against the rate the page is painting.
+    //
+    // The two are the same number on a machine that keeps up and come apart
+    // exactly when it does not: the emulator's frame counter keeps advancing
+    // while the picture falls behind, because the page's decode and paint share
+    // the same CPU the consoles need. Measured 2026-10-20 with the app in a
+    // one-core CPU quota and two MKDS consoles: the game ran 41 fps while the
+    // page painted 15, and nothing said so - the status line went on reading
+    // "link up 30s". That is the one state a player on weak hardware cannot
+    // diagnose from the picture, so it is named here. Three consecutive seconds
+    // are needed to say it and to stop saying it, so a scene that merely dips
+    // does not flash a warning.
+    const FULL_SPEED_FPS = 55;   // a DS frame is due 59.826 times a second
+    const PICTURE_SHARE = 0.65;  // painted this far below the game is visible
+    let overBudgetSecs = 0;
+    let underBudgetSecs = 0;
+    let overBudget = false;
+
+    function overBudgetLine() {
+      const c = canvases[active] || canvases[0];
+      if (!c || c.emuFps === undefined || c.painted === undefined) return null;
+      const game = c.emuFps;
+      const picture = c.painted;
+      const over = game < FULL_SPEED_FPS || picture < game * PICTURE_SHARE;
+      overBudgetSecs = over ? overBudgetSecs + 1 : 0;
+      underBudgetSecs = over ? 0 : underBudgetSecs + 1;
+      if (!overBudget && overBudgetSecs >= 3) overBudget = true;
+      if (overBudget && underBudgetSecs >= 3) overBudget = false;
+      if (!overBudget) return null;
+      const n = session ? session.players : canvases.length;
+      return `over budget: game ${Math.round(game)} fps, picture ${Math.round(picture)} fps` +
+        ` · this machine cannot hold ${n} console${n === 1 ? "" : "s"} at full speed`;
+    }
+
     async function pollStatus() {
       if (!running || !invoke) return;
       try {
@@ -1377,7 +1412,11 @@
           );
           canvases.forEach((c) => (c.hint.style.color = "#ff6b6b"));
         } else if (performance.now() > statusHoldUntil) {
-          setStatus(`${running ? "running" : "idle"} · ${up} · ${connected}${linkCheck}`);
+          // The shortfall outranks the link report: a session that is running
+          // slowly is the thing the player needs to know, and the link line is
+          // still there the moment it recovers.
+          setStatus(overBudgetLine() ||
+            `${running ? "running" : "idle"} · ${up} · ${connected}${linkCheck}`);
         }
         canvases.forEach((c, i) => {
           const p = st.players?.[i];
@@ -1389,7 +1428,17 @@
           if (c.fpsTimer === undefined) c.fpsTimer = now;
           const dt = (now - c.fpsTimer) / 1000;
           const fps = dt > 0.5 ? Math.round(c.frames / dt) : null;
-          if (fps !== null) { c.fps.textContent = `${fps} fps`; c.frames = 0; c.fpsTimer = now; }
+          if (fps !== null) { c.fps.textContent = `${fps} fps`; c.frames = 0; c.fpsTimer = now; c.painted = fps; }
+          // The game's own rate, from the console's emulated frame counter: its
+          // delta is what the emulator managed, whatever rate this page asked
+          // for (the painted rate above is the answer to a different question).
+          if (c.emuTimer === undefined) { c.emuTimer = now; c.emuFrames = p.frames; }
+          const edt = (now - c.emuTimer) / 1000;
+          if (edt >= 1.0) {
+            c.emuFps = ((p.frames - c.emuFrames) >>> 0) / edt;
+            c.emuFrames = p.frames;
+            c.emuTimer = now;
+          }
           c.hint.title = `frames ${p.frames} · sent ${p.packetsSent} · recv ${p.packetsReceived}`;
         });
       } catch (err) {
