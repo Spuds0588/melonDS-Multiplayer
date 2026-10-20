@@ -40,7 +40,9 @@ running and each console drawing its own first-person view with its own HUD —
 so was the v0.1.9ad app dead end (the attract loop ignores touch until the title
 screen; `START` moves it at once). At three and four consoles the limit measured
 so far is the app's own screen path (26.6 fps at four, 44% of DS speed), not the
-link — the "second join into an already-linked group" reading (history.md
+link — *a pre-rebuild reading taken with the machine throttled; on the current
+build MKDS runs 46.9-50.8 fps at four consoles (history.md v0.1.9dr, the
+hardware-rule item below)* — the "second join into an already-linked group" reading (history.md
 v0.1.4) was retracted in v0.1.9al as a route-ordering defect and the four-console
 couple is in v0.1.9am. **For MPH at 3-4 the limit is now measured and it is the
 guests' own games**: a joining guest aborts its own handshake (`deauth sent …
@@ -1914,14 +1916,17 @@ Concrete departures this unlocks, in rough order of value:
 - **Per-instance link state** (below) — correctness rather than accuracy, but it
   is the same rule: link bookkeeping with one owner per console.
 - **Cheap rendering when 3-4 consoles run — partly spent 2026-10-20 (history.md
-  v0.1.9do).** The screen path now costs what is on screen: `get_frames` carries
-  only the seats and screens the layout shows, each pixel as RGB555, the focused
-  console pulls every refresh and the rest at 30 Hz, and a hidden window pulls
-  nothing. Four consoles went from 16 fps painted / 3.57 cores to **29-31 fps /
-  3.21 cores** with every console still at ~59 fps. Still unspent: side mode at
-  four consoles (28 fps, 3.81 cores - eight canvas uploads a frame), and there is
-  no upscaling/AA/threaded-rendering switch to turn off because the bridge uses
-  the software renderer only.
+  v0.1.9do/v0.1.9dr).** The screen path now costs what is on screen: `get_frames`
+  carries only the seats and screens the layout shows, each pixel as RGB555, the
+  focused console pulls every refresh and the rest at 30 Hz, and a hidden window
+  pulls nothing. Four consoles went from 16 fps painted / 3.57 cores to **29-31
+  fps / 3.21 cores** with every console still at ~59 fps *(the machine was in its
+  power-saving profile for that reading; on the performance profile the same
+  build paints **45-48 fps at 3.24-3.45 cores**)*. Still unspent: side mode at
+  four consoles (**28 fps, 3.81 cores - eight canvas uploads a frame** on the
+  throttled profile; **41.5 fps emulated / 40 painted at 3.60 cores** on the
+  performance one), and there is no upscaling/AA/threaded-rendering switch to turn
+  off because the bridge uses the software renderer only.
 - **Per-title tolerances.** A wider budget, "tolerate N unanswered rounds before
   retrying", or "do not let a peer's game kick us" are legitimate knobs once a
   title's own flow is understood.
@@ -1933,9 +1938,11 @@ Concrete departures this unlocks, in rough order of value:
 **Product decision (2026-09-29):** the target configuration is four players on
 one machine, running on **the least powerful hardware that can be made to
 work** — not on the dev laptop, which has headroom (4 linked 3D consoles at
-~2.2× realtime). This is a requirement, not an optimisation pass, so it outranks
-convenience and accuracy whenever the two conflict, and it is the tiebreak when a
-design choice is otherwise even:
+~2.2× realtime in the headless harness, a figure whose power profile was never
+recorded; the app on this box, performance profile, runs four MKDS consoles at
+0.78-0.85× realtime, history.md v0.1.9dr). This is a requirement, not an
+optimisation pass, so it outranks convenience and accuracy whenever the two
+conflict, and it is the tiebreak when a design choice is otherwise even:
 
 - **Frames are the budget.** Work whose cost scales with the *number of consoles*
   has to justify itself: rendering, texture uploads, audio mixing, screen
@@ -2387,24 +2394,38 @@ NSMB is the working half. These close the other two and the drop:
       dropped players — the arm with half the failures lost two clients at CUT
       OFF against one, so the departures are the game's own transition
 - [~] **The least-hardware budget, measured — the screen path's half is done,
-      and a real 3D title confirms it (2026-10-20, history.md v0.1.9do/v0.1.9dp).**
-      MKDS on the new path (title/attract, this box): **1 console 31.9 fps / 1.22
-      cores / page 31 · 2 consoles 28.6 / 2.20 / page 22 · 4 consoles 14.4 / 3.99
-      / page 15**, with 118 five-second windows per console over a ten-minute
-      four-console run reading **min 13.4 / median 19.9 / max 55.8** fps, equal on
-      all four. For a real 3D title the **emulator** is now the limit, not the
-      display path: the page paints at the emulated rate. `diag.nds` stays the
-      recorded fast check for the screen path itself.      Older numbers, before the rebuild, MKDS scene in the app:
-      **43.1 fps at two consoles, 33.2 at three, 26.6 at four**, against 112.5 /
-      76.7 emulated frames/s per console in the headless harness — the app's own
-      screen path cost about two thirds of a four-console frame. Measured on
-      `diag.nds` before and after the rebuild: a single frame pull fell from
-      **13.0/34.3/70.1 ms** (1/2/4 consoles) to **7.6/14.8/27.6 ms**, and the
-      painted rate at four consoles from **16 fps to 29-31** for **3.21 cores
-      instead of 3.57**, with every console still at 59. The MKDS scene itself has
-      not been re-measured on the new path: that is the number this item still
-      owes, together with side mode at four (28 fps, 3.81 cores) and the webview's
-      own ~31 Hz refresh cap on this machine.
+      and a real 3D title confirms it (2026-10-20, history.md
+      v0.1.9do/v0.1.9dp/v0.1.9dr).** MKDS on the new path (title/attract, this
+      box) **with the machine's performance profile on**, which is the state every
+      earlier figure here was *not* taken in: **1 console 59.9 fps / 0.70 cores /
+      page 59 · 2 consoles 59.3 / 1.54 / page 58 + 30 · 4 consoles 48.4, 50.8 and
+      46.9 in three separate samples / 3.45, 3.38 and 3.24 cores / page 45-48 +
+      31**, the 181-second sample reading **39 windows, min 39.8 / median 46.9 /
+      max 60**, equal on all four consoles window for window. Side mode at four:
+      **41.5 fps / 3.60 cores / page 40 + 30**. What is left at the top is the DS's
+      own 60 and the page's deliberate 30 Hz for consoles it is not focused on:
+      the emulator at four is at 78-85% of full speed, not the 24% the throttled
+      numbers suggested. **The figures these replace are kept beside them, because
+      they measure the same code on a slower clock:** 1 console 31.9 fps / 1.22
+      cores / page 31; 2 consoles 28.6 / 2.20 / 22; 4 consoles 14.4 / 3.99 / 15,
+      and 118 five-second windows over the ten-minute four-console run reading
+      **min 13.4 / median 19.9 / max 55.8**; side mode 28 fps / 3.81 cores. *Every
+      fps recorded in history.md before v0.1.9dr carries that caveat, and none of
+      those runs measured the clock.* `diag.nds` stays the recorded fast check for
+      the screen path itself: **2.0/3.0/6.0 ms** per all-seat pull at 1/2/4
+      consoles (196,628/393,252/786,500 bytes) on the performance profile, against
+      **7.6/14.8/27.6 ms** on the throttled one. Older numbers, before the
+      rebuild, MKDS scene in the app: **43.1 fps at two consoles, 33.2 at three,
+      26.6 at four** (power profile unrecorded), against 112.5 / 76.7 emulated
+      frames/s per console in the headless harness — the app's own screen path
+      cost about two thirds of a four-console frame. Measured on `diag.nds` before
+      and after the rebuild: a single frame pull fell from **13.0/34.3/70.1 ms**
+      (1/2/4 consoles) to **7.6/14.8/27.6 ms**, and the painted rate at four
+      consoles from **16 fps to 29-31** for **3.21 cores instead of 3.57**, with
+      every console still at 59. What this item still owes: the *joined*
+      four-console room's ten-minute distribution on the performance profile, and
+      a weakest-machine arm — this box is a 4-core/8-thread i5-8350U, not a low-end
+      target.
 - [ ] **Input at 4.** Four keyboard zones, four gamepads, each player's own flip
       key, and no way for one player's input to reach another console — which is
       the `appctl.py --player` item above
