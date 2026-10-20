@@ -1990,6 +1990,42 @@ from 2 to 8 cores) but cannot lift the consoles. **The lever the rule needs is
 per-console frame cost, not a bigger core budget** - the same box holds four
 `diag.nds` consoles on two cores and cannot hold four MKDS ones on eight.
 
+**Where a console's frame actually goes, measured 2026-10-20 (history.md
+v0.1.9dt)** - and the one change it justified, which is now the shipped default.
+Four MKDS consoles, race scene, per console thread per frame out of a 27.2 ms
+frame (section timers in the bridge and the core, `[prof]` every 100 frames,
+rented for the pass and removed; the Rust loop timed the barrier/pacing/copy
+around it):
+
+| Section | ms | share |
+| --- | --- | --- |
+| 3D rasteriser (`RenderFrame`) | **12.4** | 51% of the 24.4 ms the thread spends |
+| - of which the per-pixel fill | 10.7 | |
+| - per-polygon dispatch loop | 1.25 | |
+| - setup + final pass (fog, edge mask) | 0.32 | |
+| 2D scanline draw + sprites | 2.7 | 11% |
+| ARM9 + ARM7 JIT | 3.0 | 12% |
+| GPU3D display-list geometry | 2.3 | 9% |
+| SPU, scheduler, bridge misc | 3.2 | 13% |
+| lockstep barrier / pacing sleep / picture copy | 2.7-3.8 / 0 / 0.10 | outside the 24.4 |
+
+The fill is genuine work, so the reduction was not in the rasteriser: melonDS's
+own frontend runs the soft renderer threaded (`3D.Soft.Threaded` defaults to
+`true`) and this bridge never called `SetRenderSettings`, so each console painted
+its 3D frame inline with its own CPU. `Bridge.cpp` now applies the setting after
+`Reset()`, and the console thread gets its 12.4 ms back: **four MKDS consoles in
+the race phase go 33-35 -> 46-53 fps**, pictures identical frame for frame (CRC of
+both screens every 60 frames, serial twice vs threaded once: 14/14; four consoles
+threaded: p1-p4 identical), `.sav` sha256 unchanged, `md_smoke_test` 176/0,
+`md_capture` 12/0. Cost: one extra thread per console, 4.06 -> 5.02 cores of 8.
+
+**What is left on that thread**, in size order, for the next pass: the 10.7 ms
+fill itself (texturing/fog/edge marking - the change hides it, it does not shrink
+it), then the 2.3 ms geometry stage and the 2.7 ms 2D compositing, which are now
+the serial path. Four consoles in the worst scene are 46-53, not 60, and a
+*joined* four-player race has still not been profiled - MKDS's attract loop is not
+the same load.
+
 ### Instruments to build first (every milestone needs them)
 
 - [x] **IPC FIFO traffic counters, counted where a word moves.** **Built

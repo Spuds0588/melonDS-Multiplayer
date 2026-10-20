@@ -559,6 +559,26 @@ void md_destroy(MDInstance* inst)
     delete inst;
 }
 
+/* melonDS's other frontend runs the software 3D rasteriser on its own thread per
+   console - "3D.Soft.Threaded" defaults to true in its config - and our bridge
+   never told the renderer anything, so every console rasterised in sequence with
+   its CPU and JIT. Threaded, the 3D rasteriser produces the frame for line y
+   while the main thread emulates the lines before it, and the 2D compositor
+   waits on a per-line semaphore for exactly the line it needs, which is the same
+   picture rendered in the same order by the same code.
+
+   Measured, four MKDS consoles, race scene (2026-10-20): the rasteriser was 10.7
+   of the 24.4ms a console thread spent per frame. */
+static void apply_render_settings(MDInstance* inst)
+{
+    melonDS::RendererSettings settings {};
+    settings.ScaleFactor = 1;
+    settings.Threaded = true;
+    settings.HiresCoordinates = false;
+    settings.BetterPolygons = false;
+    inst->nds->GetRenderer().SetRenderSettings(settings);
+}
+
 int md_load_rom(MDInstance* inst, const char* rom_path)
 {
     if (!inst || !inst->nds) return set_error(inst, "no emulator instance");
@@ -617,6 +637,7 @@ int md_load_rom(MDInstance* inst, const char* rom_path)
     apply_console_mac(inst);
 
     inst->nds->Reset();
+    apply_render_settings(inst);
 
     if (inst->nds->NeedsDirectBoot())
         inst->nds->SetupDirectBoot(rom_path);
@@ -793,6 +814,7 @@ void md_reset(MDInstance* inst)
         inst->nds->EjectCart();
 
     inst->nds->Reset();
+    apply_render_settings(inst);
 
     if (!inst->rom_path.empty())
     {
