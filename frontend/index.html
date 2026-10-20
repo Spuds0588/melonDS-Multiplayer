@@ -1541,12 +1541,15 @@
       return url.href;
     }
 
+    function mintInvite(seat, expires = Date.now() + INVITE_TTL_MS) {
+      if (seat < 1 || seat >= canvases.length) return;
+      invites.set(seat, { token: randomToken(), expires, consumed: false });
+    }
+
     function newInvites() {
       invites.clear();
       const expires = Date.now() + INVITE_TTL_MS;
-      for (let seat = 1; seat < canvases.length; seat++) {
-        invites.set(seat, { token: randomToken(), expires, consumed: false });
-      }
+      for (let seat = 1; seat < canvases.length; seat++) mintInvite(seat, expires);
     }
 
     // Per-seat audio, drained from the core by a poller of its own: the SPU's
@@ -1619,7 +1622,12 @@
       remoteInput[seat] = null;
       audioQueue.delete(seat);
       if (c) { c.pen.down = false; sendButtons(seat); }
+      // The seat is free again, so it needs a fresh capability: the old link
+      // belonged to the player who just left and a used invite must never be
+      // handed to somebody else. Without this, a host could invite exactly one
+      // player per console per session - the seat came back, the link did not.
       invites.delete(seat);
+      if (window.mdOnline.isHost()) mintInvite(seat);
     }
 
     function renderOnline(state) {
@@ -1637,11 +1645,21 @@
         return;
       }
       onlineBaseBox.hidden = false;
+      // Most renders come from a host event; the rest are the page repainting
+      // itself, and a repaint must show the same seat count as the event did
+      // (it used to fall back to zero, so the header said "0 of 1 seats taken"
+      // next to a live "P2 online" chip).
+      if (!state && window.mdOnline.isHost()) state = window.mdOnline.hostState();
+      const signalling = window.mdOnline.stats().signalling;
+      // A code or invite minted while the signalling socket is down points at
+      // nothing: the host is not registered, so no guest can reach it.
+      const reachable = signalling === "open";
       const role = state ? state.role : window.mdOnline.stats().role;
       onlineState.textContent = role === "host"
-        ? `hosting · ${state ? state.seats.length : 0} of ${canvases.length - 1} seats taken`
+          ? `hosting${reachable ? "" : " (signalling down)"} · ${state ? state.seats.length : 0} of ${canvases.length - 1} seats taken`
         : role === "guest" ? "guest" : "offline";
-      onlineCodeBox.hidden = role !== "host";
+      // Show the code only while it can actually be used.
+      onlineCodeBox.hidden = role !== "host" || !reachable;
       if (state && state.code) hostCode = state.code;
       if (hostCode) onlineCodeEl.textContent = hostCode;
       onlineSeats.innerHTML = "";
@@ -1655,7 +1673,11 @@
       }
       onlineLinks.hidden = role !== "host";
       onlineLinks.innerHTML = "";
-      if (role === "host") {
+      if (role === "host" && !reachable) {
+        onlineLinks.textContent = signalling === "down"
+          ? "the host lost the signalling server - reconnecting, new guests cannot join until it is back"
+          : "connecting to the signalling server…";
+      } else if (role === "host") {
         if (!guestPageBase()) {
           onlineLinks.textContent = "set the guest page URL once and every invite becomes a clickable link";
         } else {

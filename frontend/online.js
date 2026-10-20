@@ -38,6 +38,19 @@
   const CODE_PREFIX = 'mds-';
   const JOIN_REQUEST_TTL_MS = 30000;
   const INVITE_TTL_MS = 10 * 60 * 1000;
+  // How long a guest waits for the datachannel to open before it says so. A
+  // join that cannot complete has to end in a reason, not in a spinner.
+  const GUEST_CONNECT_TIMEOUT_MS = 20000;
+  // A guest that vanishes without closing its datachannel - a closed tab, a
+  // laptop lid, a dead wifi link - otherwise keeps its seat forever: the host
+  // goes on encoding and sending into a channel nobody is draining. Measured
+  // 2026-10-20: 30+ seconds after the guest's tab closed the host still
+  // reported `guests: 1` and its send counter kept climbing. The host pings and
+  // drops a connection it has not heard from; a guest only counts as silent
+  // once it has answered a ping, so a guest page older than the ping protocol
+  // is never dropped by it.
+  const HOST_PING_MS = 2500;
+  const HOST_PEER_TIMEOUT_MS = 8000;
 
   const state = {
     role: 'idle',              // idle | host | guest
@@ -60,6 +73,7 @@
     guestBytes: 0,
     guestFps: 0,
     guestWindow: 0,
+    guestTimer: null,
     timer: null,
   };
 
@@ -99,6 +113,45 @@
   function peerConstructor() {
     if (typeof window.Peer === 'function') return window.Peer;
     throw new Error('PeerJS did not load (vendor/peerjs.min.js)');
+  }
+
+  // PeerJS drops its own broker socket on its own - a host left idle for hours,
+  // a laptop that slept, a network change - and when it does it sets `peer.id`
+  // to null and marks itself disconnected. Existing guests keep streaming (a
+  // datachannel is peer to peer) but the host is no longer registered, so the
+  // next guest's connection attempt goes nowhere while the panel still shows a
+  // join code and an invite link. Observed on the browser host 2026-10-20:
+  // `stats().peerId` read null while a seat was mid-stream. `reconnect()`
+  // restores the same id, so recovery costs the host nothing but a retry.
+  function watchSignalling(peer, role) {
+    let attempt = 0;
+    let timer = null;
+    const retry = () => {
+      timer = null;
+      if (state.peer !== peer || peer.destroyed) return;
+      attempt += 1;
+      if (attempt > 6) {
+        report(`Online ${role}: the signalling server is unreachable - ${role === 'host' ? 'new guests cannot join until it is back' : 'the host cannot be reached'}`);
+        return;
+      }
+      try { peer.reconnect(); } catch (err) { log('reconnect threw', err); }
+      timer = setTimeout(retry, Math.min(15000, 1000 * 2 ** (attempt - 1)));
+    };
+    peer.on('disconnected', () => {
+      log('signalling down, reconnecting');
+      report(`Online ${role}: lost the signalling server - reconnecting`);
+      // The panel is repainted by host events, and this is one: the code and
+      // the invites on screen are not usable until the socket is back.
+      if (role === 'host') publishHostState();
+      if (timer) clearTimeout(timer);
+      attempt = 0;
+      timer = setTimeout(retry, 1000);
+    });
+    peer.on('open', () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      attempt = 0;
+      if (role === 'host') publishHostState();
+    });
   }
 
   function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -245,9 +298,15 @@
   }
 
   function setupHostConnection(conn) {
-    const entry = { conn, player: null, name: '' };
+    const entry = { conn, player: null, name: '', lastSeen: performance.now(), answersPings: false };
     conn.on('open', () => log('guest connection open'));
-    conn.on('data', (message) => hostMessage(entry, message));
+    conn.on('data', (message) => {
+      if (message && typeof message === 'object') {
+        entry.lastSeen = performance.now();
+        if (message.type === 'pong') { entry.answersPings = true; return; }
+      }
+      hostMessage(entry, message);
+    });
     conn.on('close', () => dropConnection(entry));
     conn.on('error', (err) => { console.warn('[online] guest connection error', err); dropConnection(entry); });
   }
@@ -259,6 +318,10 @@
     if (entry.player != null) {
       state.encoders.delete(entry.player);
       state.audioPending.delete(entry.player);
+      // The counters go with the seat: `stats().seats` is what a driver and the
+      // panel read to say who is connected, so a departed seat must not linger
+      // there as a stream that stopped moving.
+      state.videoStats.delete(entry.player);
       state.callbacks.seatLeft?.(entry.player, was);
     }
     publishHostState();
@@ -270,6 +333,24 @@
   function tick() {
     if (state.role !== 'host' || !state.connections.length) return;
     const now = performance.now();
+    // Liveness first: a seat whose guest has gone silent is dropped, so the
+    // console becomes local again instead of streaming into nothing.
+    for (const entry of [...state.connections]) {
+      if (entry.answersPings && now - entry.lastSeen > HOST_PEER_TIMEOUT_MS) {
+        log('guest went silent - dropping its seat', entry.player);
+        const seat = entry.player;
+        try { entry.conn.close(); } catch (_) {}
+        dropConnection(entry);
+        // Reported after the drop, because the page's own seatLeft handler
+        // repaints the status line and would otherwise erase the reason.
+        report(`Online host: Player ${seat == null ? '?' : seat + 1} went silent - their console is local again`);
+        continue;
+      }
+      if (now - (entry.lastPing || 0) >= HOST_PING_MS) {
+        entry.lastPing = now;
+        send(entry.conn, { type: 'ping', at: Math.round(now) });
+      }
+    }
     // Adaptive cap: the encode share has to stay bounded as seats are added.
     const interval = Math.max(VIDEO_MIN_INTERVAL, (1000 / 30) * Math.ceil(state.connections.length / 2));
     for (const entry of state.connections) {
@@ -383,6 +464,7 @@
       }
       if (!peer) throw new Error('no free join code from the broker');
       state.peer = peer;
+      watchSignalling(peer, 'host');
       peer.on('connection', setupHostConnection);
       peer.on('error', (err) => report(`Online host: ${err.message || err}`));
       state.timer = setInterval(tick, 1000 / 30);
@@ -402,6 +484,13 @@
 
   function guestMessage(message) {
     if (!message || typeof message !== 'object') return;
+    // The host's liveness question. Answering it is what lets the host notice a
+    // guest that vanished (see HOST_PING_MS) instead of streaming into a dead
+    // channel for the rest of the session.
+    if (message.type === 'ping') {
+      send(state.hostConn, { type: 'pong', at: message.at });
+      return;
+    }
     if (message.type === 'welcome') {
       state.seat = message.player;
       state.players = message.players || 2;
@@ -419,9 +508,42 @@
       return;
     }
     if (message.type === 'error') {
-      report(`Online guest: ${message.message || 'the host refused the connection'}`);
-      state.callbacks.error?.(message.message || 'refused');
+      const reason = message.message || 'the host refused the connection';
+      // Before a seat is handed out there is nothing to keep: reset so the
+      // player can try another code instead of reloading the page.
+      if (state.seat == null) { guestAbort(`${reason} (refused)`); return; }
+      report(`Online guest: ${reason}`);
+      state.callbacks.error?.(reason);
     }
+  }
+
+  // One phrasing per failure the guest can actually hit, so the page can show a
+  // reason the player can act on instead of "connecting…" forever.
+  function joinFailureReason(err) {
+    const text = String((err && (err.type || err.message)) || err || '');
+    if (/peer-unavailable/i.test(text)) return 'no host is answering that code (unavailable) - check the code and that the host is still hosting';
+    if (/network|server-error|socket-error|socket-closed|ssl/i.test(text)) return 'cannot reach the signalling server (unavailable) - a proxy or firewall may be blocking it';
+    if (/browser-incompatible/i.test(text)) return 'this browser has no WebRTC (unavailable)';
+    if (/unavailable-id/i.test(text)) return 'that join code is unavailable - the host may have just restarted';
+    return `the connection failed (unavailable): ${text || 'no reason given'}`;
+  }
+
+  // Abandon a guest join: stop the peer, drop the connection, go back to idle so
+  // the page can retry, and report once. Duplicate errors from the peer and the
+  // connection therefore cost one message, not two.
+  function guestAbort(reason) {
+    if (state.role !== 'guest') return;
+    if (state.guestTimer) { clearTimeout(state.guestTimer); state.guestTimer = null; }
+    const conn = state.hostConn;
+    state.hostConn = null;
+    state.role = 'idle';
+    state.seat = null;
+    try { conn?.close(); } catch (_) {}
+    try { state.peer?.destroy(); } catch (_) {}
+    state.peer = null;
+    log('guest join aborted:', reason);
+    report(`Online guest: ${reason}`);
+    state.callbacks.error?.(reason);
   }
 
   async function startGuest() {
@@ -441,9 +563,22 @@
     state.role = 'guest';
     try {
       state.peer = await openPeer();
+      // The peer answers questions the datachannel never will: a code nobody
+      // holds comes back here as `peer-unavailable`, while the connection just
+      // stays closed.
+      state.peer.on('error', (err) => guestAbort(joinFailureReason(err)));
       const conn = state.peer.connect(target, { reliable: true });
       state.hostConn = conn;
+      let opened = false;
+      state.guestTimer = setTimeout(() => {
+        if (!opened) guestAbort(`the host did not answer within ${Math.round(GUEST_CONNECT_TIMEOUT_MS / 1000)} s (unavailable)`);
+      }, GUEST_CONNECT_TIMEOUT_MS);
+      const stopWaiting = () => {
+        opened = true;
+        if (state.guestTimer) { clearTimeout(state.guestTimer); state.guestTimer = null; }
+      };
       conn.on('open', () => {
+        stopWaiting();
         if (token) {
           send(conn, { type: 'hello', token, player, session, protocol: PROTOCOL });
           report('Online guest: connecting to host…');
@@ -453,12 +588,17 @@
         }
       });
       conn.on('data', guestMessage);
-      conn.on('close', () => report('Online guest: host disconnected'));
-      conn.on('error', (err) => report(`Online guest: ${err.message || 'connection failed'}`));
+      conn.on('close', () => {
+        if (!opened) { guestAbort('the host closed the connection before the stream started (refused)'); return; }
+        report('Online guest: host disconnected');
+      });
+      conn.on('error', (err) => {
+        if (!opened) { guestAbort(joinFailureReason(err)); return; }
+        report(`Online guest: ${err.message || 'connection failed'}`);
+      });
       return true;
     } catch (err) {
-      state.role = 'idle';
-      report(`Online unavailable: ${err.message || err}`);
+      guestAbort(joinFailureReason(err));
       return false;
     }
   }
@@ -494,6 +634,7 @@
     state.hostConn = null;
     try { state.peer?.destroy(); } catch (_) {}
     state.peer = null;
+    if (state.guestTimer) { clearTimeout(state.guestTimer); state.guestTimer = null; }
     state.encoders.clear();
     state.audioPending.clear();
     state.videoStats.clear();
@@ -531,6 +672,10 @@
       guests: state.connections.length,
       pending: state.pending.length,
       guest: { frames: state.guestFrames, bytes: state.guestBytes, fps: state.guestFps, seat: state.seat },
+      // Whether the broker still knows this peer. A host whose signalling socket
+      // has dropped keeps streaming to its existing guests but cannot be found
+      // by a new one, so the panel has to be able to say so.
+      signalling: !state.peer ? 'none' : state.peer.disconnected ? 'down' : state.peer.open ? 'open' : 'connecting',
     }),
     isHost: () => state.role === 'host',
     isGuest: () => state.role === 'guest',

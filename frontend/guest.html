@@ -318,8 +318,25 @@
       report("enter the host's join code");
     }
 
+    const BAD_STATUS = /unavailable|declined|invalid|expired|refused|disconnected|failed|full|busy/i;
+    const badStatus = (text) => BAD_STATUS.test(text);
+    // A join that cannot complete must land somewhere readable: the reason goes
+    // on the overlay itself (not only the status line under it) and the code box
+    // comes back so the player can retry. Before this the overlay kept saying
+    // "Connecting to the host…" while the join was already dead.
+    function showJoinFailure(text) {
+      overlay.hidden = false;
+      codeEntry.hidden = false;
+      overlayText.innerHTML = "<b>Not connected</b>";
+      overlayText.append(document.createElement("br"), document.createTextNode(text.replace(/^Online guest:\s*/i, "")));
+    }
+
     window.mdOnline.init({
-      status: (text) => report(text, /unavailable|declined|invalid|expired|refused|disconnected|failed|full|busy/i.test(text)),
+      status: (text) => {
+        const bad = badStatus(text);
+        report(text, bad);
+        if (bad) showJoinFailure(text);
+      },
       welcome: (msg) => {
         seatEl.textContent = `Player ${msg.player + 1}`;
         document.title = `melonDS Multiplayer — Player ${msg.player + 1}`;
@@ -332,7 +349,7 @@
         drawFrame(jpeg);
       },
       audio: (bytes) => playAudio(bytes),
-      error: () => { overlay.hidden = false; },
+      error: () => { codeEntry.hidden = false; },
     });
 
     // Guest-side health, readable from a test driver: fps, seat and whether a

@@ -4735,6 +4735,12 @@ fn ctrl_probe(app: &tauri::AppHandle, player: usize) -> Result<serde_json::Value
         "arm9_ie": format!("{ie9:04X}"),
         "arm9_if": format!("{if9:04X}"),
         "arm9_vblank_pending": (if9 & ie9 & 1) != 0,
+        // The keypad register itself: what a game polls at 0x04000130, active
+        // low (a cleared bit is a held button: 0x03FF is nothing pressed). Read
+        // over I/O rather than taken from the frontend's own idea of the mask,
+        // because the question an online guest raises - "did my press reach the
+        // console's game?" - is only answered by the machine's own register.
+        "keyinput": format!("{:04X}", unsafe { md_read_io16(inst.ptr, 9, 0x0400_0130) }),
         "powcnt1": format!("{powcnt1:04X}"),
         "screens_enabled": powcnt1 & 1 != 0,
         "engine_a": powcnt1 & (1 << 1) != 0,

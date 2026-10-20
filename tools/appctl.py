@@ -344,6 +344,10 @@ def cmd_probe(ch, args):
         f"IE={out['arm9_ie']} IF={out['arm9_if']} vblank_pending={out['arm9_vblank_pending']}",
         f"  lcd: powcnt1={out['powcnt1']} dispcntA={out['dispcnt_a']} "
         f"dispcntB={out['dispcnt_b']} vcount={out['vcount']}",
+        # The console's own keypad register (active low: 03FF = nothing held).
+        # This is what a game polls, so it is the read that settles whether a
+        # remote player's press actually reached the emulated console.
+        f"  keyinput {out.get('keyinput', '-')}",
     ]
     mp = out.get("mp", {})
     if mp:
