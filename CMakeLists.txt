@@ -22,6 +22,14 @@ project(melonDS-Multiplayer
     HOMEPAGE_URL "https://github.com/Spuds0588/melonDS-Multiplayer"
     LANGUAGES C CXX)
 
+# Upstream's Qt frontend stamps this into the Windows resource file
+# (src/frontend/qt_sdl/CMakeLists.txt, `string(REPLACE ... MELON_RC_VERSION)`)
+# and the .rc template's FileVersion. Upstream defines it beside its own
+# project() call; renaming the project here dropped it, and a Windows configure
+# then failed with "string sub-command REPLACE requires at least four arguments"
+# because the argument was empty. Keep it defined for every platform.
+set(melonDS_VERSION "${PROJECT_VERSION}")
+
 include(CheckSymbolExists)
 include(CheckLibraryExists)
 include(CMakeDependentOption)

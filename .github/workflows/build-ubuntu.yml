@@ -15,6 +15,14 @@ env:
   MELONDS_BUILD_PROVIDER: GitHub Actions
 #  MELONDS_VERSION_SUFFIX: " RC"
 
+concurrency:
+  # A push supersedes the run it replaced: without this, a burst of commits queues
+  # one full cross-platform build per commit, and the macOS pool answers the
+  # surplus with "job was not acquired by Runner of type hosted" - a cancelled
+  # run that mails a failure nobody can act on.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   build:
     continue-on-error: true
