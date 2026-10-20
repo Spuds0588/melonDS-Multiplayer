@@ -1233,6 +1233,39 @@ fn kick_after_windows() -> u32 {
     })
 }
 
+/// Should the watchdog resync this console's bus state in this window?
+///
+/// The kick exists for one failure: a console polling hard while accepting
+/// nothing, with its peers sitting on the bus, which a resync cures. Two ways
+/// of mistaking something else for that were measured, and both are excluded
+/// here rather than left to a route's environment variable:
+///
+/// * **A join in progress looks identical, window for window.** A console
+///   waiting for a peer to associate polls hard and accepts nothing, and the
+///   kick then discards the very replies it was about to deliver: the MPH
+///   four-console record has kick #1 firing 265 ms after the host's radio came
+///   on, both mid-join guests deauthenticating 7.8 s later. A window in which
+///   the group's shape changed - a radio began or ended, the connected mask
+///   moved - is therefore not evidence of a wedge, and does not count.
+/// * **One kick, not three.** The old range test fired the same kick on three
+///   consecutive windows; a four-console MKDS room (2026-10-20) took three
+///   kicks per console five seconds apart and none of them cured it.
+///
+/// `after == 0` still disables the kick entirely (`MD_KICK_AFTER_WINDOWS=0`).
+fn kick_allowed(
+    after: u32,
+    stalled_windows: u32,
+    connected: u32,
+    shape_changed: bool,
+    already_kicked: bool,
+) -> bool {
+    after > 0
+        && connected.count_ones() > 1
+        && !shape_changed
+        && !already_kicked
+        && stalled_windows >= after
+}
+
 
 fn default_flip_key(player: usize) -> &'static str {
     // Peek applies to whichever session the keyboard currently controls
@@ -1797,6 +1830,14 @@ fn start_session_inner(
                 }
                 let mut prev: Vec<Snapshot> = vec![Snapshot::default(); insts.len()];
                 let mut stall_windows: Vec<u32> = vec![0; insts.len()];
+                // The bus's own shape, carried window to window: each console's
+                // radio begin/end counts and the mask of who is connected. A
+                // window in which any of it moved is a join or a departure in
+                // progress, not a wedge - see `kick_allowed`.
+                let mut shape_prev: Vec<(u32, u32, u32)> = vec![(0, 0, 0); insts.len()];
+                // One kick per continuous stall. The old range test fired the
+                // same kick on three consecutive windows.
+                let mut kicked: Vec<bool> = vec![false; insts.len()];
                 // PC churn: a game that has wedged keeps producing frames while
                 // executing the same handful of instructions forever, waiting on
                 // a hardware interrupt that never arrives. Frame counters cannot
@@ -1887,6 +1928,25 @@ fn start_session_inner(
                     if health_stop.load(Ordering::SeqCst) {
                         break;
                     }
+                    // Did the group's shape move this window? A console
+                    // joining or leaving changes its own radio count and the
+                    // connected mask, and those are the bus's own words for
+                    // "something is in progress". Two measurements put this
+                    // here: the MPH four-console record has a kick fired 265 ms
+                    // after the host's radio came on, answered by both joiners'
+                    // deauth 7.8 s later, and a four-console MKDS room
+                    // (2026-10-20) took three kicks per console, five seconds
+                    // apart, in a park they never cured.
+                    let mut shape_changed = false;
+                    for (i, inst) in insts.iter().enumerate() {
+                        let mut stats = MDLinkStats::default();
+                        unsafe { md_link_stats(inst.ptr, &mut stats) };
+                        let shape = (stats.begin_count, stats.end_count, stats.connected);
+                        if shape != shape_prev[i] {
+                            shape_changed = true;
+                            shape_prev[i] = shape;
+                        }
+                    }
                     for (i, inst) in insts.iter().enumerate() {
                         let mut stats = MDLinkStats::default();
                         unsafe { md_link_stats(inst.ptr, &mut stats) };
@@ -1976,21 +2036,27 @@ fn start_session_inner(
                         // did not reply" - and the client deauthenticated 1.75s
                         // in. The kick discards the very replies it then misses.
                         // The historic cure it was built for came after ~10s of
-                        // continuous STALL, so two windows keeps that cure and
-                        // stops interrupting handshakes.
-                        // 0 = never kick (MD_KICK_AFTER_WINDOWS=0), which is the
-                        // arm a multi-guest join needs: see kick_after_windows.
+                        // continuous STALL, so two windows keeps that cure. What
+                        // a window has to be to count - and how many kicks one
+                        // stall gets - is `kick_allowed`'s business, because a
+                        // join in progress looks exactly like a stall and a kick
+                        // there is what lost the joining guests.
                         let kick_after_windows: u32 = kick_after_windows();
-                        if state == "LINK STALL" {
+                        if state == "LINK STALL" && !shape_changed {
                             stall_windows[i] = stall_windows[i].saturating_add(1);
                         } else {
                             stall_windows[i] = 0;
+                            kicked[i] = false;
                         }
 
-                        let kick_due = kick_after_windows > 0
-                            && stall_windows[i] >= kick_after_windows
-                            && stall_windows[i] <= kick_after_windows + 2;
-                        if kick_due && snap.connected.count_ones() > 1 {
+                        let kick_due = kick_allowed(
+                            kick_after_windows,
+                            stall_windows[i],
+                            snap.connected,
+                            shape_changed,
+                            kicked[i],
+                        );
+                        if kick_due {
                             // Kicked through the driver thread: this used to
                             // call straight into the bus, mutating the very
                             // FIFO read offset the console's own receive path
@@ -1998,11 +2064,11 @@ fn start_session_inner(
                             if inst.link_resync_now("health watchdog") {
                                 health_monitor.resyncs.fetch_add(1, Ordering::SeqCst);
                                 health_monitor.stalled.fetch_add(1, Ordering::SeqCst);
+                                kicked[i] = true;
                                 log::warn!(
-                                    "p{} stalled with peers on the bus for {} windows - resynced its bus state (kick #{})",
+                                    "p{} stalled with peers on the bus for {} windows - resynced its bus state (once per stall)",
                                     i + 1,
-                                    stall_windows[i],
-                                    stall_windows[i] - kick_after_windows + 1
+                                    stall_windows[i]
                                 );
                             }
                         } else if state == "LINK STALL" && verbose {
@@ -2017,9 +2083,14 @@ fn start_session_inner(
                                 stall_windows[i],
                                 if kick_after_windows == 0 {
                                     "stall kick disabled (MD_KICK_AFTER_WINDOWS=0)".to_string()
+                                } else if shape_changed {
+                                    "the group's shape changed this window: a join or a departure is in progress"
+                                        .to_string()
+                                } else if kicked[i] {
+                                    "this stall already had its one kick".to_string()
                                 } else {
                                     format!(
-                                        "at, or past, the {kick_after_windows}-window threshold, which fires only once"
+                                        "below the {kick_after_windows}-window threshold"
                                     )
                                 }
                             );
@@ -5701,5 +5772,28 @@ mod tests
                 );
             }
         }
+    }
+
+    /// The kick's policy, which is the part that cost joiners their session:
+    /// a window in which the group's shape moved is a join in progress, not a
+    /// wedge, and one stall gets one kick.
+    #[test]
+    fn a_join_in_progress_is_not_a_stall_to_kick()
+    {
+        // Two peers on the bus, stalled well past the threshold, never kicked -
+        // and a radio came on (or went off) this window. This is the MPH
+        // four-console window that lost both joining guests.
+        assert!(!kick_allowed(2, 9, 0b11, true, false));
+        // The same stall with a stable shape is the failure the kick is for.
+        assert!(kick_allowed(2, 2, 0b11, false, false));
+    }
+
+    #[test]
+    fn one_kick_per_stall_and_none_alone_or_disabled()
+    {
+        assert!(!kick_allowed(2, 5, 0b11, false, true), "a second kick in one stall");
+        assert!(!kick_allowed(2, 5, 0b01, false, false), "no peer to resync against");
+        assert!(!kick_allowed(0, 50, 0b11, false, false), "MD_KICK_AFTER_WINDOWS=0 means never");
+        assert!(!kick_allowed(2, 1, 0b11, false, false), "short of the threshold");
     }
 }
