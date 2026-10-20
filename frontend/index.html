@@ -298,6 +298,7 @@
   <!-- Vendored, not from a CDN: the app is offline-first and its CSP allows no
        third-party script origin (see the meta tag above). -->
   <script src="vendor/peerjs.min.js"></script>
+  <script src="frame-codec.js"></script>
   <script src="online.js"></script>
   <!-- No-op inside the desktop window (the Tauri API is already there); in a
        browser it defines the invoke() this page runs on. See browser-host.js. -->
@@ -538,78 +539,16 @@
     }
 
     // ------------------------------------------------------------------
-    // Frame pump: the seats and screens the page is about to paint
+    // Frame pump: how often each console is asked for, and what is painted
     //
-    // The wire format and the reason for its shape live in one place (the Rust
-    // side's `frames_payload`): a request names the consoles and screens the
-    // layout is actually showing, and each pixel arrives as RGB555. Measured
-    // 2026-10-20 before this: one pull carried every console's two screens as
-    // RGBA and took 70.1 ms at four consoles (~22 MB/s over IPC), so the page
-    // painted 16 fps while every console ran at 59.9. Flip mode - the default -
-    // now asks for one screen per console, the console the keyboard drives pulls
-    // every frame while the rest pull at FRAME_RATE_IDLE, and a hidden window
-    // pulls nothing at all.
+    // Encoding is the Rust side's `frames_payload`, decoding is
+    // `frame-codec.js`; what is left here is the cadence. The console the
+    // keyboard drives pulls every frame it can get, the rest pull at
+    // FRAME_RATE_IDLE, and a hidden window pulls nothing at all - which is what
+    // took a four-console pull from 70.1 ms of RGBA to what is on screen.
     // ------------------------------------------------------------------
 
     const FRAME_RATE_IDLE = 30;   // Hz for the consoles nobody is driving
-
-    // 15-bit RGB → canvas RGBA words, built once. The DS has five bits per
-    // channel, so this expansion is lossless: there is nothing to round away.
-    const RGB555 = (() => {
-      const t = new Uint32Array(32768);
-      for (let v = 0; v < 32768; v++) {
-        const r5 = v & 31, g5 = (v >> 5) & 31, b5 = (v >> 10) & 31;
-        const r8 = (r5 << 3) | (r5 >> 2);
-        const g8 = (g5 << 3) | (g5 >> 2);
-        const b8 = (b5 << 3) | (b5 >> 2);
-        // Canvas ImageData in memory is R,G,B,A - little-endian, so the word is
-        // 0xAABBGGRR.
-        t[v] = 0xFF000000 | (b8 << 16) | (g8 << 8) | r8;
-      }
-      return t;
-    })();
-
-    // One reusable RGBA buffer per seat: a 60 Hz pull that allocated 1.5 MB a
-    // frame at four consoles would spend more time in the collector than in the
-    // copy. Entries returned by `decodeFrames` alias these buffers and are valid
-    // only until the next decode - and only for the screens their entry lists.
-    const frameScratch = new Map();
-    function scratchFor(seat) {
-      let s = frameScratch.get(seat);
-      if (!s) {
-        s = { top: new Uint8ClampedArray(PX * 4), bottom: new Uint8ClampedArray(PX * 4) };
-        frameScratch.set(seat, s);
-      }
-      return s;
-    }
-
-    // Decode one payload (layout: see `frames_payload` in src-tauri/src/lib.rs).
-    // Exposed as `window.__mdframes` so the control channel's own screen readers
-    // (`see`, `bands`, `shot`, `digest`) decode the same bytes with the same
-    // code instead of keeping a second copy of the format.
-    function decodeFrames(buf) {
-      const dv = new DataView(buf);
-      const count = dv.getUint32(0, true);
-      const out = [];
-      let off = 4;
-      for (let i = 0; i < count; i++) {
-        const seat = dv.getUint32(off, true);
-        const screens = dv.getUint32(off + 4, true);
-        const seq = dv.getBigUint64(off + 8, true);
-        off += 16;
-        const s = scratchFor(seat);
-        for (const [bit, dst] of [[1, s.top], [2, s.bottom]]) {
-          if (!(screens & bit)) continue;
-          const words = new Uint16Array(buf, off, PX);
-          const view = new Uint32Array(dst.buffer);
-          for (let p = 0; p < PX; p++) view[p] = RGB555[words[p]];
-          off += PX * 2;
-        }
-        out.push({ seat, screens, seq, top: s.top, bottom: s.bottom });
-      }
-      return out;
-    }
-    window.__mdframes = { decode: decodeFrames };
 
     let pullNext = [];        // per console: earliest time its next pull is due
     let pullFailStreak = 0;   // consecutive rejected pulls, for the recovery line
@@ -671,7 +610,7 @@
     }
 
     function consumeFrames(buf) {
-      const frames = decodeFrames(buf);
+      const frames = window.__mdframes.decode(buf);
       if (pullFailStreak > 0 && frames.length) {
         setStatus(`frame pull recovered after ${pullFailStreak} failed pull(s)`, false, 4000);
         pullFailStreak = 0;

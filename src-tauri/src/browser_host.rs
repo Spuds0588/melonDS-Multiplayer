@@ -53,6 +53,7 @@ const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// that differs from the bundled one is a bug waiting to happen.
 const INDEX_HTML: &str = include_str!("../../frontend/index.html");
 const ONLINE_JS: &str = include_str!("../../frontend/online.js");
+const FRAME_CODEC_JS: &str = include_str!("../../frontend/frame-codec.js");
 const GUEST_HTML: &str = include_str!("../../frontend/guest.html");
 const BROWSER_HOST_JS: &str = include_str!("../../frontend/browser-host.js");
 const PEERJS_JS: &str = include_str!("../../frontend/vendor/peerjs.min.js");
@@ -208,7 +209,7 @@ fn dispatch(app: &tauri::AppHandle, cmd: &str, args: &Value) -> Result<Reply, St
                         .collect()
                 })
                 .unwrap_or_default();
-            Reply::Bytes(crate::frames_payload(state.inner(), &seats))
+            Reply::Bytes(crate::frames::frames_payload(state.inner(), &seats))
         }
         "get_audio" => {
             let seats: Vec<u32> = args
@@ -216,7 +217,7 @@ fn dispatch(app: &tauri::AppHandle, cmd: &str, args: &Value) -> Result<Reply, St
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect())
                 .unwrap_or_default();
-            Reply::Bytes(crate::audio_payload(state.inner(), &seats))
+            Reply::Bytes(crate::frames::audio_payload(state.inner(), &seats))
         }
         "set_input" => {
             let input: crate::PlayerInput = serde_json::from_value(
@@ -359,6 +360,7 @@ fn serve(app: tauri::AppHandle, mut stream: TcpStream, shared: Arc<Mutex<Browser
     let file = match path {
         "/" | "/index.html" => Some((INDEX_HTML, "text/html; charset=utf-8")),
         "/online.js" => Some((ONLINE_JS, "text/javascript; charset=utf-8")),
+        "/frame-codec.js" => Some((FRAME_CODEC_JS, "text/javascript; charset=utf-8")),
         "/guest.html" => Some((GUEST_HTML, "text/html; charset=utf-8")),
         "/browser-host.js" => Some((BROWSER_HOST_JS, "text/javascript; charset=utf-8")),
         "/vendor/peerjs.min.js" => Some((PEERJS_JS, "text/javascript; charset=utf-8")),
