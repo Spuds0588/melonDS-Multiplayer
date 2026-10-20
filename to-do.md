@@ -1913,10 +1913,15 @@ Concrete departures this unlocks, in rough order of value:
   tick, so no reply window can straddle two frames on a loaded machine.
 - **Per-instance link state** (below) — correctness rather than accuracy, but it
   is the same rule: link bookkeeping with one owner per console.
-- **Cheap rendering when 3-4 consoles run.** Skip drawing consoles that are not
-  focused, cap unfocused consoles at 30 fps while their input still runs at full
-  rate, turn off upscaling/AA/threaded rendering above 2 consoles. Accuracy
-  spent for frames is exactly the permission above.
+- **Cheap rendering when 3-4 consoles run — partly spent 2026-10-20 (history.md
+  v0.1.9do).** The screen path now costs what is on screen: `get_frames` carries
+  only the seats and screens the layout shows, each pixel as RGB555, the focused
+  console pulls every refresh and the rest at 30 Hz, and a hidden window pulls
+  nothing. Four consoles went from 16 fps painted / 3.57 cores to **29-31 fps /
+  3.21 cores** with every console still at ~59 fps. Still unspent: side mode at
+  four consoles (28 fps, 3.81 cores - eight canvas uploads a frame), and there is
+  no upscaling/AA/threaded-rendering switch to turn off because the bridge uses
+  the software renderer only.
 - **Per-title tolerances.** A wider budget, "tolerate N unanswered rounds before
   retrying", or "do not let a peer's game kick us" are legitimate knobs once a
   title's own flow is understood.
@@ -2306,6 +2311,23 @@ NSMB is the working half. These close the other two and the drop:
       the window is choosing to give up: start from whether it waits for a
       *second* client at all, and prove a fix by the clientfail rate collapsing
       on this route
+- [x] **The stall kick no longer fires into a join, and one stall gets one kick**
+      (2026-10-20, v0.1.9dp). Two measurements made the old policy untenable:
+      the MPH four-console record has kick #1 firing 265 ms after the host's
+      radio came on, with both mid-join guests deauthenticating 7.8 s later, and
+      a four-console MKDS run took **nine kicks — three per console, five
+      seconds apart — in a park none of them cured**
+      (`logs/real4_mkds_prefix_app.log.gz`). `kick_allowed` now owns the
+      decision: a window in which the group's shape moved (any console's radio
+      begin/end count, or the connected mask) is a join or a departure in
+      progress, so it neither counts toward the stall nor kicks; and one
+      continuous stall gets **one** kick, not the old `stalled <= after + 2`
+      range. Re-run with the same route and the **default** configuration
+      (`logs/real4b_mkds_app.log.gz`): six kicks, all on the host, each at
+      window 2 and separated by a recovered stretch, none on a joining guest,
+      and p2–p4 joined the existing room and stayed through CUT OFF and VS.
+      `MD_KICK_AFTER_WINDOWS=0` is no longer required for a multi-guest join;
+      it remains the off switch. Two unit tests pin the policy.
 - [x] **Per-instance routing in `LocalMP` — done in v0.1.9bh, and the shape to
       build with is written down in "The link's shape, as of v0.1.9bh" above.**
       The first attempt (v0.1.9al) was narrowed by measurement and reverted
@@ -2364,16 +2386,25 @@ NSMB is the working half. These close the other two and the drop:
       improvement, not yet a change to the default, and it is *not* a fix for
       dropped players — the arm with half the failures lost two clients at CUT
       OFF against one, so the departures are the game's own transition
-- [ ] **The least-hardware budget, measured.** In the app on the dev laptop, the
-      same MKDS scene at **43.1 fps with two consoles, 33.2 with three, 26.6 with
-      four** (72/55/44% of DS speed), while the same game in the headless harness
-      does **112.5 emulated frames/s per console at two and 76.7 at four** (1.28×
-      realtime across four). So the app's own per-frame screen path costs about
-      two thirds of a four-console frame, and the frames are there rather than in
-      the emulator or the link: the cheap wins are no rendering for a console
-      nobody is looking at, 30 fps off-focus with input still at full rate, and no
-      upscaling/AA above two consoles — the hardware rule above is the standing
-      version of this item
+- [~] **The least-hardware budget, measured — the screen path's half is done,
+      and a real 3D title confirms it (2026-10-20, history.md v0.1.9do/v0.1.9dp).**
+      MKDS on the new path (title/attract, this box): **1 console 31.9 fps / 1.22
+      cores / page 31 · 2 consoles 28.6 / 2.20 / page 22 · 4 consoles 14.4 / 3.99
+      / page 15**, with 118 five-second windows per console over a ten-minute
+      four-console run reading **min 13.4 / median 19.9 / max 55.8** fps, equal on
+      all four. For a real 3D title the **emulator** is now the limit, not the
+      display path: the page paints at the emulated rate. `diag.nds` stays the
+      recorded fast check for the screen path itself.      Older numbers, before the rebuild, MKDS scene in the app:
+      **43.1 fps at two consoles, 33.2 at three, 26.6 at four**, against 112.5 /
+      76.7 emulated frames/s per console in the headless harness — the app's own
+      screen path cost about two thirds of a four-console frame. Measured on
+      `diag.nds` before and after the rebuild: a single frame pull fell from
+      **13.0/34.3/70.1 ms** (1/2/4 consoles) to **7.6/14.8/27.6 ms**, and the
+      painted rate at four consoles from **16 fps to 29-31** for **3.21 cores
+      instead of 3.57**, with every console still at 59. The MKDS scene itself has
+      not been re-measured on the new path: that is the number this item still
+      owes, together with side mode at four (28 fps, 3.81 cores) and the webview's
+      own ~31 Hz refresh cap on this machine.
 - [ ] **Input at 4.** Four keyboard zones, four gamepads, each player's own flip
       key, and no way for one player's input to reach another console — which is
       the `appctl.py --player` item above
@@ -4958,18 +4989,20 @@ grid** four-player splitscreen games use. 2-screen view: **every player in a
 *This phase is optional and not the core focus. Only pursue if there's demand.*
 
 ### Todo
-- [ ] Research WebRTC implementation for remote players
-- [ ] Build simple web client for remote viewing
-- [ ] Implement frame streaming to remote clients
-- [ ] Input routing back from remote players
-- [ ] Connection management UI
-- [ ] Testing with remote players
+- [ ] Push the guest page, so the published `online.js` carries the join reasons and the ping/pong liveness (nothing else reaches a real guest)
+- [ ] Release a console's buttons when the *host page* disappears (reload, closed tab): the page owns the masks, and today the last remote press stays held
+- [ ] Testing with players on real networks (everything measured so far is two ends on one machine)
 
 ### In Progress
 - [ ] 
 
 ### Done
-- [ ] 
+- [x] Research WebRTC implementation for remote players (PeerJS data channels, host-authoritative)
+- [x] Build simple web client for remote viewing (`frontend/guest.html`, published to Pages)
+- [x] Implement frame streaming to remote clients (per-seat JPEG of both screens, 30 fps, latest frame wins)
+- [x] Input routing back from remote players (measured: a guest's A press moves that console's own keypad register `03FF` -> `03FE` -> `03FF`)
+- [x] Connection management UI (join code with host approval, per-seat invite links, seat chips, pending requests)
+- [x] A foreground guest joins the browser host by code and by invite link from the published page, decodes the stream and drives its console — v0.1.9dq, [history.md](./history.md#L3065)
 
 ---
 
