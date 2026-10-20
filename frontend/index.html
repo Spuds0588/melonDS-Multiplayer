@@ -317,7 +317,7 @@
     const hasDialog = !!(Tauri && Tauri.dialog && Tauri.dialog.open);
     const inBrowserHost = !!(Tauri && window.__mdBrowserHost);
 
-    const W = 256, H = 192, PX = W * H, BPS = PX * 4;
+    const W = 256, H = 192, PX = W * H;   // BPS is gone: pixels arrive as RGB555
 
     const el = (id) => document.getElementById(id);
     const statusEl = el("status");
@@ -538,53 +538,162 @@
     }
 
     // ------------------------------------------------------------------
-    // Frame pump: raw bytes from get_frames → putImageData
+    // Frame pump: the seats and screens the page is about to paint
+    //
+    // The wire format and the reason for its shape live in one place (the Rust
+    // side's `frames_payload`): a request names the consoles and screens the
+    // layout is actually showing, and each pixel arrives as RGB555. Measured
+    // 2026-10-20 before this: one pull carried every console's two screens as
+    // RGBA and took 70.1 ms at four consoles (~22 MB/s over IPC), so the page
+    // painted 16 fps while every console ran at 59.9. Flip mode - the default -
+    // now asks for one screen per console, the console the keyboard drives pulls
+    // every frame while the rest pull at FRAME_RATE_IDLE, and a hidden window
+    // pulls nothing at all.
     // ------------------------------------------------------------------
+
+    const FRAME_RATE_IDLE = 30;   // Hz for the consoles nobody is driving
+
+    // 15-bit RGB → canvas RGBA words, built once. The DS has five bits per
+    // channel, so this expansion is lossless: there is nothing to round away.
+    const RGB555 = (() => {
+      const t = new Uint32Array(32768);
+      for (let v = 0; v < 32768; v++) {
+        const r5 = v & 31, g5 = (v >> 5) & 31, b5 = (v >> 10) & 31;
+        const r8 = (r5 << 3) | (r5 >> 2);
+        const g8 = (g5 << 3) | (g5 >> 2);
+        const b8 = (b5 << 3) | (b5 >> 2);
+        // Canvas ImageData in memory is R,G,B,A - little-endian, so the word is
+        // 0xAABBGGRR.
+        t[v] = 0xFF000000 | (b8 << 16) | (g8 << 8) | r8;
+      }
+      return t;
+    })();
+
+    // One reusable RGBA buffer per seat: a 60 Hz pull that allocated 1.5 MB a
+    // frame at four consoles would spend more time in the collector than in the
+    // copy. Entries returned by `decodeFrames` alias these buffers and are valid
+    // only until the next decode - and only for the screens their entry lists.
+    const frameScratch = new Map();
+    function scratchFor(seat) {
+      let s = frameScratch.get(seat);
+      if (!s) {
+        s = { top: new Uint8ClampedArray(PX * 4), bottom: new Uint8ClampedArray(PX * 4) };
+        frameScratch.set(seat, s);
+      }
+      return s;
+    }
+
+    // Decode one payload (layout: see `frames_payload` in src-tauri/src/lib.rs).
+    // Exposed as `window.__mdframes` so the control channel's own screen readers
+    // (`see`, `bands`, `shot`, `digest`) decode the same bytes with the same
+    // code instead of keeping a second copy of the format.
+    function decodeFrames(buf) {
+      const dv = new DataView(buf);
+      const count = dv.getUint32(0, true);
+      const out = [];
+      let off = 4;
+      for (let i = 0; i < count; i++) {
+        const seat = dv.getUint32(off, true);
+        const screens = dv.getUint32(off + 4, true);
+        const seq = dv.getBigUint64(off + 8, true);
+        off += 16;
+        const s = scratchFor(seat);
+        for (const [bit, dst] of [[1, s.top], [2, s.bottom]]) {
+          if (!(screens & bit)) continue;
+          const words = new Uint16Array(buf, off, PX);
+          const view = new Uint32Array(dst.buffer);
+          for (let p = 0; p < PX; p++) view[p] = RGB555[words[p]];
+          off += PX * 2;
+        }
+        out.push({ seat, screens, seq, top: s.top, bottom: s.bottom });
+      }
+      return out;
+    }
+    window.__mdframes = { decode: decodeFrames };
+
+    let pullNext = [];        // per console: earliest time its next pull is due
+    let pullFailStreak = 0;   // consecutive rejected pulls, for the recovery line
+
+    // Which screens of this console are on screen right now: flip mode shows the
+    // top screen, or the touch screen while peeking; side mode shows both.
+    function screensOf(c) {
+      if (layoutMode === "side") return 3;
+      return c.peeking ? 2 : 1;
+    }
+
+    // What to ask for this tick. The console the keyboard drives is asked for
+    // every frame it can get; the others at FRAME_RATE_IDLE. Nothing is asked
+    // for while the window is hidden or occluded: nobody is looking.
+    // Slack on the idle deadline: a deadline of exactly one refresh interval
+    // lands on the frame after it, so a 33 ms slot on a 31 Hz display ran the
+    // unfocused consoles at 16 Hz instead of 30 (measured 2026-10-20). A few
+    // milliseconds of slack lets the frame that was meant to meet it do so.
+    const IDLE_SLACK_MS = 6;
+
+    function dueFrames(now) {
+      const due = [];
+      if (document.hidden) return due;
+      for (let p = 0; p < canvases.length; p++) {
+        if (now < (pullNext[p] || 0) - IDLE_SLACK_MS) continue;
+        pullNext[p] = now + (p === active ? 0 : 1000 / FRAME_RATE_IDLE);
+        due.push({ seat: p, screens: screensOf(canvases[p]) });
+      }
+      return due;
+    }
+
+    // Coming back from hidden: repaint at once rather than on the idle slot.
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) pullNext = [];
+    });
 
     async function pump() {
       if (running && session && invoke && !pumping) {
-        pumping = true;
-        try {
-          const buf = await invoke("get_frames");
-          if (buf instanceof ArrayBuffer) consumeFrames(buf);
-          else console.warn("unexpected get_frames payload", buf);
-        } catch (err) {
-          console.error("get_frames failed:", err);
-          setStatus(`frame pump error: ${err}`, true);
-          running = false;
-          syncButtons();
+        const seats = dueFrames(performance.now());
+        if (seats.length) {
+          pumping = true;
+          try {
+            const buf = await invoke("get_frames", { seats });
+            if (buf instanceof ArrayBuffer) consumeFrames(buf);
+            else console.warn("unexpected get_frames payload", buf);
+          } catch (err) {
+            // A rejected pull drops this frame and the next tick asks again.
+            // It used to set running = false, which stopped the pump for the
+            // rest of the session: every player's picture froze while the
+            // emulation kept running, with no way back (measured 2026-10-20).
+            pullFailStreak++;
+            console.error("get_frames failed:", err);
+            setStatus(`frame pull failed (${err}) - retrying`, true);
+          }
+          pumping = false;
         }
-        pumping = false;
       }
       requestAnimationFrame(pump);
     }
 
     function consumeFrames(buf) {
-      const dv = new DataView(buf);
-      const bytes = new Uint8Array(buf);
-      let off = 0;
-      for (let p = 0; p < canvases.length && off + 8 + BPS * 2 <= buf.byteLength; p++) {
-        const c = canvases[p];
-        const seq = dv.getBigUint64(off, true);
-        off += 8;
-        if (seq !== c.seq) {
-          c.seq = seq;
-          c.frames++;
-          c.imgTop.data.set(bytes.subarray(off, off + BPS));
-          off += BPS;
-          const bottomHidden = layoutMode === "flip" && !c.peeking;
-          if (!bottomHidden) {
-            c.imgBot.data.set(bytes.subarray(off, off + BPS));
-            c.ctxBottom.putImageData(c.imgBot, 0, 0);
-            // putImageData wipes the canvas: the pen dot rides on top of the
-            // fresh frame (only needed while the screen is hidden — shown
-            // screens have the real cursor).
-            if (c.pen.down) drawPenDot(c);
-          }
-          off += BPS; // hidden bottom screens skip the copy, not the offset
-          c.ctxTop.putImageData(c.imgTop, 0, 0);
-        } else {
-          off += BPS * 2;
+      const frames = decodeFrames(buf);
+      if (pullFailStreak > 0 && frames.length) {
+        setStatus(`frame pull recovered after ${pullFailStreak} failed pull(s)`, false, 4000);
+        pullFailStreak = 0;
+      }
+      for (const f of frames) {
+        const c = canvases[f.seat];
+        if (!c) continue;
+        // Same emulated frame and nothing newly visible: there is nothing to
+        // paint, so do not touch the canvases.
+        if (f.seq === c.seq && (f.screens & ~(c.paintedScreens || 0)) === 0) continue;
+        c.paintedScreens = f.seq === c.seq ? (c.paintedScreens | f.screens) : f.screens;
+        c.seq = f.seq;
+        c.frames++;
+        c.imgTop.data.set(f.top);
+        c.ctxTop.putImageData(c.imgTop, 0, 0);
+        if (f.screens & 2) {
+          c.imgBot.data.set(f.bottom);
+          c.ctxBottom.putImageData(c.imgBot, 0, 0);
+          // putImageData wipes the canvas: the pen dot rides on top of the
+          // fresh frame (only needed while the screen is hidden - shown
+          // screens have the real cursor).
+          if (c.pen.down) drawPenDot(c);
         }
       }
     }
@@ -1161,6 +1270,9 @@
     function applyLayout() {
       document.body.classList.toggle("mode-side", layoutMode === "side");
       el("view").value = layoutMode;
+      // What is on screen just changed, so every console is due at once: a
+      // screen that has just been revealed must not wait for its idle slot.
+      pullNext = [];
       // Column count, and the widest the row is allowed to get:
       //   1-screen view, 3-4 players -> 2 columns, the standard 2x2;
       //   1-screen view, 1-2 players -> one row of that many;

@@ -461,6 +461,12 @@ about to read and moves the read offset its receive path is tracking. If you add
 a feature that needs to send, receive or resync, **queue it** (`link_send_now`,
 `link_drain_now`, `link_resync_now`); do not call `md_link_*` from a new thread.
 
+`MD_FRAME_PULL_FAIL=N` rejects every Nth `get_frames` pull (off by default). It
+exists to exercise the frontend's recovery path, which is a frame dropped and
+retried rather than the pump stopping: with `=3` the status line alternates
+`frame pull failed (...) - retrying` and `frame pull recovered after N failed
+pull(s)` while the picture keeps advancing. Nothing else reads it.
+
 `MD_LINK_PROBE=1` enables the link monitor's packet-injecting probe (off by
 default: it puts a foreign frame into the game's receive stream). The always-on
 verification does not need it - real traffic crossing the bus is the proof, and

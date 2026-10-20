@@ -195,7 +195,21 @@ fn dispatch(app: &tauri::AppHandle, cmd: &str, args: &Value) -> Result<Reply, St
                 .ok_or_else(|| "missing boolean argument 'enabled'".to_string())?;
             Reply::Json(crate::set_per_game_fix(state, enabled)?)
         }
-        "get_frames" => Reply::Bytes(crate::frames_payload(state.inner())),
+        "get_frames" => {
+            // The page asks for the seats and screens it is about to paint; this
+            // transport forwards that request verbatim, so a browser-hosted
+            // session pays exactly what the desktop window pays.
+            let seats: Vec<crate::FrameSeat> = args
+                .get("seats")
+                .and_then(|v| v.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Reply::Bytes(crate::frames_payload(state.inner(), &seats))
+        }
         "get_audio" => {
             let seats: Vec<u32> = args
                 .get("seats")
