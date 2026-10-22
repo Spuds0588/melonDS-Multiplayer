@@ -2855,6 +2855,41 @@ attempted against the blind check and are not counted; no fifth ordering was run
 Three-player multi-card play needs a fix in the title's room state machine (the
 place the `01 8D` rule-set flag is written), not another press order.
 
+### 2026-10-22f — the `06 01` command is the room's normal close, and the 04/05 phase after it is the whole difference
+
+Takes 2026-10-22e's command apart against the last two-console match. The same
+body (`06 01 02 00 03 11 05 00 00 00 00 4E 02 00`) appears five times in the 14:03
+two-console log that started a match, the guest deauthenticates on it, and the
+host then runs `F6 00 02 00 04 9D 03 00 03 00 ...` for the rest of the session. At
+three consoles the same step happens with `06 01 06 00 ... 4E 06 00`, the three
+deauths are written, and the host goes to `F6 00 06 00 05 9D 07 00 07 00 <names>
+<counter>` and stays - 437 commands with the default reply window, 1,443 with the
+old 34 ms / two-frame window, and **no** match-family command in either arm
+(`accept-trace.txt` section 8, `ab3_default.log`, `ab3_old1.log`).
+
+Byte 2 is the client mask (02/06) repeated at 14-15, byte 4 is `9D` in both, byte
+3 is the phase (04 match, 05 roster/name exchange), and byte 5 is 03 at two
+consoles against 07 at three - the player count, not a fault.
+
+**The bookkeeping is clean:** every window with all three in reads
+`collected=0006 of mask 0006` (558), the host hands client 1 and client 2
+separately (648/563 handoffs), the guests answer with distinct ids (`01 0D 20 20
+21 00`, `... 23 00`), nothing is credited twice, `stale` is 0, and the 20-byte
+roster command is delivered to both guests, read by their own games and answered
+in the same round.
+
+**The A/B rules the reply window out:** four frames and the old two frames reach
+the same roster loop and the same room end. **And the two-console control is no
+longer reproducible:** both arms reached the match family at two consoles (2,710
+and 3,322 commands) but the guest's answers stay at `00 80 20 20`/`00 80 00 00`
+and both screens sit on the setup table after 30 s (`2p_default_end.png`,
+`2p_route_start_end.png`), where the 14:03 guest answered `00 80 0A 04` through
+the match. So 2026-10-22c's match stands as one run.
+
+**Three-player multi-card play needs** the title's own three-player roster
+exchange to complete inside its room state machine; no press order, reply window
+or transport change moves it, and nothing measured points into this tree.
+
 ### 2026-10-22e — the room ends itself on one host command, pressed or not: the confirm press was never the trigger
 
 Corrects 2026-10-22d. The four confirmation orders were all run at three
