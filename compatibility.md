@@ -2855,6 +2855,26 @@ attempted against the blind check and are not counted; no fifth ordering was run
 Three-player multi-card play needs a fix in the title's room state machine (the
 place the `01 8D` rule-set flag is written), not another press order.
 
+### 2026-10-22g — the two-console control is bisected: the code variables are cleared, the guest's own room state is the difference
+
+The 14:03 recipe was re-run with one variable changed at a time. Five arms, one
+result: head binary verbose on (host runs `F6 00 02 00 04 9D ...`, 2,710-3,322
+commands, both screens on the setup table), head verbose off, head with a fresh
+save, head pinned `taskset -c 0-3`, and a worktree built at `f7ce6897` - the parent
+of the reply-window commit - from its own tree. **The reply-window change is not
+the regression**, and neither the link logging, the save, nor the CPU affinity
+moves it. Frames are not lost: the guest reads every match command (six halfword
+reads each) and its answer is collected every round (`collected=0002 of mask
+0002`).
+
+**Where the runs part:** the 14:03 log's guest reached `30B 00 00 0B 04` then
+`30B 00 80 0A 04` for its table-poll answer *before* the host sent the match
+family; today's stays at `00 80 0A 03`, `00 80 0B 03`, later `00 80 20 20`. So the
+host starts and the guest's own game never joins the phase. No knob in this tree
+restores the match, and the next instrument is the guest's writes after it
+consumes the table poll (`accept-trace.txt` section 9, `b2_noverbose.log.gz`,
+`b2_freshsav.log.gz`, `pre2_prevcommit.log.gz`).
+
 ### 2026-10-22f — the `06 01` command is the room's normal close, and the 04/05 phase after it is the whole difference
 
 Takes 2026-10-22e's command apart against the last two-console match. The same
