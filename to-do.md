@@ -17,6 +17,34 @@ item. The bar is an **in-game match with the link healthy** — a live link that
 never reaches a match is not done, and neither is a game whose own screen ignores
 both consoles' input.*
 
+**2026-10-22, third pass: the press after the room was run as a differential, and
+it is a game-side start condition, not a dropped packet - no code was changed for
+it.** Two consoles and three consoles, the same table and the same presses, one
+at a time with a screenshot after each (`game-captures/tetris-accept-2026-10-22/
+accept-trace.txt`, section 4). **Two consoles:** the host's A leaves it on
+"Please wait until all of the players have set their rules", the guest's own A
+advances the room - the host's command body goes from `F6 00 02 00 00 80` to the
+18-byte `F6 00 02 00 04 9D ...` form in the very round it collects `01 8D 20 20
+11 00`, and the STANDARD match starts on both. **Three consoles:** the host's A
+does exactly the same thing on the table (p1 to "Please wait", p2 and p3 on their
+own editable panels, no error, link clean), and then the guest's A takes the room
+down - both guests write their own `reason 0003` within twenty lines of each
+other and land on the game's own communication error. **What differs is not the
+link:** the host's body never leaves the 6-byte form at three consoles (170
+commands logged, not one 18-byte body), the guests answer `01 0D 20 20 ...` in
+255 of the 283 windows where both are credited (`01 8D` only 14), where the
+two-console guest answers `01 8D` in 1,025 windows of 1,155; and the host's
+replies are all credited to the last frame (507 from p2, 511 from p3, `stale` 0,
+every window `collected=0006 of mask 0006` up to the guests' own deauths). That
+flag byte is read out of the **guest's own wireless slot body** by our trace, so
+it is the title's state, not something the transport supplies: at three consoles
+both guests' games answer without the bit the two-console handshake advances on.
+**The honest state: no match at three, and the next input is the guest's own
+state machine, not the reply path** - what makes a guest's room answer carry
+`80` at two consoles and not at three (its own rule-setting screen state, its
+player-list read, or a per-room flag the host has yet to send). Do not spend
+another pass on the transport for this: it was measured clean.
+
 **2026-10-22, second pass: the three-console acceptance was the host's reply
 window giving up one round early, and the party now reaches the game's own mode
 select.** The two-console accept and the three-console accept were traced side by
