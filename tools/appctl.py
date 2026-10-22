@@ -22,6 +22,14 @@ console, click UI, read the emulated screens as text, and save screenshots.
     tools/appctl.py index 2 && tools/appctl.py tap KeyA
     tools/appctl.py script tools/scripts/example.txt
 
+A menu sweep needs to come back to the same screen after each trial, and a
+boot is too expensive to pay per branch:
+
+    tools/appctl.py snapshot menu           # hung on the current picture
+    tools/appctl.py press down --player 1
+    tools/appctl.py restore menu            # back exactly where it was
+    tools/scripts/menu-map.py --name meteor # the whole sweep, built on this
+
 A route that has to wait for the *game* can wait on the picture instead of on a
 frame count, which is what every earlier route in this project guessed at:
 
@@ -530,6 +538,23 @@ def cmd_digest(ch, args):
     return screen_digest(ch, args.player)
 
 
+def cmd_snapshot(ch, args):
+    """Save this console's whole state under a name, so a menu sweep can come back.
+
+    A menu is a tree, so mapping one means trying each input from the same
+    screen. Without this, each trial costs a boot plus the route to that screen,
+    and every route in this project before today was replayed by hand.
+    """
+    out = ch.call(cmd="snapshot", player=args.player, name=args.name)
+    return f"snapshot '{out['name']}' of player {out['player']}: {out['bytes']} bytes"
+
+
+def cmd_restore(ch, args):
+    """Put a snapshot back into this console - the other half of `snapshot`."""
+    out = ch.call(cmd="restore", player=args.player, name=args.name)
+    return f"restored '{out['name']}' on player {out['player']} ({out['bytes']} bytes)"
+
+
 def cmd_quit(ch, args):
     """Ask the app to exit, the way the window's close button does.
 
@@ -1018,6 +1043,16 @@ def build_parser():
     p = sub.add_parser("digest", help="hash a console's screens now (for `waitfor --change`)")
     p.add_argument("--player", type=int, default=1, help="1-based")
     p.set_defaults(func=cmd_digest)
+
+    p = sub.add_parser("snapshot", help="save a console's state under a name (a menu sweep's backtrack)")
+    p.add_argument("name")
+    p.add_argument("--player", type=int, default=1)
+    p.set_defaults(func=cmd_snapshot)
+
+    p = sub.add_parser("restore", help="put a snapshot back into a console")
+    p.add_argument("name")
+    p.add_argument("--player", type=int, default=1)
+    p.set_defaults(func=cmd_restore)
 
     p = sub.add_parser("script", help="run a file of these commands, one per line")
     p.add_argument("file")

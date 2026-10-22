@@ -17,6 +17,28 @@ item. The bar is an **in-game match with the link healthy** — a live link that
 never reaches a match is not done, and neither is a game whose own screen ignores
 both consoles' input.*
 
+**2026-10-22, the menu wall was an instrument gap, and it is closed.** The
+control channel now has `snapshot`/`restore` (the bridge's savestate, taken on
+the console's own thread between frames) and `tools/scripts/menu-map.py` sweeps a
+front end systematically - every button, five two-button presses and a 32-pixel
+touch grid from each screen, returning with `restore` between trials, every
+distinct screen saved as text and PNG. That is how the Tetris DS route was read
+instead of guessed: its main menu rows are at bottom `y=40/70/96/124/152`, every
+row needs **two** touches, and `tools/scripts/tetris-4p.py` now drives 2-4
+consoles to the game's own card room. **Two cart consoles reach a live STANDARD
+match** (59.8 fps each, lockstep, 0.6 % `clientfail`) - which corrects the
+2026-10-16c two-cart control; the difference is *when* the host's A lands, and it
+is swallowing the press 1-2 s after a guest's accept. **At 3 and 4 the next wall
+is the guests' acceptance:** every console reaches the host's room and its `NAME`
+column, but no guest leaves `Accepting players now`, so the host's press cannot
+open the setup table - at four it instead takes the room down the download path
+(run A: a 264-byte `NINTENDO` packet on two guests' slots, `Transmitting data...`
+on the host) and every console lands on its own communication error with deauth
+reason `0003`. Next: instrument the acceptance at 3 consoles (which command
+carries it, and which client it is filed for) - the host's own roster lists all
+three, so the host's game has accepted them and the message that would tell each
+guest is either not sent to all of them or not read.
+
 Where it stands: **NSMB works at 2 players** (race reached, one console's input
 measured in the peer's picture). **MKDS couples 2, 3 and 4 consoles into one
 group through the app's own route and stays coupled** (`link mask 0x3` / `0x7` /

@@ -1327,6 +1327,42 @@ answer for a console that is playing a match. `waitfor TEXT` (the original form)
 still reads the window's status line. `sleep` now takes `--ms` as well as a bare
 count, like every other duration command.
 
+**A menu sweep needs to come back, not to boot again.** Every route before
+2026-10-22 was a list of taps: to try a second branch of a menu the console had
+to be restarted and the route replayed, which is why a menu that did not move
+on the first guess was abandoned rather than mapped. The control channel now
+carries the bridge's own savestate:
+
+```sh
+tools/appctl.py snapshot menu        # this console's whole state, under a name
+tools/appctl.py press down --ms 150
+tools/appctl.py restore menu         # back on the same picture, same frame
+```
+
+Both run on the console's own thread between frames (`LinkOp::State`, the same
+slot every link operation uses), so a snapshot is a console at a frame boundary
+rather than mid-scanout. States are 19 MB for Tetris DS and live for the life of
+the process. `tools/scripts/menu-map.py` is the sweep built on them: from each
+screen it tries every button, five two-button presses and a 32-pixel touch grid,
+returns to that screen with `restore` between trials, and saves every screen it
+has not seen as a PNG and as ASCII text under `logs/menu-map/<name>/` (with
+`graph.json` and `report.md`). Screens are compared as a 64x48 gray thumbnail of
+the **bottom** panel: measured on Tetris DS's main menu, the same screen differs
+by up to 5.8 mean gray between reads (the top panel animates) and by 0.0 on the
+bottom, while tapping a different menu row moves the bottom panel by 30.7.
+
+```sh
+tools/scripts/menu-map.py --name meteos             # buttons + touch grid
+python3 tools/scripts/menu-map.py --name dkr --no-touch
+```
+
+`tools/scripts/tetris-4p.py` is the first route that came out of a sweep and is
+reusable as-is: it drives 2-4 Tetris DS consoles from boot to the game's own
+card room (main menu rows at bottom y=40/70/96/124/152, every row needing two
+touches - the first highlights, the second enters - then INVITE `(110,50)` /
+STANDARD `(110,56)` on the host, JOIN `(110,110)` plus `A` on the room entry for
+each guest). `--start` presses A through the room's setup table.
+
 **Real time passes between two driver commands.** There is no pause: a console
 keeps emulating while a driver reads a screenshot, so a route that inspects
 between steps races the game — this is what dropped a joined MPH guest three

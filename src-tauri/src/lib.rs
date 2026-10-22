@@ -301,6 +301,13 @@ extern "C" {
         bottom: *mut *const u32,
     ) -> i32;
     fn md_frame_counter(inst: *mut MDInstance) -> u32;
+    // Save states, for the `snapshot`/`restore` control commands. A menu sweep
+    // needs to put a console back exactly where it was after each branch: a
+    // route that guesses at a menu has to try a dozen inputs per screen, and
+    // without a restore each trial costs a full boot plus the route again.
+    fn md_max_state_size() -> usize;
+    fn md_save_state(inst: *mut MDInstance, out: *mut u8, cap: usize) -> usize;
+    fn md_load_state(inst: *mut MDInstance, data: *const u8, len: usize) -> i32;
     // Program counters, for the health thread's "is the game still executing
     // code or just producing frames?" check. Read-only, so sampling them from
     // another thread is no different from md_link_stats.
@@ -710,6 +717,15 @@ enum LinkOp {
     Drain {
         reply: std::sync::mpsc::Sender<Vec<(Vec<u8>, u64)>>,
     },
+    /// Read or write this console's whole savestate. `None` asks for one and
+    /// answers its bytes; `Some` puts those bytes back and answers empty. It
+    /// runs in the same between-frames slot as every other op here, which is
+    /// the only place a savestate is safe: restoring into a console that is
+    /// mid-frame would serialize a picture half-drawn and a bus mid-read.
+    State {
+        data: Option<Vec<u8>>,
+        reply: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+    },
     /// One turn of the Download Play joiner, run *inside* this console's own
     /// turn: read the inbox, advance the client state machine, and send whatever
     /// it decided - all before this console's next frame. This is the whole
@@ -787,6 +803,26 @@ impl Instance {
                     dp_joiner::step(&bus, &dp, &mut st, std::time::Instant::now());
                 }
                 let _ = reply.send(());
+            }
+            LinkOp::State { data, reply } => {
+                let out = match data {
+                    None => {
+                        let cap = unsafe { md_max_state_size() };
+                        let mut buf = vec![0u8; cap];
+                        let len = unsafe { md_save_state(self.ptr, buf.as_mut_ptr(), cap) };
+                        if len == 0 {
+                            None
+                        } else {
+                            buf.truncate(len);
+                            Some(buf)
+                        }
+                    }
+                    Some(bytes) => {
+                        let rc = unsafe { md_load_state(self.ptr, bytes.as_ptr(), bytes.len()) };
+                        if rc == 0 { Some(Vec::new()) } else { None }
+                    }
+                };
+                let _ = reply.send(out);
             }
             LinkOp::BootDownloaded { image, info, session, reply } => {
                 let ok = unsafe {
@@ -888,6 +924,26 @@ impl Instance {
                 None
             }
         }
+    }
+
+    /// This console's savestate, or None when the driver did not answer.
+    fn state_save_now(&self) -> Option<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.link_ops.lock().push(LinkOp::State { data: None, reply: tx });
+        match rx.recv_timeout(LINK_OP_TIMEOUT) {
+            Ok(Some(bytes)) if !bytes.is_empty() => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Put a savestate back. False when the driver refused or did not answer.
+    fn state_load_now(&self, data: &[u8]) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.link_ops.lock().push(LinkOp::State {
+            data: Some(data.to_vec()),
+            reply: tx,
+        });
+        matches!(rx.recv_timeout(LINK_OP_TIMEOUT), Ok(Some(_)))
     }
 
     /// Everything queued for this console right now, or None when the driver
@@ -1351,6 +1407,15 @@ struct Session {
 
 pub struct AppState {
     session: RwLock<Option<Arc<Session>>>,
+    /// Named savestates, for `snapshot`/`restore`.
+    ///
+    /// The control channel's menu sweeps need one thing the emulator does not
+    /// otherwise offer: put a console back on the screen it was on, so the next
+    /// branch of a menu can be tried without booting again. Keyed by name
+    /// because a sweep names its nodes (`"boot"`, `"menu"`, `"wireless"`), and
+    /// held for the life of the process so a driver that exits and reattaches
+    /// still finds them.
+    snapshots: Mutex<BTreeMap<String, Vec<u8>>>,
     /// The Settings switch for per-game fixes: the one gate a game-specific
     /// patch reads. It lives on the app (not a session) so flipping it does not
     /// restart emulation and the next session inherits it. Default on.
@@ -1361,6 +1426,7 @@ impl Default for AppState {
     fn default() -> Self {
         AppState {
             session: RwLock::new(None),
+            snapshots: Mutex::new(BTreeMap::new()),
             per_game_fixes: AtomicBool::new(true),
         }
     }
@@ -4144,6 +4210,83 @@ fn ctrl_parse_hex(s: &str) -> Option<u32> {
     u32::from_str_radix(t, 16).ok()
 }
 
+/// The session and instance a control command names, or the reason it cannot.
+fn ctrl_instance(
+    app: &tauri::AppHandle,
+    player: usize,
+) -> Result<Arc<Instance>, String> {
+    let state = app.state::<AppState>();
+    let current = state.session.read();
+    let session = current.as_ref().ok_or("no session")?;
+    session
+        .instances
+        .get(player)
+        .cloned()
+        .ok_or_else(|| format!("player {} is not running", player + 1))
+}
+
+/// Save this console's whole state under `name`.
+///
+/// A menu is a tree, and the only honest way to map one is to try each input
+/// from the same starting screen. Booting again per branch makes that cost a
+/// boot per trial; a savestate makes each trial one press. The state itself is
+/// taken between frames on the console's own thread (see `LinkOp::State`), so
+/// what is saved is a console at a frame boundary rather than one mid-scanout.
+fn ctrl_snapshot(
+    app: &tauri::AppHandle,
+    player: usize,
+    name: &str,
+) -> Result<serde_json::Value, String> {
+    if name.is_empty() {
+        return Err("snapshot needs a 'name' (e.g. \"menu\")".into());
+    }
+    let inst = ctrl_instance(app, player)?;
+    let bytes = inst
+        .state_save_now()
+        .ok_or_else(|| format!("player {} did not answer a save-state request", player + 1))?;
+    let len = bytes.len();
+    app.state::<AppState>()
+        .snapshots
+        .lock()
+        .insert(name.to_string(), bytes);
+    Ok(serde_json::json!({
+        "player": player + 1,
+        "name": name,
+        "bytes": len,
+    }))
+}
+
+/// Put the state named `name` back into this console.
+fn ctrl_restore(
+    app: &tauri::AppHandle,
+    player: usize,
+    name: &str,
+) -> Result<serde_json::Value, String> {
+    let bytes = app
+        .state::<AppState>()
+        .snapshots
+        .lock()
+        .get(name)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "no snapshot named '{name}' - take one with `snapshot {name}` first"
+            )
+        })?;
+    let inst = ctrl_instance(app, player)?;
+    if !inst.state_load_now(&bytes) {
+        return Err(format!(
+            "player {} refused a restore from '{name}' (the bridge rejected the state)",
+            player + 1
+        ));
+    }
+    Ok(serde_json::json!({
+        "player": player + 1,
+        "name": name,
+        "bytes": bytes.len(),
+    }))
+}
+
 /// Read a console's main RAM through the bridge's `md_read_ram`, which takes a
 /// 4-byte-aligned address and length. Answers the bytes and the ARM9's own
 /// 32-bit words, so a caller can read a game's variables rather than argue
@@ -5001,6 +5144,29 @@ fn ctrl_dispatch(app: &tauri::AppHandle, line: &str) -> serde_json::Value {
                 },
             };
             match ctrl_poke(app, player as usize, addr, &words, cpu) {
+                Ok(v) => reply(v),
+                Err(e) => failed(e),
+            }
+        }
+        // A menu sweep's backtrack: the picture a console was on, put back.
+        "snapshot" => {
+            let player = match ctrl_json_player(&req) {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let name = arg_str("name").unwrap_or_default();
+            match ctrl_snapshot(app, player as usize, &name) {
+                Ok(v) => reply(v),
+                Err(e) => failed(e),
+            }
+        }
+        "restore" => {
+            let player = match ctrl_json_player(&req) {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let name = arg_str("name").unwrap_or_default();
+            match ctrl_restore(app, player as usize, &name) {
                 Ok(v) => reply(v),
                 Err(e) => failed(e),
             }
