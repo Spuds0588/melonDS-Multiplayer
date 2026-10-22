@@ -1365,6 +1365,23 @@ panel (a DS dialog box) and the default for dark ink on a bright one (a menu).
 `tools/glyphs.py` is the next step when a word still needs to be certain - it
 splits a crop into one block per character.
 
+**Measuring a session rather than reading a moment of it:**
+`tools/scripts/room-bench.py` samples a running session once a second through
+the control channel and `/proc`, and prints a distribution rather than a number:
+
+```sh
+tools/scripts/room-bench.py --seconds 900 --log logs/x_app.log --out logs/x_bench.json
+```
+
+Per console it reports the emulated frames and `min/p25/median/p75/max` fps over
+the whole window, the per-window spread between consoles (lockstep), the app's
+own CPU and its child processes', every thread's share by name, and a census of
+the app log's own event lines (stall, kick, wedge, lockstep dissolved, console
+stopped, heartbeat missed, deauth, wireless on/off, still picture). It reads the
+app's pid from the log's `[supervisor] app pid N started` line, so give it the
+log `tools/run_app.sh` wrote, and it injects nothing - a measurement is safe on a
+session someone is playing.
+
 Two things a driver hits before it hits a game, both measured on 2026-09-28.
 Reloading the window mid-session (`eval location.reload()`, or a user pressing
 reload) is **survivable**: the Rust side and the session keep running and the UI

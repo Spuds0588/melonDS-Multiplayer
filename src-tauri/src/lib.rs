@@ -1714,11 +1714,14 @@ fn start_session_inner(
     // host packets into the queues the emulated WiFi reads could confuse a
     // real game. It classifies each console's link state per window so a
     // freeze is attributable from the log alone:
-    //   LINK STALL  - wireless on, no packet accepted from a peer all window
-    //                 (the game's WiFi state machine is stuck: the frozen MKDS
-    //                 lobby looked exactly like this)
-    //   LINK IDLE   - no traffic and few polls: the game's WiFi isn't even
-    //                 asking (menu, powered off, or asleep)
+    //   LINK STALL  - wireless on, packets were delivered to this console and
+    //                 its game accepted none of them all window (the game's
+    //                 WiFi state machine is stuck: the frozen MKDS lobby looked
+    //                 exactly like this). A window with nothing delivered is
+    //                 IDLE however hard the game polls - see `starved` below.
+    //   LINK IDLE   - no traffic and few polls, or polls that had nothing to
+    //                 read: the game's WiFi isn't being given anything (menu,
+    //                 waiting for joiners, powered off, or asleep)
     //   LINK ACTIVE - packets flowing; verbose mode adds per-kind rates
     // Holds Arc<Instance> clones, never the Session itself: Drop must be able
     // to set `stop` and join this thread before the consoles are destroyed.
@@ -1954,11 +1957,28 @@ fn start_session_inner(
                         } else {
                             -1.0
                         };
+                        /* A console can only be *stalled* if something was
+                           actually handed to it and its own game read none of
+                           it. The kick exists to re-anchor a drifted FIFO read
+                           offset or an unsignaled semaphore, and both leave
+                           `delivered` climbing while `game` stays 0 - polling
+                           an inbox that never received anything is not that,
+                           and nothing is lost by waiting. Measured on a joined
+                           four-console MKDS room (2026-10-22): the host sat on
+                           its group page with a peer on the bus that had not
+                           entered the multiplayer section yet, and its own
+                           window read `delivered 0(+0) · game 0(+0) ·
+                           tx 243(+23)`, against a `slots 0x3` that made it a
+                           `LINK STALL`; the watchdog resynced the host's bus
+                           three times during that one normal join (frames
+                           6901, 9594, 12588), each clearing receive semaphores
+                           on a console that was simply waiting for joiners. */
+                        let starved = d_delivered > 0;
                         let state = if !wireless_on {
                             "LINK OFF  "
                         } else if rx_active {
                             "LINK ACTIVE"
-                        } else if d_polls > 60 {
+                        } else if d_polls > 60 && starved {
                             "LINK STALL"
                         } else {
                             "LINK IDLE "

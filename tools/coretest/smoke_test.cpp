@@ -918,6 +918,40 @@ int main(int argc, char** argv)
               "both of the clump's answers reach the game, one round apart");
     }
 
+    /* A blank from one console must not stand in for another console's answer.
+       At four consoles every window sees blanks - a console sends one for a
+       command that was not addressed to it, and any one poll addresses at most
+       one client - so a window that counts a blank as "this console has
+       answered" closes as soon as every console has *said something*, and the
+       answer it was waiting for is left in the queue for the next command to
+       drop. Measured on a joined four-console MKDS room (v0.1.9du): 433 blanks
+       consumed against 452 `clientfail` acks, and 392 answers dropped unread by
+       the next command. */
+    {
+        melonDS::LocalMP four;
+        four.SetRecvTimeout(0);
+        four.SetReplyTimeout(0);
+        for (int i = 0; i < 4; i++) four.Begin(i);
+        four.SendCmd(0, cmd, sizeof(cmd), 100);
+        for (int i = 1; i < 4; i++)
+            check(four.RecvHostPacket(i, got1, nullptr) > 0,
+                  "each of three clients reads the host's command");
+
+        unsigned char a1[] = { 0x11 }, a2[] = { 0x22 }, a3[] = { 0x33 };
+        four.SendReply(1, a1, sizeof(a1), 100, 1);
+        four.SendReply(2, a2, sizeof(a2), 100, 2);
+        /* p3's blank answers an earlier command that was not addressed to it;
+           its own answer to this one is queued behind the blank. */
+        four.SendReply(3, nullptr, 0, 100, 3);
+        four.SendReply(3, a3, sizeof(a3), 100, 3);
+
+        unsigned char fourSlots[15 * 1024] = { 0 };
+        check(four.RecvReplies(0, fourSlots, 100, 0xE) == 0xE,
+              "a blank does not stand in for the answer behind it - every asked-for client is credited");
+        check(fourSlots[0] == a1[0] && fourSlots[1024] == a2[0] && fourSlots[2048] == a3[0],
+              "... and each answer sits in its own aid's slot");
+    }
+
     /* Two consoles that each host a client of their own. Each client's answer
        has to reach the console it is following: a single process-wide "the last
        console to send a command" cannot tell these apart and would file both

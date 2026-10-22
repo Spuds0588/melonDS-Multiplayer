@@ -1067,7 +1067,25 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
             }
         }
 
-        heard |= (u16)(1 << pktheader.SenderID);
+        /* Only an entry that carried a body counts as "this console has
+           answered". A zero-length entry is the blank a console sends for a
+           command that was not addressed to it (Wifi's `send a blank` arm), and
+           at four consoles that is most of what a window sees: measured on a
+           joined four-console MKDS room, the host consumed 433 blanks against
+           452 `clientfail` acks. Counting a blank as an answer closed the window
+           as soon as every console had said *something* - a blank from p3 and
+           p4, in the window the run recorded - while the client the host had
+           actually polled had its own answer read on the next command, or
+           dropped unread (`reanchor-dropped` 392 in the same run). The window
+           now ends when the answers it asked for are here, or when there is
+           nothing left to wait for (the semaphore's timed wait). */
+        if (pktheader.Length)
+            heard |= (u16)(1 << pktheader.SenderID);
+
+        /* `heard` counts consoles, `ret` counts aids; a console answers as one
+           aid, so both conditions say "everyone asked for has answered" - the
+           sender test is stock's and stays for a console whose aid the bus does
+           not know. */
         if (((heard & curinstmask) == curinstmask) ||
             ((ret & aidmask) == aidmask))
         {

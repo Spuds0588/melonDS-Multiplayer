@@ -1482,11 +1482,25 @@ def main():
             # nothing this title offers a client to press is what ends the room.
             r.press_room(players, watch=args.watch)
         else:
-            for label, xy in (("cut-off", CUT_OFF_TAP), ("vs", VS_TAP)):
-                r.ch.call(cmd="touch", player=1, x=xy[0], y=xy[1], ms=150)
-                r.ch.call(cmd="untouch", player=1)
-                r.wait_frames(120, (1,))
-                r.say(f"{label} pressed on the host: {r.state(1)} d={r.page(1)[1][:8]}")
+            # CUT OFF starts the game's own fixed walk (`06 00 -> 00 FF -> ...
+            # -> FF 00`, 2-5 s of it, compatibility.md 2026-10-16w) and VS is the
+            # game-select screen at the end of it, so a fixed 120-frame wait put
+            # the VS tap *inside* the walk. VS now goes out on the host's own
+            # settled page instead (`wait_stable`), and that change is also the
+            # measurement that settled what ends a four-console room: on the run
+            # that used it (2026-10-22, room 4) the bus was already `0x0` when
+            # the page settled, so the walk itself ends the room and the VS tap
+            # is not what does (history.md v0.1.9du).
+            r.ch.call(cmd="touch", player=1, x=CUT_OFF_TAP[0], y=CUT_OFF_TAP[1], ms=150)
+            r.ch.call(cmd="untouch", player=1)
+            r.say(f"cut-off pressed on the host: {r.state(1)} d={r.page(1)[1][:8]}")
+            settled = r.wait_stable(1, hold=60)
+            r.say(f"cut-off walk settled: {r.state(1)} d={settled[1][:8]} - VS goes out on the "
+                  f"settled page, not 120 frames into the walk")
+            r.ch.call(cmd="touch", player=1, x=VS_TAP[0], y=VS_TAP[1], ms=150)
+            r.ch.call(cmd="untouch", player=1)
+            r.wait_frames(120, (1,))
+            r.say(f"vs pressed on the host: {r.state(1)} d={r.page(1)[1][:8]}")
             # The race's own confirm, on every console that is in the room: the
             # documented two-console route presses A on the host after VS.
             for p in [1] + joined:

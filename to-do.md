@@ -54,6 +54,33 @@ and CPU are each ruled out by measurement (history.md v0.1.9az), and
 next - is strictly better than overlapping them**, holding a host+guest pair to
 the hunter roster at four consoles.
 
+**A joined four-console room now has its own record, and its link is clean:
+two defects fell out of it and the room still ends inside MKDS's own cut-off
+walk (v0.1.9du, 2026-10-22).** Four runs of the v0.1.9dp recipe
+(`tools/scripts/mkds-4p.py --attach --players 4`), measured by a new
+`tools/scripts/room-bench.py`: every console joins (`mask 0x1 -> 0x3 -> 0x7 ->
+0xf`, each proved from its own `role` and frames), CUT OFF moves the host to its
+pre-race walk, and the group then ends with all four consoles writing their own
+`deauth … reason 0003` - run 1 at frame 13,824, run 3 at 11,194, run 4 with the
+host's own radio off before VS. **The button question is settled:** a route that
+waits for the walk's own settled page before tapping VS finds the bus already
+`0x0` when that page settles, so VS is not what ends the room and the walk is.
+The harness defect that hid it (a fixed 120-frame wait between CUT OFF and VS,
+which put the tap inside a walk the record says takes 2-5 s) is fixed in the
+route. What the run exposed in the link is fixed too: the host's reply window
+counted a console's *blank* answer as the answer it was waiting for (262 of
+1,095 windows returned with asked-for clients missing; blanks no longer count -
+0 of 2,610/736/1,338 after), and the stall watchdog resynced consoles that had
+simply been handed nothing yet (three kicks during one normal four-console join,
+now 0). Speed: **58.7 fps average per console over 900 s, min 28.7, median
+59.6, max 60.7**, identical on all four consoles, lockstep never dissolved, 0
+kick/heartbeat/wedge events before the room ended, tree cost 2.73 cores of 8.
+**Next item on this thread, with the measurement that supports it:** the
+walk-ends-the-group step at four consoles - what the host's engine does to its
+clients between CUT OFF and the walk's end that it does not do at two, given
+the link carried every class of frame through it and the guests keep answering
+(`collected 4,886`, `clientfail 30%` of rounds) until their own radios go off.
+
 **What the guest is waiting for is now measured, and it is the host game's own
 data (v0.1.9bi).** The host's directed commands come in two forms, and the one it
 uses is the *host game's* own TX-slot write, passed to the link at the length the
