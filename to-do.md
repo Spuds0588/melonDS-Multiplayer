@@ -75,11 +75,30 @@ simply been handed nothing yet (three kicks during one normal four-console join,
 now 0). Speed: **58.7 fps average per console over 900 s, min 28.7, median
 59.6, max 60.7**, identical on all four consoles, lockstep never dissolved, 0
 kick/heartbeat/wedge events before the room ended, tree cost 2.73 cores of 8.
-**Next item on this thread, with the measurement that supports it:** the
-walk-ends-the-group step at four consoles - what the host's engine does to its
-clients between CUT OFF and the walk's end that it does not do at two, given
-the link carried every class of frame through it and the guests keep answering
-(`collected 4,886`, `clientfail 30%` of rounds) until their own radios go off.
+**That question is answered, and it is not a link question (v0.1.9dv,
+2026-10-22).** Read as rounds, the final four-console run asks all three clients
+(`mask 0x000e` x1,208) for about 1,800 rounds and then **`0x0002` x2,896**: the
+host's game prunes p3 and p4 and finishes the session with p2 alone, in the
+same command sizes it had used all along (46, 74 and 54 bytes; 4,550 / 18 / 4
+of the 4,619 commands) - a one-client lobby to its last round, not a new phase. The 563 `clientfail` acks are a burst and not a background -
+458 by round 1,523, **502 by 1,733 (44 in those 210 rounds, 21%)**, then 61
+over the remaining 2,886 (2.1%) - and the prune starts between rounds 1,733 and
+1,801, where the burst ends (210 rounds is 3.5 s of emulation, the size of the
+cut-off walk). The radios go off 10.25 s apart (p3 at bus +210.47 s, p4
++211.88 s, p2 +220.55 s, p1 +220.72 s), each console writing its own `reason
+0003` just before its own switch-off and the guests' deauths coming after the
+host's own last round, so the host's session end is the event and the four
+switch-offs are a cascade rather than one shared frame. **The
+control that closes the suspect:** the same route on the same binary at two
+consoles gives `1,953` rounds, `1,952` collected, **one empty window**,
+**`clientfail 1` of 1,953 acks**, zero deauth, 115 beacons sent / 114 accepted - and both consoles
+still sit on a pure-black page (`790742fa`) for all 360 watched frames. So the
+short windows at four are not what stands between the room and a race, and no
+link repair can produce one; v0.1.9cc's prune-suppression arm agrees (the group
+died at the walk anyway). **Next item on this thread:** the game's own start
+message, which v0.1.9cd located and could not reach - match a handler in the
+table at `0x6018A40` against the type MKDS's ARM9 dequeues at the wall, and find
+what writes `ctx+0x3F4`.
 
 **What the guest is waiting for is now measured, and it is the host game's own
 data (v0.1.9bi).** The host's directed commands come in two forms, and the one it

@@ -1382,6 +1382,26 @@ app's pid from the log's `[supervisor] app pid N started` line, so give it the
 log `tools/run_app.sh` wrote, and it injects nothing - a measurement is safe on a
 session someone is playing.
 
+`tools/scripts/round-timing.py` answers the other half of that question - not
+how fast the room ran, but whether each poll got the answers it asked for:
+
+```sh
+tools/scripts/round-timing.py logs/x_app.log            # the whole run
+tools/scripts/round-timing.py logs/x_app.log.gz --tail 1200
+```
+
+It reads one `MD_LINK_VERBOSE=1` log as *rounds* - the host's command with its
+client mask, each window's credited aids, each client's own `answering cmd` /
+`BLANK reply` / `answer sent` - and prints the poll masks used, how many windows
+credited every client asked for (and how many credited nobody), how many polls
+back each credited answer was actually made for (`lag 1` is the normal pipeline:
+a guest answers at its own round boundary, so the host reads it in the next
+window), replies credited from a client the poll did not ask, the same numbers
+per block of polls (the phases of a run are not one population), per-client
+blanks, and the last link events with each console's wireless block as the
+digest read it. Exit 2 means the log has no link trace, which is the answer to
+"why is every count zero".
+
 Two things a driver hits before it hits a game, both measured on 2026-09-28.
 Reloading the window mid-session (`eval location.reload()`, or a user pressing
 reload) is **survivable**: the Rust side and the session keep running and the UI
