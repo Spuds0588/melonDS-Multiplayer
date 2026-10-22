@@ -2841,6 +2841,20 @@ Past the boot both consoles show the STANDARD lobby with a 2-player roster, the 
 
 First boot writes the game's save (new `Test Roms/Tetris DS (USA).sav`; supervisor-pinned, exit 0). Higher player counts (the title supports up to 10 over Download Play) and the other modes (MISSION, PUSH) are unmeasured.
 
+### 2026-10-22e — presses proven landed: the rule confirm still ends a three-console room in the two orders measured, so the wall is the title's own handshake
+
+`tools/scripts/tetris-confirm.py` presses A, waits for that console's own bottom
+panel to move, re-sends until it does (five attempts), prints the attempt count and
+exits non-zero when a press never lands. The room gate is the game's own protocol
+(the host's log carrying `body[6]=F6 00`), not a screenshot: a batch run without
+the verbose line read NO-TABLE on sessions that were at the table. With that gate,
+every press landed on its first attempt and both measured orders still ended the
+room - 1,2,3 (host first) with 5 deauths, 2,3,1 (guests first) with 3 - while the
+link credited every reply (section 5). The two unmeasured interleavings were only
+attempted against the blind check and are not counted; no fifth ordering was run.
+Three-player multi-card play needs a fix in the title's room state machine (the
+place the `01 8D` rule-set flag is written), not another press order.
+
 ### 2026-10-22d — the guests' answer flag is their own rule-set state, and the press that completes the set is what still ends the room
 
 Corrects 2026-10-22c. In a three-console room, a guest pressing A on its own
