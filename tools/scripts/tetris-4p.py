@@ -10,12 +10,21 @@ to tell them apart - it paces the pair (1.2s, the gap measured working) and
 verifies the *stage* afterwards with a screenshot a person can check.
 
     tools/scripts/tetris-4p.py --players 2 --host 1            # stop at the setup table
-    tools/scripts/tetris-4p.py --players 4 --host 1 --start    # press A through the start
+    tools/scripts/tetris-4p.py --players 4 --host 1 --start    # guests ready, then the host
 
 Screenshots of every stage go to logs/shots/tetris4p-<stage>-p<N>.png. The
 driver never guesses that a stage was reached: the caller reads the pictures
 (or the link counters in logs/md_app.log) and the next pass can re-run the same
 file. This is deliberately the reusable route, not a one-off tap list.
+
+The start sequence is the one measured to produce a match (2026-10-22, the
+proven replay of the earlier control): each guest's A opens its own rules
+panel, the host's A twice takes it to "please wait", and each guest's A again
+confirms its rules - which is the press that lets the host's game leave its
+ready loop. Every press is *proven* by that console's own panel moving and
+re-sent until it does; the same order sent blind left both consoles on the
+table, because a swallowed press and a landed one are indistinguishable from
+the outside.
 """
 
 import argparse
@@ -53,6 +62,25 @@ class Pad:
 
     def press(self, mask, ms=200):
         self.ch.call(cmd="press", player=self.p, buttons=mask, ms=ms)
+
+    def press_proven(self, mask=0x1, label="", attempts=5, patience=2.2):
+        """Send a press until this console's own bottom panel moves.
+
+        The room swallows a press made within a second or two of a phase
+        change, and a swallowed press changes nothing on the console that was
+        supposed to take it - so the panel, not the send, decides. Re-sending
+        is safe: a press that already landed has moved the panel and the loop
+        has exited before the second one is sent.
+        """
+        before = self.sig()
+        for attempt in range(1, attempts + 1):
+            self.press(mask)
+            if self.changed(before, patience):
+                if label:
+                    print(f"  p{self.p}: {label} (attempt {attempt})", flush=True)
+                return attempt
+        raise SystemExit(f"p{self.p}: {label or 'press'} never moved this console's panel "
+                         "- see the stage shots")
 
     def sig(self):
         """Bottom-screen thumbnail: the part of this panel a menu lives in."""
@@ -176,15 +204,7 @@ def main():
     #    it is swallowed (measured 2026-10-22 - the same press that opens the
     #    table 6s after a guest's accept does nothing 1.5s after it). So it is
     #    pressed until the host's own panel changes, not once.
-    before = host.sig()
-    for attempt in range(6):
-        host.press(0x1)
-        if host.changed(before, 2.2):
-            print(f"p{args.host}: setup table after {attempt + 1} press(es)", flush=True)
-            break
-    else:
-        raise SystemExit("p%s: the host's panel never opened the setup table "
-                         "(see setup shot)" % args.host)
+    host.press_proven(0x1, "setup table")
     time.sleep(1.0)
     for p in pads.values():
         p.shot("setup")
@@ -193,13 +213,33 @@ def main():
         print("stopping at the setup table (no --start)", flush=True)
         return 0
 
-    # 5. every player readies on the table (the last ready starts the match).
-    #    A console whose table has not arrived yet swallows the press, so each
-    #    one is pressed until its own panel leaves the table.
-    for p in pads.values():
-        p.press(0x1)
-        time.sleep(1.5)
-    time.sleep(3.0)
+    # 5. readies, in the order measured to start a match (2026-10-22 replay of
+    #    the working control: guest A, host A, host A, guest A at 1-2s spacing).
+    #    Each guest's first A opens its own rules panel, the host's two presses
+    #    take it to "please wait", and each guest's second A confirms its rules
+    #    - the press the host's game waits on. Sent blind in this same order the
+    #    room stays on the table, because the presses are swallowed and nothing
+    #    reports it; proven one at a time it starts on the first attempt.
+    for p in guests:
+        p.press_proven(0x1, "rules panel open")
+        time.sleep(0.8)
+    host.press_proven(0x1, "host to please-wait")
+    time.sleep(1.0)
+    # The second host press is the one the room swallows: it is already on
+    # "please wait", so requiring this panel to move would abort a good route
+    # (measured 2026-10-22 - tetris-confirm's proof passed it in the run that
+    # started a match, and the driver aborted on it in the next run).
+    host.press(0x1)
+    time.sleep(1.0)
+    for p in guests:
+        p.press_proven(0x1, "rules confirmed")
+        time.sleep(0.8)
+
+    # Give the room time to start, then photograph every console. The verdict is
+    # read from the game's own protocol afterwards - the host's log carries
+    # `body[6]=F6 00` and then `F6 00 0n 00 04 9D` with MD_LINK_VERBOSE=1 - not
+    # from these pictures, which only say which panel each console is drawing.
+    time.sleep(4.0)
     for p in pads.values():
         p.shot("match")
     print("match screen captured on every console", flush=True)
