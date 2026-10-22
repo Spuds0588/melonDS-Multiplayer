@@ -2841,6 +2841,28 @@ Past the boot both consoles show the STANDARD lobby with a 2-player roster, the 
 
 First boot writes the game's save (new `Test Roms/Tetris DS (USA).sav`; supervisor-pinned, exit 0). Higher player counts (the title supports up to 10 over Download Play) and the other modes (MISSION, PUSH) are unmeasured.
 
+### 2026-10-22d — the guests' answer flag is their own rule-set state, and the press that completes the set is what still ends the room
+
+Corrects 2026-10-22c. In a three-console room, a guest pressing A on its own
+NAME/ITEMS/HANDICAP/TEAM panel (showing "Please wait until all of the players
+have set their rules") flips that console's room answer to `01 8D` and keeps it:
+the same room answers `01 0D` in 255 of 283 credited windows before any
+confirmation and `8D` in every window after it, for both guests
+(`3p_rules_guest_set.png`, `3p_rules_p1_panel.png`). So the byte is the game's own
+"my rules are set" state, not a room-size condition.
+
+**What still fails is completing the set.** Guests confirming while the host has
+not (order p2, p3) ends the room at the last press - the host sends its own deauth
+first (reason `0003`) to p3 and p2, then the guests, all three on the game's
+communication error (`3p_rules_last_confirm_error_p1.png`); host and one guest
+confirmed (order p1, p2) ends it at the guest's press. Two consoles with the same
+presses start a match. In every failing run the host's command body never leaves
+`F6 00 06 00 00 80`, the mask stays `0006`, every window is `collected=0006 of
+mask 0006` with `stale` 0, and the host credits its replies to the last frame, so
+the confirmations are not being lost by the transport. The one variable not yet
+run cleanly is the order around the host - host first, then guests - which is the
+next measurement (`accept-trace.txt` section 5).
+
 ### 2026-10-22c — the press after the room, run as a two-against-three differential: it is the title's own start condition, and the transport is clean up to the guests' deauths
 
 **Two consoles and three consoles, same table, same presses, one at a time with a

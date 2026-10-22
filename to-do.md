@@ -17,6 +17,26 @@ item. The bar is an **in-game match with the link healthy** — a live link that
 never reaches a match is not done, and neither is a game whose own screen ignores
 both consoles' input.*
 
+**2026-10-22, fourth pass: the guest answer flag is "my rules are set", and the
+press that completes the set is the whole remaining wall.** Correcting the third
+pass: in a three-console room the guests' answers do flip to `01 8D` (bit `80`
+set) the moment a guest presses A on its own NAME/ITEMS/HANDICAP/TEAM panel and
+shows "Please wait until all of the players have set their rules", and they stay
+`8D` - before any confirmation the same room answers `01 0D` in 255 of 283
+windows, after it every window. So the bit is the guest's own rule-set state,
+written by the game, not a room-size condition. **What still fails is the confirm
+that completes the set:** with the guests confirming while the host has not
+(order p2, p3) the room dies at the last press - the host sends its own deauth
+first, then the guests, all three on the game's communication error; with the host
+and one guest confirmed (order p1, p2) it dies at the guest's press. Two consoles
+with the same presses start a match. In every failing case the host's command body
+never leaves `F6 00 06 00 00 80`, the mask stays `0006`, every window is
+`collected=0006 of mask 0006` with `stale` 0, and the link is clean to the
+deauths, so the transport is not dropping the confirmations. **The untested
+variable is the order around the host:** a clean host-first run (p1, p2, p3) was
+not obtained - the one attempt never left the join screen - and that is the next
+thing to run, not more transport work.
+
 **2026-10-22, third pass: the press after the room was run as a differential, and
 it is a game-side start condition, not a dropped packet - no code was changed for
 it.** Two consoles and three consoles, the same table and the same presses, one
