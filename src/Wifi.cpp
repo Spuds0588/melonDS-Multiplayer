@@ -165,6 +165,25 @@ static const char* mp_body_hex(const u8* body, int len, char* buf, size_t buflen
     return buf;
 }
 
+/* A client mask as the AIDs it addresses: `0006` -> "1,2", `0000` -> "none".
+   The host's own game writes this field into every command (payload+2) and the
+   answer to it comes back stamped with one of these AIDs, so a line that names
+   them is the one place an AID mismatch can be read at both ends instead of
+   inferred from which replies stopped arriving. */
+static const char* mp_aid_list(u16 mask, char* buf, size_t buflen)
+{
+    size_t n = 0;
+    buf[0] = 0;
+    if (!mask) { snprintf(buf, buflen, "none"); return buf; }
+    for (int i = 1; i < 16; i++)
+    {
+        if (!(mask & (1 << i))) continue;
+        if (n && ((n + 1) < buflen)) buf[n++] = ',';
+        if ((n + 2) < buflen) n += (size_t)snprintf(&buf[n], buflen - n, "%d", i);
+    }
+    return buf;
+}
+
 /* Whether a repeated CMD sequence number is handed to the game.
 
    Stock melonDS treats a repeated CMD seqno as a transport-level event: the
@@ -518,6 +537,8 @@ void Wifi::Reset()
     MPReplyTimer = 0;
     MPClientMask = 0;
     MPClientFail = 0;
+    MPD.last_cmd_mask_game = 0xFFFF;
+    MPD.last_cmd_mask_poll = 0xFFFF;
     MPLoopAlive = false;
     memset(MPClientReplies, 0, sizeof(MPClientReplies));
 
@@ -1219,9 +1240,19 @@ void Wifi::TXSendFrame(const TXSlot* slot, int num)
         if (mp_trace())
         {
             char hexbody[3 * 16 + 1];
+            /* The reply-slot trace: which of the wireless RAM's slots this
+               console's game wrote the answer into, and the AID the answer is
+               stamped with. Both are needed to tell a client that answered
+               correctly from one answering as an AID its host is not polling:
+               the slot is per-console state, the AID is shared vocabulary, and
+               a collision there files two clients' answers into one of the
+               host's per-AID buffers (LocalMP::RecvReplies, packets[(aid-1)*1024]). */
             Log(LogLevel::Debug,
-                "[mp] answer sent: frame seq=%04X arm=#%llu armed in round seq %04X, "
+                "[mp] answer sent: reply slot %04X in wireless RAM (length byte %02X), "
+                "stamped AID %d, frame seq=%04X arm=#%llu armed in round seq %04X, "
                 "%d byte frame, body[%d]=%s\n",
+                slot->Addr, (unsigned)((slot->Addr < 0x1FF0) ? RAM[slot->Addr + 0xA] : 0),
+                MPReplyAID(),
                 (len >= 24) ? *(u16*)&TXBuffer[12 + 22] : 0,
                 (unsigned long long)MPArmServedSerial, MPArmServedSeq,
                 len, (int)MPD.last_answer_len,
@@ -1308,8 +1339,28 @@ void Wifi::StartTX_Cmd()
     if (rate == 0x14) slot->Rate = 2;
     else              slot->Rate = 1;
 
-    MPClientMask = *(u16*)&RAM[slot->Addr + 12 + 24 + 2] & MPClientFail;
+    /* The mask in the frame is the host's *game's* own text - it is the field
+       the game's answers are matched against - and the transport's poll mask is
+       that field narrowed by `MPClientFail`. Printing both when either changes
+       is what makes "the host's game stopped addressing this client" a line in
+       the log instead of a conclusion drawn from silence: the accept and the
+       room's close are both commands whose mask is the only thing that differs
+       between a client that is polled and one that is not. */
+    const u16 game_mask = *(u16*)&RAM[slot->Addr + 12 + 24 + 2];
+    MPClientMask = game_mask & MPClientFail;
     MPClientFail &= MPClientMask;
+
+    if (mp_trace() && (game_mask != MPD.last_cmd_mask_game || MPClientMask != MPD.last_cmd_mask_poll))
+    {
+        char g[48], p[48];
+        Log(LogLevel::Debug,
+            "[mp] command addressing changes: the game's own mask %04X (%s), polled as %04X (%s)%s\n",
+            game_mask, mp_aid_list(game_mask, g, sizeof(g)),
+            MPClientMask, mp_aid_list(MPClientMask, p, sizeof(p)),
+            (MPClientMask != game_mask) ? " - the transport narrowed it" : "");
+        MPD.last_cmd_mask_game = game_mask;
+        MPD.last_cmd_mask_poll = MPClientMask;
+    }
 
 
     u32 duration = PreambleLen(slot->Rate) + (slot->Length * (slot->Rate==2 ? 4:8));
@@ -2532,10 +2583,14 @@ void Wifi::FinishRX()
             // TODO: also send this if we have RX disabled
 
             if (mp_trace())
+            {
+                char aids[48];
                 Log(LogLevel::Debug,
-                    "[mp] BLANK reply to cmd seq=%04X: AID %d, host mask %04X, not addressed to us "
-                    "(mask bit %d) - the host hears silence and counts a failed reply\n",
-                    seqno, IOPORT(W_AIDLow), clientmask, IOPORT(W_AIDLow));
+                    "[mp] BLANK reply to cmd seq=%04X: this console is AID %d, the host's mask is "
+                    "%04X (%s), so it is not addressed - the host hears silence and counts a "
+                    "failed reply\n",
+                    seqno, MPReplyAID(), clientmask, mp_aid_list(clientmask, aids, sizeof(aids)));
+            }
 
             MPD.answers_blank++;
             Platform::MP_SendReply(nullptr, 0, USTimestamp, 0, NDS.UserData);
@@ -2894,6 +2949,19 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
                answer, and a poll that lands in that window belongs to this
                console just as much as one that does not. */
             MPMYAID = aid & 0xF;
+
+            /* What the host told this console it is, printed once per
+               association: every answer it sends is stamped with this AID and
+               every poll is "ours" only when the mask carries its bit. A
+               three-console room is the case where the assignment itself can
+               go wrong (two guests told the same AID), so the line names both
+               the raw field and the bit the guest will test. */
+            if (mp_trace())
+                Log(LogLevel::Debug,
+                    "[mp] association accepted: the host handed this console AID %d (raw %04X); "
+                    "it stamps every answer with AID %d and answers a poll only when mask bit %d is set\n",
+                    MPMYAID, aid, MPReplyAID(), (int)MPMYAID);
+
             /* No clock snap here any more. This used to copy the host's
                timestamp into the client's own clock - the one alignment the
                two consoles ever got, and the reason their clocks could part

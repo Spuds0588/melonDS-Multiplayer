@@ -2841,6 +2841,51 @@ Past the boot both consoles show the STANDARD lobby with a 2-player roster, the 
 
 First boot writes the game's save (new `Test Roms/Tetris DS (USA).sav`; supervisor-pinned, exit 0). Higher player counts (the title supports up to 10 over Download Play) and the other modes (MISSION, PUSH) are unmeasured.
 
+### 2026-10-22i — the three-client accept is not refused: all three are accepted, addressed as AIDs 1 and 2 and credited, and the room reaches a three-player table; the wall is the title's own re-entry after its pre-match close
+
+The last pass's next instrument was built: `TXSendFrame` now prints the reply
+slot its game wrote, the length byte in wireless RAM and the AID the answer is
+stamped with; `CheckRX` prints the AID an association accepted; `StartTX_Cmd`
+prints the host's own client mask and the transport's poll mask as the AID lists
+they stand for whenever either changes; and `LocalMP::RecvReplies` names an AID
+collision once, with both senders, when two consoles answer as one AID inside the
+same few milliseconds. All of it is behind the existing verbose trace.
+
+**The accept is accepted.** In every three-console run the host's `06 01 06 00 03
+11 05 ... 4E 06 00` is preceded by `command addressing changes: the game's own
+mask 0006 (1,2), polled as 0006 (1,2)`, both guests print `association accepted:
+the host handed this console AID 1` / `AID 2`, every answer is `stamped AID 1` /
+`AID 2`, the collision detector never fires, and the host collects both in the
+same window (`collected=0006 of mask 0006`, 30-455 windows per run). The bookkeeping
+the accept was blamed for is clean.
+
+**The room then reaches a three-player table.** With the host's A pressed first
+and both guests confirming, the host's own game lists all three players and shows
+`Please wait until all of the players have set their rules`
+(`tetris-3p-2026-10-22/3p-table-pleasewait.png`, `probe6.log.gz`). **The order is
+the game's, not the driver's:** a guest's A does not open its rules panel until the
+host has pressed (five attempts, panel never moved, `probe4`), so guests-first is
+not a legal order at all - the two-console recipe's opening guest press only works
+there because the host reaches its press a second later.
+
+**What still fails is the re-entry after the pre-match close.** The close is the
+same `06 01` command at both player counts, and after it the guests diverge: one
+re-associates and keeps answering, the other's game abandons the room (`guest set
+its AID to 0 ... it has nothing to answer with`, then `deauth ... reason 0003`) and
+is back on the title screen. The run that got furthest started the game's own
+match family (`F6 00 02 00 04 9D 03 00 03 00`, client mask 0x03) with **3,641**
+`04 9D` commands, but the reply window credited only AID 1 (`collected=0002
+of mask 0002`), so two consoles played and the third sat at the title
+(`3p-match-2of3.png`, `probe5.log.gz`). Two other orders (one host press, four host
+presses) stayed in `05 9D` - 100 and 108 sends, 344 and 455 windows with `0006` -
+and then ended on the same `06 01`. So the wall is not the accept, the AID
+assignment or the reply window; it is the title's own two guests taking different
+paths out of the pre-match close, which is game-level.
+
+**The two-console control is live:** the route's own proven two-stage presses,
+2,344 `04 9D`, link mask 0x3 at +50 s, both boards falling with different NEXT
+queues (`2p-control-live.png`, `ctl2.log.gz`), save byte-identical afterwards.
+
 ### 2026-10-22h — the 14:03 log was the room closing, not a match; the same timeline with every press proven plays a live match, and that is the whole difference
 
 The press timeline was recovered from `logs/tetris2-accept.log` to the second (p2 A

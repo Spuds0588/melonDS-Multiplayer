@@ -201,6 +201,26 @@ private:
            away (2026-10-22, LocalMP.cpp's reply-window cap). */
         u64  answer_us[16] {};
 
+        /* Which console last stamped each AID, when it did, and whether a
+           second console has been seen doing the same while the first was
+           still answering. The host files every answer under its AID
+           (`packets[(aid-1)*1024]`), so two consoles answering as one AID
+           overwrite each other and the host's game reads one client's bytes as
+           the other's - a collision a three-console hand-off can produce and
+           nothing else reports.
+
+           The owner is scoped to *time*, not to the session: a room's normal
+           close is followed by both guests re-associating, and the host hands
+           the first one back AID 1 - a legitimate reuse that a lifetime-scoped
+           check reports as a collision. Only an owner that answered within a
+           few hundred milliseconds (a live client answers every round, ~16 ms)
+           counts, so the warning means two consoles really are answering as
+           one AID at once. -1 = no console has stamped that AID yet, and
+           `aid_collision_logged` keeps it to once per AID. */
+        int  aid_owner[16];
+        u64  aid_owner_us[16] {};
+        bool aid_collision_logged[16] {};
+
         MPReplyDiag diag {};
     };
 

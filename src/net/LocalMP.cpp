@@ -147,6 +147,11 @@ LocalMP::LocalMP() noexcept :
     {
         Consoles[i].frameSem = Semaphore_Create();
         Consoles[i].answerSem = Semaphore_Create();
+
+        /* -1, not the zero the memset above leaves: "no console has stamped
+           this AID yet" is a state the collision check reads, and 0 would make
+           the first guest that answers as AID 1 look like p1's own answer. */
+        for (int a = 0; a < 16; a++) Consoles[i].aid_owner[a] = -1;
     }
 
     Log(LogLevel::Info, "MP comm init OK\n");
@@ -234,6 +239,9 @@ void LocalMP::Reset()
         memset(c.inbox, 0, kPacketQueueSize);
         memset(c.answers, 0, kReplyQueueSize);
         memset(c.answer_us, 0, sizeof(c.answer_us));
+        for (int a = 0; a < 16; a++) c.aid_owner[a] = -1;
+        memset(c.aid_owner_us, 0, sizeof(c.aid_owner_us));
+        memset(c.aid_collision_logged, 0, sizeof(c.aid_collision_logged));
         memset(&c.diag, 0, sizeof(c.diag));
     }
 
@@ -1076,6 +1084,38 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
                 Mutex_Unlock(MPQueueLock);
                 continue;
             }
+
+            /* Which console this AID belongs to, for the lifetime of the
+               session. Two consoles stamping one AID is a real defect and a
+               silent one: both answers land in the same per-AID buffer, so the
+               host's game reads whichever arrived last as that AID's answer and
+               neither client's state reaches it intact. Named once per AID, with
+               both senders, because "the third client's hand-off reused an AID
+               the other two still answer as" is exactly the thing a
+               three-console accept cannot be diagnosed without. */
+            /* Scoped to the last few hundred milliseconds, not the session:
+               a client answers every round (~16 ms), so an owner that answered
+               within this window is a console that is answering *now*. The
+               room's normal close is followed by both guests re-associating and
+               the host handing the first one back AID 1 - a legitimate reuse
+               seconds later that a session-scoped check would call a collision. */
+            const long long since = (long long)(timestamp - self.aid_owner_us[aid]);
+            const bool owner_live = (self.aid_owner[aid] >= 0) &&
+                                    (since >= 0) && (since < (long long)(kReplyStaleWindow * 8));
+            if (owner_live && (self.aid_owner[aid] != pktheader.SenderID))
+            {
+                if (!self.aid_collision_logged[aid])
+                {
+                    Log(LogLevel::Warn,
+                        "reply aid collision: p%d answered as AID %d, which p%d answered as %lld us "
+                        "earlier - both are filed into the host's AID %d buffer, so the host's game "
+                        "cannot tell their answers apart\n",
+                        pktheader.SenderID + 1, aid, self.aid_owner[aid] + 1, since, aid);
+                    self.aid_collision_logged[aid] = true;
+                }
+            }
+            self.aid_owner[aid] = pktheader.SenderID;
+            self.aid_owner_us[aid] = timestamp;
 
             self.answerRead = RingRead(self.answers, kReplyQueueSize,
                                        (self.answerRead + kReplyQueueSize - pktheader.Length) % kReplyQueueSize,

@@ -300,6 +300,16 @@ public:
         u64 loop_start_us;   // when the current stretch of rounds began
         u64 last_client_join_us;      // when the newest client associated
 
+        /* ---- AID bookkeeping (2026-10-23) ----
+
+           The host's own game states which clients a command addresses in the
+           frame itself (payload+2), and the transport polls that field narrowed
+           by `MPClientFail`. Keeping both last values is what lets a change be
+           printed once instead of every round, and a change is the readable
+           form of "the host's game has dropped this client". */
+        u16 last_cmd_mask_game;
+        u16 last_cmd_mask_poll;
+
         // last frames seen, bodies included (both roles)
         u16 last_cmd_seq;
         u16 last_cmd_len;    // body bytes, after the 24-byte 802.11 header
