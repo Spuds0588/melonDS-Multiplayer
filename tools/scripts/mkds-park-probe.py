@@ -53,11 +53,32 @@ def main():
     ap.add_argument("--ms", type=int, default=400)
     ap.add_argument("--settle", type=float, default=2.0, help="seconds to wait after each input")
     ap.add_argument("--reps", type=int, default=1, help="how many times to repeat the whole battery")
+    ap.add_argument("--samples", type=int, default=0,
+                    help="read this many snapshots before pressing anything, one every --interval s")
+    ap.add_argument("--interval", type=float, default=0.5, help="seconds between --samples snapshots")
     args = ap.parse_args()
 
     ch = Channel(args.port, timeout=60)
     for line in snap(ch, "before"):
         print(line, flush=True)
+
+    # A parked console is not a dead one until the frame counter says so, and one
+    # snapshot cannot tell "executing a black frame" from "the emulation thread
+    # has stopped and the app is re-serving its last copy". Sampling the same
+    # reads several times answers that: `frames` must climb, the program
+    # counters must be *somewhere* the game runs, and the wifi block's raised and
+    # acked counters must move if the game still services its radio. The app's
+    # own copy is counted apart (`copy beats`): a beat only happens when the
+    # picture the host is handed differs from the last one, so a beat count that
+    # climbs while both crcs stay put is the renderer producing fresh black.
+    if args.samples:
+        t0 = time.time()
+        for i in range(args.samples):
+            if i:
+                time.sleep(args.interval)
+            print(f"### sample {i + 1}/{args.samples} at t+{time.time() - t0:.1f}s", flush=True)
+            for line in snap(ch, f"sample {i + 1}"):
+                print(line, flush=True)
     for rep in range(args.reps):
         for buttons in args.press:
             for p in (1, 2):

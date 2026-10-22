@@ -100,6 +100,37 @@ message, which v0.1.9cd located and could not reach - match a handler in the
 table at `0x6018A40` against the type MKDS's ARM9 dequeues at the wall, and find
 what writes `ctx+0x3F4`.
 
+**The black page itself is now measured, and the console is not running the
+game on it (v0.1.9dw).** A two-console park after CUT OFF + VS, read five times
+a second apart: emulated frames climb **16,811 -> 16,931 in 2 s on both
+consoles** while **`pc9 FFFF0238` and `pc7 0000115C` - the BIOS wait on both
+CPUs - never move**, and every wifi counter is identical across the same 2 s
+(the radios are off: `link mask 0x0`, the host handed a `00C0` deauth). The
+picture is not a stale copy: the app reports `changed 2754x last 10844` against
+frames at 16,931, so the last change is the frame the game cleared to black and
+the same black has been carried for ~6,000 frames. The memory the park waits on:
+gate `ctx+0x3F4` = **0**, wifi context queue `ctx+0x188` = head `0x0380B700` /
+tail `0x0380B7C0` (**192 undrained bytes between them**), ARM9 netcode queue
+`0x2173300`/`0x21732AC` = `0x40`/`0x40` (empty). Two consequences: "frames still
+advancing" is **not** evidence a game is running - these frames are an idle
+console - so the fps clause of the hardware rule has to be read beside the CPUs'
+own state; and the two-console park is two states (radios up and polling vs
+radios off and idle) that look identical on screen.
+
+**No other title in `Test Roms/` reached four-console gameplay this pass
+(v0.1.9dw survey).** All four consoles boot and read only their own input on
+both titles below, so the app's side holds; what is missing is a route.
+*Meteos:* four consoles reach the main menu (SIMPLE / STAR TRIP / TIME WAR /
+DELUGE / TUTOR); SIMPLE is a **single-player** rules page and the `WIRELESS`
+button the record claimed at bottom-left `(60,108)` is **STAR TRIP** on this
+build, so no wireless entry was found. *Diddy Kong Racing DS:* four consoles
+reach the game-type wheel (`SINGLE PLAYER`, or `OPTIONS` after one RIGHT) and it
+would not rotate further to any D-pad, L, or rim tap. **So the four-console
+playable set is still empty**; the cheapest route to a playable result is a menu
+that draws a wireless entry, which both of these do not - the next candidates
+are Club House Games' per-game multiplayer list and Mario Hoops 3 on 3, and
+both need a route discovery pass before any session is worth running.
+
 **What the guest is waiting for is now measured, and it is the host game's own
 data (v0.1.9bi).** The host's directed commands come in two forms, and the one it
 uses is the *host game's* own TX-slot write, passed to the link at the length the

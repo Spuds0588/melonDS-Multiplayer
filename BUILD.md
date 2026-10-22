@@ -1803,7 +1803,13 @@ space asked for (`--var ADDR[:LEN]` on both consoles in one window), and
 `tools/scripts/arm7-ctx-watch.py` traces the wifi context's fields (the gate and
 the queues at `+0x188`/`+0x1F4`/`+0x200`, plus the `+0x300` pointers) live, one
 row per console per sample, so "is this ever nonzero" is answerable over a whole
-session rather than at one instant. Three traps this pass paid for: the ARM7's
+session rather than at one instant. The probe's `--samples N --interval S` reads
+the same snapshot N times before pressing anything, which is the difference a
+single read cannot show: `frames` climbing while `pc9`/`pc7` never move is a
+console whose emulator is running and whose game is not (the BIOS wait, with the
+picture frozen at its last change), and `copy ... changed Mx last <frame>` dates
+that change - what separates a parked game from a stopped emulator and from a
+stale buffer (v0.1.9dw, history.md). Three traps this pass paid for: the ARM7's
 `0x06000000` window is **VRAM** in melonDS's map and MKDS maps its wide ARM7 wifi
 library into it, so its 128 KB image plus its data tail is what `mem --cpu 7`
 returns there (`0x06020000`-`0x0603FFFF` is zero, `0x06040000+` is the image's
