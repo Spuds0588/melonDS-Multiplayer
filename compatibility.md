@@ -2855,6 +2855,38 @@ attempted against the blind check and are not counted; no fifth ordering was run
 Three-player multi-card play needs a fix in the title's room state machine (the
 place the `01 8D` rule-set flag is written), not another press order.
 
+### 2026-10-22e — the room ends itself on one host command, pressed or not: the confirm press was never the trigger
+
+Corrects 2026-10-22d. The four confirmation orders were all run at three
+consoles with the setup table confirmed from the host's own `F6` command and every
+press proven landed on its first attempt (order, table, outcome): 1,2,3 (43 `F6`),
+2,3,1 (30 `F6`), 2,1,3 (21 -> 24 `F6`, 9 deauth lines), 3,1,2 (12 -> 15 `F6`, 9
+deauth lines). All four end the room; none starts a match; all three consoles stay
+within a frame of each other (p1 2298, p2 2299, p3 2299) with `LINK ACTIVE` up to
+the deauth (`accept-trace.txt` section 6, `ord-213_end.png`, `ord-312_end.png`).
+
+**The no-press control is what changes the reading.** The same room, the same
+table, nothing pressed for 45 seconds, dies anyway: all three consoles land on the
+game's own "A communication error has occurred" (`ctl_nopress_table.png`,
+`ctl_nopress_error.png`). What ends it is one host command,
+`06 01 06 00 03 11 05 00 00 00 00 4E 06 00` (sent in a 12-frame burst); each
+guest's game clears its association on it (`guest set its AID to 0 ... it has
+nothing to answer with`), arms its deauth slot and writes `reason 0003`, and the
+host then broadcasts `0003`. Presses change *when* the host reaches that command
+(+34.4s with presses, +41.9s without), not whether.
+
+It is a different body family from the one the two-console match started from in
+2026-10-22c (`F6 00 02 00 04 9D ...`); after the guests have left the host does
+reach `F6 00 02 00 05 9D 07 00 ...` with its mask down to `0002`. A two-console
+re-run of the same driver this pass died the same way (`06 01 02 00 03 11 05 00 00
+00 00 4E 02 00` at +29.4s, `ctl_2p_end.png`), so 2026-10-22c's working two-console
+match stands as one run, not as a control the driver reproduces.
+
+**Three-player multi-card play needs** the host's room bookkeeping to accept the
+third console's `01 8D` answer instead of abandoning the room with that `06 01 ...`
+command - the same place the answer flag is written - not another press order,
+reply window or transport change.
+
 ### 2026-10-22d — the guests' answer flag is their own rule-set state, and the press that completes the set is what still ends the room
 
 Corrects 2026-10-22c. In a three-console room, a guest pressing A on its own
