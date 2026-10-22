@@ -99,6 +99,9 @@ def main():
     ap.add_argument("--host", type=int, default=1, help="1-based console that hosts")
     ap.add_argument("--start", action="store_true",
                     help="press A through the room's setup table to start the match")
+    ap.add_argument("--hold", action="store_true",
+                    help="stop with every guest in the room and the host's start press "
+                         "not made, so a caller can time that press itself")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = ap.parse_args()
 
@@ -160,6 +163,13 @@ def main():
                 f"p{p.p}: still on the multiplayer page - the JOIN touches never "
                 "landed (see joined shot)")
     print(f"{len(guests)} guest(s) left the join browser", flush=True)
+
+    if args.hold:
+        for p in pads.values():
+            p.shot("in-room")
+        print("holding: every guest is in the room; the host's A has not been pressed",
+              flush=True)
+        return 0
 
     # 4. the host's A turns the waiting screen into the setup table, but only
     #    once each guest's own game has finished associating: pressed too early

@@ -884,7 +884,7 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   Prime - Hunters, Mario Kart DS and LEGO Star Wars II run with no joiner and no
   frame of ours on their link.
 * **`MD_REPLY_BUDGET_FRAMES` caps what one frame may spend inside reply waits**
-  (default **2** = two emulated frames, ~33ms; negative = no cap, the same thing
+  (default **4** = four emulated frames, ~67ms; negative = no cap, the same thing
   `MD_REPLY_BUDGET_NS=-1` means in the harness). It is in *emulated frames*,
   which is the unit the budget is stated in - it was called `MD_REPLY_BUDGET_MS`
   while its value was read as a frame count, so a sweep at `17` bought 17 frames
@@ -908,6 +908,18 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   have waited 2ms ... only 33000us of slack left" - there the budget was never
   the binding constraint, which is exactly what an over-tight ceiling looks
   like.)
+  **Changed 2026-10-22, and why: the budget only binds windows nobody is
+  answering.** Its clock starts at the frame's beginning while the poll it
+  guards is sent mid-frame, so two frames of budget left about one frame of
+  waiting - and a peer answers from inside the same emulated round on its own
+  thread. At three consoles on Tetris DS's card room (defaults 34ms / 2 frames)
+  that lost 1,062 of 3,463 windows (30.7 % of the host's acks said `clientfail`,
+  against 0.6 % at two consoles) and the game retransmitted one Download Play
+  packet until both guests left; 67ms / four frames, with the caps applied only
+  while the polled mask has a client that answered in the last four rounds
+  (`LocalMP::RecvReplies`), opens the room on all three at 59.7-59.9 fps. A
+  window whose clients have all gone quiet keeps both old caps (one frame, and
+  whatever the frame has left), which is the case this budget was written for.
 * **Each console has its own MAC.** `md_load_rom` assigns a per-slot MAC out of
   the firmware image (slot 0 keeps the firmware's, the rest get offsets - the
   same scheme melonDS's Qt frontend uses for its extra instances), because two

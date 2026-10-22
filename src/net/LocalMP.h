@@ -192,6 +192,15 @@ private:
         u32  answerWrite = 0;
         Platform::Semaphore* answerSem = nullptr;
 
+        /* When each aid's last real answer was credited to this console, in
+           this console's own US-tick domain (the timestamp Wifi hands
+           RecvReplies). Zero means "never". RecvReplies reads it to tell a
+           poll that is waiting on clients which are answering from one that
+           is waiting on a client which has gone quiet: the first wait is time
+           the peers were spending anyway, the second is frame rate thrown
+           away (2026-10-22, LocalMP.cpp's reply-window cap). */
+        u64  answer_us[16] {};
+
         MPReplyDiag diag {};
     };
 

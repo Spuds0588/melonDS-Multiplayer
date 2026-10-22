@@ -194,6 +194,7 @@ void LocalMP::Begin(int inst)
        private epoch would buy nothing - while a log line showing more reads
        than deliveries reads as a contradiction. */
     memset(&self.diag, 0, sizeof(self.diag));
+    memset(self.answer_us, 0, sizeof(self.answer_us));
 
     Mutex_Unlock(MPQueueLock);
 }
@@ -232,6 +233,7 @@ void LocalMP::Reset()
         c.bytes_delivered = 0;
         memset(c.inbox, 0, kPacketQueueSize);
         memset(c.answers, 0, kReplyQueueSize);
+        memset(c.answer_us, 0, sizeof(c.answer_us));
         memset(&c.diag, 0, sizeof(c.diag));
     }
 
@@ -900,26 +902,80 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
     for (;;)
     {
         /* Waiting for a reply is wall-clock time spent inside an emulated
-           frame, so it is only allowed to eat the slack the frame had anyway.
-           Spending it freely once took a live MKDS join (1436 commands, 363
-           empty windows) down to 9fps, because every peer console then waits
-           for the slow one at the lockstep barrier and the host's own reply
-           latency grows with the cost of a frame - the wait feeds itself. With
-           a budget published per frame, an answer the peer cannot produce
-           inside this frame's slack is an answer this frame does not get. */
+           frame. Spending it freely *on a client that is not answering* once
+           took a live MKDS join (1436 commands, 363 empty windows) down to
+           9fps, because every peer console then waits for the slow one at the
+           lockstep barrier and the host's own reply latency grows with the
+           cost of a frame - the wait feeds itself. So both the per-window
+           ceiling and the per-frame budget below still apply to a window that
+           nobody is answering; see the `answering` test under them for the
+           case they must not apply to. */
         int waitms = ReplyTimeout;
-        const long long budget_ns = GetReplyBudgetLeft(inst);
-        if (budget_ns >= 0)
+
+        /* ... and only while the clients this poll names are the ones that have
+           been answering.
+
+           A wait is worth its wall clock when it is covering a peer's own
+           progress: the peer answers this command from inside the same
+           emulated round, on its own thread, so the host's wait is time the
+           group had to spend anyway. It is pure loss when the client has gone
+           quiet - nobody is going to post that semaphore, and the frame rate
+           pays for every millisecond of it.
+
+           Measured at three consoles on Tetris DS's card room (2026-10-22):
+           with this cap applied to every window, 1,062 of 3,463 windows came
+           back empty - exactly the number of `clientfail` bits the host's own
+           CMD ACK reported - and the game answered that 30% loss rate by
+           retransmitting one Download Play data packet until both guests gave
+           up with `reason 0003`. The same route with the same two guests, the
+           cap lifted only by making the budget unbounded, opened the room's
+           setup table on all three consoles at 59.7fps each with 30 failures
+           in 428 acks. The difference is not `clientfail` being tolerated; it
+           is that the peers were answering all along and the window gave up
+           on them one round early. */
+        constexpr u64 kAnsweringRecent = 4 * 16715; // four emulated frames, in us
+        constexpr int kQuietWaitMs = 16;             // one emulated frame
+        bool answering = false;
+        for (int a = 1; (a < 16) && !answering; a++)
         {
-            const int budget_ms = (int)(budget_ns / 1000000);
-            if (budget_ms < waitms)
+            if (!(aidmask & (1 << a)) || !self.answer_us[a]) continue;
+            /* A negative age is an answer stamped later than this console's
+               own clock - still recent, see kReplyStaleWindow. */
+            if ((long long)(timestamp - self.answer_us[a]) < (long long)kAnsweringRecent)
+                answering = true;
+        }
+
+        /* A window that is waiting on a client which is answering gets its
+           full ceiling: the peer is producing this round's answer on its own
+           thread and the group cannot go on without it. A window with no
+           recent answer from anyone it names is the case the per-frame budget
+           was written for, and it keeps both caps - one frame, and whatever
+           the frame has left. */
+        if (!answering)
+        {
+            if (waitms > kQuietWaitMs)
             {
                 if (trace_replies())
                     Log(LogLevel::Debug,
-                        "reply window: p%d would have waited %dms for a reply, but this frame only has "
-                        "%lldus of slack left (nothing waiting, collected=%04X so far)\n",
-                        inst + 1, waitms, budget_ns / 1000, ret);
-                waitms = budget_ms;
+                        "reply window: p%d's mask %04X has no client that answered in the last "
+                        "%lluus - waiting one frame, not %dms\n",
+                        inst + 1, aidmask, (unsigned long long)kAnsweringRecent, waitms);
+                waitms = kQuietWaitMs;
+            }
+
+            const long long budget_ns = GetReplyBudgetLeft(inst);
+            if (budget_ns >= 0)
+            {
+                const int budget_ms = (int)(budget_ns / 1000000);
+                if (budget_ms < waitms)
+                {
+                    if (trace_replies())
+                        Log(LogLevel::Debug,
+                            "reply window: p%d would have waited %dms for a reply, but this frame only "
+                            "has %lldus of slack left (nothing waiting, collected=%04X so far)\n",
+                            inst + 1, waitms, budget_ns / 1000, ret);
+                    waitms = budget_ms;
+                }
             }
         }
 
@@ -1025,6 +1081,7 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
                                        (self.answerRead + kReplyQueueSize - pktheader.Length) % kReplyQueueSize,
                                        &packets[(aid-1)*1024], pktheader.Length);
             ret |= (1 << aid);
+            self.answer_us[aid] = pktheader.Timestamp;
             self.diag.collected++;
 
             if (trace_replies())

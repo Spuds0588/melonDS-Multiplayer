@@ -1571,8 +1571,19 @@ fn start_session_inner(
         // wait returns the instant a reply is posted, so a healthy session pays
         // nothing for the larger bound.
         // Override with MD_REPLY_TIMEOUT_MS to sweep without a rebuild.
+        // ... and the ceiling is four emulated frames, not two, because a peer
+        // answers from inside the same emulated round on its own thread and
+        // with more than one console on the bus it lands late in wall clock:
+        // measured 2026-10-22 on Tetris DS's three-console room, where a 34ms
+        // ceiling lost 1,062 of 3,463 windows (30% of the host's acks said
+        // `clientfail`) and the game retransmitted one packet until every
+        // guest left; 67ms opened the room on all three at 59.7fps. The wait
+        // returns the instant an answer is posted, and LocalMP only spends it
+        // on clients that have answered within the last four rounds - see the
+        // reply-window cap in LocalMP::RecvReplies for why that pair is the
+        // whole fix and what it protects.
         md_link_set_recv_timeout(0);
-        const DEFAULT_REPLY_TIMEOUT_MS: i32 = 34;
+        const DEFAULT_REPLY_TIMEOUT_MS: i32 = 67;
         let timeout_override = std::env::var("MD_REPLY_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.trim().parse::<i32>().ok())
@@ -1597,12 +1608,18 @@ fn start_session_inner(
         // unbounded costs: 1436 commands asked for replies inside 15s, 363 of
         // those windows were empty, and at a 34ms ceiling that is 12.3s of the
         // 15s spent blocked - the session ran at 9fps and every peer waited for
-        // it at the lockstep barrier. A frame is now allowed to spend up to two
+        // it at the lockstep barrier. A frame is now allowed to spend up to four
         // of its own frames' worth of wall time waiting for replies, which is
         // what the per-window bound was trying to say in the first place: on
         // schedule the wait eats idle slack, off schedule the frame comes
-        // first and the game hears `clientfail` the usual way. See
-        // MPInterface::SetReplyBudget.
+        // first and the game hears `clientfail` the usual way. Four rather than
+        // two because this budget's clock starts at the frame's beginning while
+        // the poll it guards is sent mid-frame, so half of a two-frame budget
+        // was already spent before the window opened - and at three consoles
+        // that was the difference between 30% `clientfail` and 7% (Tetris DS,
+        // 2026-10-22; LocalMP::RecvReplies carries the measurement and the
+        // client-liveness test that keeps this from being paid on a quiet
+        // peer). See MPInterface::SetReplyBudget.
         // Override with MD_REPLY_BUDGET_FRAMES to sweep without a rebuild, or
         // set it negative to leave the waits unbounded (the same thing
         // MD_REPLY_BUDGET_NS=-1 means in the harness). The knob counts
@@ -1613,7 +1630,7 @@ fn start_session_inner(
         let frames_of_slack = std::env::var("MD_REPLY_BUDGET_FRAMES")
             .ok()
             .and_then(|v| v.trim().parse::<i64>().ok())
-            .unwrap_or(2);
+            .unwrap_or(4);
         REPLY_BUDGET_NS.store(
             if frames_of_slack < 0 {
                 -1

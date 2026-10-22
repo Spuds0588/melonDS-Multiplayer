@@ -17,7 +17,47 @@ item. The bar is an **in-game match with the link healthy** — a live link that
 never reaches a match is not done, and neither is a game whose own screen ignores
 both consoles' input.*
 
-**2026-10-22, the menu wall was an instrument gap, and it is closed.** The
+**2026-10-22, second pass: the three-console acceptance was the host's reply
+window giving up one round early, and the party now reaches the game's own mode
+select.** The two-console accept and the three-console accept were traced side by
+side on the wire (same ROM, same route, `MD_LINK_VERBOSE=1`): both guests were in
+the host's room and answering (p2 3,323 of 3,459 polls, p3 3,016 of 3,463; 5,948
+real replies collected, zero firmware stand-ins), and the difference was the
+host's acks - 18 `clientfail` of 3,154 at two consoles, **1,062 of 3,463 (30.7 %)
+at three**. The log line behind every one of those is `would have waited 34ms for
+a reply, but this frame only has ~27ms of slack left`: the per-frame reply budget
+starts at the frame's beginning while the poll it guards is sent mid-frame, so a
+two-frame budget leaves about one frame of waiting, and a peer answers from
+inside the same emulated round on its own thread. The game reads 30 % loss as a
+lost packet and retransmits **one** Download Play `04` DataPacket (packet 0,
+`"NINTENDO"`) until both guests leave with `reason 0003` - so the download-image
+packet is a consequence of the failed round, not a separate defect, and it now
+enters the path only after the window has already lied about a client.
+
+**The fix** (`src/net/LocalMP.cpp`, `src-tauri/src/lib.rs`): the reply timeout is
+four emulated frames (67 ms) and the per-frame budget four frames instead of two,
+and both caps now apply only to a window **nobody is answering** - `RecvReplies`
+keeps the timestamp of the last credited answer per AID and lets a window wait its
+full ceiling only while the mask it polls has a client that answered within the
+last four rounds. A quiet client keeps the cheap behaviour, so the 2026-09-25
+MKDS 9 fps case the budget was written for stays protected. Measured with the
+shipped defaults, no overrides: **three consoles open the setup table on all
+three (7.8 % `clientfail`) at 59.7-59.9 fps each, then reach the game's LINK mode
+select (STANDARD / PUSH / TOUCH / PUZZLE / CATCH / MISSION) on all three at the
+same frame rate**, with the host's `F6` match protocol running and every poll
+collected. The two-console arm is unregressed: setup table on both, a live
+STANDARD match (boards falling, 0.7 % `clientfail`, 59.8 fps each).
+
+**What is still open: the confirm press.** From the mode select, confirming a mode
+takes the room down - all three consoles land on the game's own "A communication
+error has occurred", both guests after their own deauth `reason 0003`, with the
+link clean to the last frame (commands, replies, acks and beacons all counted, no
+stale drops, no re-anchor drops). The next measurement is that press: which
+command carries it, what each console's own game does between it and the error,
+and whether the same press at two consoles (where it starts a match) differs only
+in the number of clients or in its timing.
+
+**2026-10-22, first pass: the menu wall was an instrument gap, and it is closed.** The
 control channel now has `snapshot`/`restore` (the bridge's savestate, taken on
 the console's own thread between frames) and `tools/scripts/menu-map.py` sweeps a
 front end systematically - every button, five two-button presses and a 32-pixel
