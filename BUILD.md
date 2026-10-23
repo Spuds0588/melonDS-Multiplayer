@@ -1427,7 +1427,12 @@ reusable as-is: it drives 2-4 Tetris DS consoles from boot to the game's own
 card room (main menu rows at bottom y=40/70/96/124/152, every row needing two
 touches - the first highlights, the second enters - then INVITE `(110,50)` /
 STANDARD `(110,56)` on the host, JOIN `(110,110)` plus `A` on the room entry for
-each guest). `--start` presses A through the room's setup table.
+each guest). `--start` presses A through the room's setup table. Its join check
+is a panel-change test, and a room list that is still animating passes it: on
+2026-10-23 a two-console run reported "left the join browser" with the guest
+still on "Searching...", never associated, and then failed its first press with
+nothing wrong in the link. Before blaming a route that dies early, read the
+guest's own `association requested` line (`MD_LINK_VERBOSE=1`).
 
 **Real time passes between two driver commands.** There is no pause: a console
 keeps emulating while a driver reads a screenshot, so a route that inspects
