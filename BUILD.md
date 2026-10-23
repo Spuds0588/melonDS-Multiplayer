@@ -920,7 +920,7 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   (`LocalMP::RecvReplies`), opens the room on all three at 59.7-59.9 fps. A
   window whose clients have all gone quiet keeps both old caps (one frame, and
   whatever the frame has left), which is the case this budget was written for.
-* **`MD_REPLY_DEFER_FRAMES` holds a host round open until its clients have
+* **`MD_REPLY_DEFER_FRAMES` (default 3) holds a host round open until its clients have
   answered** (default **3** emulated frames; 0 turns it off). This is the reply
   rendezvous, and it is the path the host takes whenever a command's first poll
   leaves an addressed client uncredited: `Wifi::ProcessTX` phase 14 keeps
@@ -938,6 +938,15 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   up and exactly those three acks report `clientfail`, which is how the
   violation path is exercised. Healthy rounds never enter phase 14, so a
   two-console session's traffic is unchanged.
+  **What it costs, measured 2026-10-23:** at three consoles the room still runs
+  59-60 fps with the rendezvous on; at four consoles, holding all four guests
+  costs the room its frame rate - **14 fps** against **39-42 fps** with the
+  rendezvous off (where 85 of 622 acks, 13.7%, report a failed client and the
+  room collapses to the menus). The bound is not the lever: a 1-frame budget
+  gives the same 14 fps and 1/685 failed acks. The reply digest's
+  `reply_defer_us` measures 0.4 emulated frames per held round (~2% of the
+  session), which does not explain the wall-clock difference, so treat the
+  four-console cost as measured but not yet accounted for.
 * **`MD_REPLY_EXTEND_FRAMES` lets a window outlive its ceiling for a client that
   has not taken its own round yet** (default **0**, i.e. never). When a window's
   ceiling expires with answers still owed, `LocalMP::RecvReplies` asks a question
