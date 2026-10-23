@@ -12,7 +12,7 @@ single-console play.
 > healthy around them. Several titles below clear the wire and stop at the
 > game's own screen — that is recorded as its own result, not rounded up.
 
-- Last updated: 2026-10-23, twenty-fourth pass (the route's "setup table" proof was a false positive and is replaced: it only tested that the host's bottom panel moved, which the title's start handshake also does while the top screen still shows the waiting page - so eleven saved "table/setup" frames were re-scored and **one** is a table, and with an honest gate the two-cart start handshake is **15 wins in 20 trials** with the guest's own join-data chunk advancing past 08 as the only thing that separates them) (the Download Play reading of Tetris DS's start press is retired: the same 264-byte `06 01 <mask> 00 80 11 04 00 00 00 00 4E 49 4E 54 45 4E 44` handshake is sent at 2, 3 and 4 carts, and the two-cart run that plays sends it too - the card room's start is a data transfer at every count, and today's two-cart control failed it in the same shape as four carts, so player count is not the discriminator) (Tetris DS's four-console party assembles on this machine - host room listing Player 1-4, all three guests on "Accepting players now" - and then the host's own start press hands the room the download-image packet, drops its own mask to 0000 and returns all three guests to the join browser: 0 matches in one live run, with the link clean at clientfail 0; the room body is re-advertised 1.15 s after the close and read by every guest, so the browser's missing piece is its own scan, not the host's advertisement) (Tetris DS reached a live **four-console STANDARD match** for the first time, on the unchanged binary, after tracing the room's close: every guest's re-association is accepted with its AID and the host's mask returns to 000E; the same route on the next run re-formed the same room and took no press, so the match is real but not yet reproducible) (Tetris DS two-cart play is reproducible and reaches a live match - re-confirmed this pass, 1,607 match commands - while three and four carts end on the host's own room close, which lands 0.86-6.5 emulated s after each guest associates and is followed by the guests' return at two consoles and by none, or by a second close, at three and four; NSMB's host windows ran under the ask-once policy for the first time)
+- Last updated: 2026-10-23, twenty-fifth pass (the save confound is retired by an A/B with equal arms - pin 7 wins/1 loss against written 8 wins/0 losses, Fisher p = 1.0 - and the start press's lock is localised: in a storm the guest's own software is handed 1,248 copies of the host's 264-byte start packet and its game reads the body of **none** of them, while every win reads the body of every packet sent; the join-data chunk is neither necessary (abw3 won at 08) nor sufficient (t2t3 lost at 0B)) (the route's "setup table" proof was a false positive and is replaced: it only tested that the host's bottom panel moved, which the title's start handshake also does while the top screen still shows the waiting page - so eleven saved "table/setup" frames were re-scored and **one** is a table, and with an honest gate the two-cart start handshake is **15 wins in 20 trials** with the guest's own join-data chunk advancing past 08 as the only thing that separates them) (the Download Play reading of Tetris DS's start press is retired: the same 264-byte `06 01 <mask> 00 80 11 04 00 00 00 00 4E 49 4E 54 45 4E 44` handshake is sent at 2, 3 and 4 carts, and the two-cart run that plays sends it too - the card room's start is a data transfer at every count, and today's two-cart control failed it in the same shape as four carts, so player count is not the discriminator) (Tetris DS's four-console party assembles on this machine - host room listing Player 1-4, all three guests on "Accepting players now" - and then the host's own start press hands the room the download-image packet, drops its own mask to 0000 and returns all three guests to the join browser: 0 matches in one live run, with the link clean at clientfail 0; the room body is re-advertised 1.15 s after the close and read by every guest, so the browser's missing piece is its own scan, not the host's advertisement) (Tetris DS reached a live **four-console STANDARD match** for the first time, on the unchanged binary, after tracing the room's close: every guest's re-association is accepted with its AID and the host's mask returns to 000E; the same route on the next run re-formed the same room and took no press, so the match is real but not yet reproducible) (Tetris DS two-cart play is reproducible and reaches a live match - re-confirmed this pass, 1,607 match commands - while three and four carts end on the host's own room close, which lands 0.86-6.5 emulated s after each guest associates and is followed by the guests' return at two consoles and by none, or by a second close, at three and four; NSMB's host windows ran under the ask-once policy for the first time)
 - Legend: ✅ playable · 🟡 partial (link or lobby, no match) · ⛔ blocked by
   single-card *Download Play* (not supported **yet** — it is a planned feature,
   Milestone 4 of [to-do.md](to-do.md#the-road-to-a-working-2-3-and-4-player-link)) ·
@@ -2842,6 +2842,56 @@ Past the boot both consoles show the STANDARD lobby with a 2-player roster, the 
 
 First boot writes the game's save (new `Test Roms/Tetris DS (USA).sav`; supervisor-pinned, exit 0). Higher player counts (the title supports up to 10 over Download Play) and the other modes (MISSION, PUSH) are unmeasured.
 
+### 2026-10-23 (v0.1.9ew) — the save is not the variable, and the start press locks because the guest's game will not read the start packet's body
+
+Two questions were left open: does the card's save decide the outcome (the eight-win
+streak began right after a restore), and where does the storm actually live. Both
+are answered on the same arm, one binary and one route (`game-captures/tetris-savab-2026-10-23/`).
+
+**The save A/B** (`tools/scripts/tetris-sav-ab.py`): every trial restores a known
+save, checks its md5, boots, runs the route once; arms alternate, 8 trials each.
+
+| arm | save | wins | losses |
+|---|---|---|---|
+| pin | `a3c0bc2c…` (pinned) | 7 | 1 |
+| written | `7866ada3…` (written by the game at 10:26) | 8 | 0 |
+
+Fisher exact two-sided **p = 1.0**: the arm carrying the supposedly bad save won
+every trial. The save story is retired. Health: 59.8-59.9 fps both consoles in all
+16, app CPU 0.78-0.96 cores, route wall 39.6-46.4 s. Six more trials (3 per arm)
+also won, so **0 storms in 22 trials** against 2 in the first 14 of the previous
+block - the storm is rarer than last pass's numbers suggested, and this pass could
+not reproduce one live.
+
+**Where the lock is** (`tools/scripts/stall-report.py`, new):
+
+| | storm (t2t6) | win (abw3) |
+|---|---|---|
+| start packets the host sent | 1,248 | 3 |
+| handed to the guest's own software | **1,248 x 288 B** | 3 x 288 B |
+| start-packet bodies the guest's game read | **0** | **6** |
+| command reads (header-only / body) | 8,814 / 4 | 7,776 / 10 |
+| guest answers, chunks written | 1,465, chunk 08 only | 168, `00->07->08` |
+| guest clock at the end of the stall | reading at 35.287 s | match at 44.71 s |
+
+The guest's radio and the link hand its game every copy of the packet; the game
+reads each 6-halfword header and declines the payload, 1,248 times, while its
+answer stays at chunk 08. Every win reads the body of **every** packet the host
+sends. That also corrects v0.1.9ev's separator: abw3 won with its chunk at 08 and
+t2t3 lost after reaching 0B, so the chunk number is a side effect of how far the
+guest's own upload had got, not the gate.
+
+**The one loss this pass (abp3)** was a different failure: the press moved nothing
+twice, the host stayed on the waiting page (123/255, Player 1 listed), the guest
+was back on the join browser, and the host sent **no start packet at all**. Both
+consoles ran 59.9 fps and advanced 308 frames each in the 5 s after the abort, so
+only the party was dead. Screens: `shots/abp3-stall-{host,guest}.png`.
+
+**Named, not fixed:** the lock is inside the guest's own game, so no protocol knob
+is turned against it. The next measurement is the guest's `W_RX_*` length/offset
+registers at the moment it header-reads a start packet, compared between a win and
+a storm.
+
 ### 2026-10-23 (v0.1.9ev) — the "setup table" proof was a false positive, and with it honest the two-cart start handshake is 15 wins in 20 trials whose only separator is the guest's own join-data chunk
 
 The route proved the stage with `press_proven(0x1, "setup table")`, whose only test
@@ -2895,7 +2945,15 @@ fastest storm (t2t2 35.7 s vs t2t6 35.5 s):
 
 So the separator is not the wire, the load or the frame rate (the sampled block ran
 at 59.8 fps with CPU 0.04-0.07 cores above the storm's, the same order as the run-to-run spread): it is whether the guest's
-own game advances its join-data chunk past 08. Wins are not one recipe
+own game advances its join-data chunk past 08.
+
+**Correction (v0.1.9ew, one pass later): the chunk is not the separator.** abw3
+reached a match with `chunks=00->07->08` (no 0A, no 0B) and t2t3 lost after reaching
+0B, so chunk movement is neither necessary nor sufficient. The variable every win
+shares is the guest's game **reading the body of the host's start packet** - 4-6
+reads for the 2-3 packets sent - against **0 body reads for 1,248 packets** in the
+storm, with the frames delivered to the guest's software 1,248 times. The section
+below carries that measurement. Wins are not one recipe
 either - seven landed on 0B, **two on 0A**, and t2w1 needed 5 start packets and 294
 continues. Nothing in this tree gates that chunk, so no source change follows from
 it; and t2t3 shows a completed transfer (chunk 0B, room body) can still die at the
