@@ -2865,10 +2865,11 @@ land on `A communication error has occurred` (`please-wait-then-error.png`). The
 one measured transport asymmetry is the rate at which a guest puts *nothing* on
 the wire for a round: the host's ack reports a failed client in 6.3% of rounds at
 three consoles (30 of 475) against 0.3% in the two-console control (15 of 4,394).
-Each of those rounds is a window that closed `collected=0002` because the other
-guest never sent a reply - not a reply the transport lost, a reply that was never
-there. The ack line that measures this (`[mp] ack sent: cmdcount ... clientfail
-... last window credited ...`, verbose-gated) is new in `SendMPAck`.
+None of the 30 is a reply the transport lost: 20 closed with `collected=0000` (no
+client answered that round at all - the host's next command overtook a guest
+that answers on its own cadence) and 9 with one client's reply; the window's own
+trace says so. The ack line that measures this (`[mp] ack sent: cmdcount ...
+clientfail ... last window credited ...`, verbose-gated) is new in `SendMPAck`.
 
 **Verdict:** the record is not dropped by the guest, the host, or the bus - all
 three are on the record and in step - so the three-player start's gate is the
