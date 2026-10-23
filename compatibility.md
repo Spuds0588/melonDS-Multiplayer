@@ -2870,7 +2870,9 @@ sequence** fields - the whole 36-byte prefix, i.e. the 12-byte header and the
 24-byte 802.11 header - and not one byte of the MP body, which begins at offset
 36. The winning run's driver makes the same six accesses and then two more
 passes into the payload (offsets 106 and 234), so the decision is downstream of
-reads that are identical in both arms. It also sharpens v0.1.9ew's "header-only,
+reads that are identical in both arms. A fresh win on the rebuilt app
+(`logs/fd2.log`, 3 copies of the same packet) reproduces the win's signature
+exactly: the same six accesses, 128 halfword reads, deepest offset 234. It also sharpens v0.1.9ew's "header-only,
 3-6 halfwords": the counter is 6 for every storm copy, and 6 accesses reach the
 last field before the payload, not just the first three words.
 

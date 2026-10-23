@@ -30,7 +30,7 @@ what the game actually took, and `--depth` reports it: that is what separates a
 guest that stopped at the frame header from one that read the payload.
 
 Usage:
-    tools/scripts/delivery-field-diff.py WIN.log STORM.log [--player 2]
+    tools/scripts/delivery-field-diff.py WIN.log STORM.log [--player 2]   # the guest's `pN` label
     tools/scripts/delivery-field-diff.py A.log.gz B.log.gz --json out.json
 """
 
@@ -183,7 +183,7 @@ def report(paths, player, body_len):
         if st is not None:
             st["reads"] = rd
         out[path] = st
-        print("== %s (console %d)" % (path, player + 1))
+        print("== %s (console p%d)" % (path, player))
         if st is None:
             print("   no %d-byte frame delivered to this console in this log" % (body_len + 24))
             continue
@@ -263,7 +263,8 @@ def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("logs", nargs="+", help="melonDS logs (plain or .gz), a win first and a storm second")
     ap.add_argument("--player", type=int, default=2,
-                    help="0-based index of the console under study (default 2: the guest in a 2-console run)")
+                    help="the console's label in the log: 2 studies `p2`, the guest in a 2-console run"
+                         " (default 2); a 3- and 4-console log wants the guest's own label")
     ap.add_argument("--body-len", type=int, default=264,
                     help="payload length of the frame under study (default 264: Tetris DS's start packet)")
     ap.add_argument("--json", help="also write the collected numbers here")
