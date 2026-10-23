@@ -195,6 +195,9 @@ Two boundaries worth stating because over-eager cleanup is worse than none:
 - Status updates are succinct and bullet-pointed: what you found, what it
   means, what you will do next. No play-by-play, no status-line chatter.
   One short prose line plus bullets beats a paragraph every time.
+- For questions about melonDS core: Refer to original melonDS project channels
+- For project-specific questions: Use GitHub Issues
+- Discord: TBD
 
 ### Wrap-up format (every completed task)
 
@@ -218,10 +221,6 @@ substitute for a bullet list.
 
 - One or two concrete next steps, most valuable first, each with the reason it
   is next. Recommendations only - do not start them in the same turn.
-
-- For questions about melonDS core: Refer to original melonDS project channels
-- For project-specific questions: Use GitHub Issues
-- Discord: TBD
 
 ## Legal Notes
 
