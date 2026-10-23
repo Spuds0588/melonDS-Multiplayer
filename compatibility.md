@@ -2841,6 +2841,44 @@ Past the boot both consoles show the STANDARD lobby with a 2-player roster, the 
 
 First boot writes the game's save (new `Test Roms/Tetris DS (USA).sav`; supervisor-pinned, exit 0). Higher player counts (the title supports up to 10 over Download Play) and the other modes (MISSION, PUSH) are unmeasured.
 
+### 2026-10-22j — the guest panel is swept with the menu harness and nothing on it moves the room: the answer byte follows the host's packet, and the host's game never leaves its three-player roster while both guests are credited
+
+`tools/scripts/tetris-rules-sweep.py` (new) reuses `menu-map.py`'s machinery -
+the bottom-panel signature, the settled read, the action applier - and adds the
+one thing this question needs: an oracle. After every attempt it re-reads that
+console's own last `answer sent` line from the verbose link log, so "did this
+input set the rule state" is answered by the guest's game, not by a picture.
+Each attempt starts from the panel's own snapshot (`restore`, verified against
+the recorded signature), and leaving the panel is recorded rather than
+mis-attributed.
+
+**The sweep:** 48 touch points (32-pixel grid over the whole bottom screen), 12
+buttons, and 6 ordered pairs on **each** guest's NAME/ITEMS/HANDICAP/TEAM panel,
+the room re-formed under all three consoles (`panels-2p-vs-3p.png` shows the
+same table at 2 and 3 players). Not one attempt changed the guest's answer:
+`01 0D 20 20 36 00 46 1D B8 B6` before, and the same after every touch, button
+and pair (`sweep-grid.txt`, the sweep's own transcript). The host stayed in
+`05 9D` throughout the session that followed.
+
+**Why the bit could never be "set":** it is not panel state. In a later session
+the same guest answered `01 8D 00 00 01 00 ...` to a roster command carrying
+`FF 7F` where it had answered `01 0D ...` to one carrying `01 00` - no input
+between them, and the host still stayed in its roster (`sweep3.log.gz`, line
+19637). So the answer byte tracks
+the host's packet stage, and the previous entry's `20 A0` / `20 20` comparison
+was two answers to different packets.
+
+**Where the wall actually is, counted across the sessions:** with **both guests
+credited** (`collected=0006 of mask 0006`) the host's game sends only `05 9D`
+(277, 600, 1,079 sends by run) and never `04 9D`; with **one client credited** it
+sends `04 9D` 2,430 times; at two consoles it sends `04 9D` 2,050-2,097 times and
+`05 9D` not at all. The title's own three-player room machine never transitions
+to its match while two clients are present, and nothing a guest's panel can send
+moves it.
+
+**The two-console control is unchanged and live:** 3,120 `04 9D`, mask 0x3, both
+boards falling (`ctl2c.log.gz`, `2p-control-final.png`).
+
 ### 2026-10-22i — the three-client accept is not refused: all three are accepted, addressed as AIDs 1 and 2 and credited, and the room reaches a three-player table; the wall is the title's own re-entry after its pre-match close
 
 The last pass's next instrument was built: `TXSendFrame` now prints the reply
@@ -2885,18 +2923,24 @@ screen difference was only which console's press had dismissed the game's own
 error page. The link treats the two guests the same (`slice_run.log`,
 `probe9.log.gz`, `probe10.log.gz`).
 
-**What the three-player roster waits on is a per-guest bit the guests' own games
-set only sometimes.** After the handoff the room re-forms and all three consoles
-sit on the three-player table, each on its own NAME/ITEMS/HANDICAP/TEAM panel
-(`probe10-after-handoff.png`) - and the host then runs `05 9D` 999-1,796 times
-without ever reaching `04 9D`. The guests' answers show why: a guest that has set
-its rules answers `20 A0`, one that has not answers `20 20`, and that bit is a
-property of the guest's own game. In one run p2 held `A0` and p3 never did, in
-another neither did. Neither an A press on the panel nor a touch on its OK button
-reliably sets it at three consoles (p3 pressed twice with the panel proven to
-move, and stayed `20 20`), while the same A presses do set it at two consoles.
-So the split is inside the title's own per-console rule state; no AID, delivery
-frame or slot state differs between the two guests.
+**2026-10-22j corrects what that bit was.** It is not a rules-set flag and there
+was nothing for a guest to set: the answer byte follows the *host's packet*, not
+the panel. The same guest answers `01 0D ...` to a roster command carrying
+`... 01 00` and `01 8D ...` to one carrying `FF 7F` (`logs/sweep_run.log`, line
+19637), with no input between them. The panel sweep below tries every input on
+the panel and the answer never moves; the byte is a protocol stage marker.
+
+**What the three-player roster waits on is not on the guests' panel at all.**
+After the handoff the room re-forms and all three consoles sit on the
+three-player table, each on its own NAME/ITEMS/HANDICAP/TEAM panel
+(`panels-2p-vs-3p.png`) - and the host then runs `05 9D` 277-1,079 times and never
+sends `04 9D`. Counted across the sessions in `game-captures/tetris-3p-2026-10-22/`:
+with **both guests credited** (`collected=0006 of mask 0006`) the host sends only
+`05 9D` (277, 600, 1,079 by run); with **one client credited** it sends `04 9D`
+2,430 times; at two consoles it sends `04 9D` 2,050-2,097 times and no `05 9D` at
+all. So the title's own room machine only starts a match when at most one client
+is present, and a three-player room stays in its roster exchange indefinitely.
+No AID, delivery frame, slot or trim differs between the two guests.
 
 **The two-console control is live on the instrumented build and on the committed
 binary**, re-run after this slice: the route's own proven presses, 3,062 and
