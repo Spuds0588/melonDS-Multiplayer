@@ -114,7 +114,7 @@ void Wifi::TracePowerWrite(int id, u16 old, u16 val)
    command into an empty bus for the rest of the session. Which end sends it,
    and the reason code in the body, is what separates "the firmware or game gave
    up on this client" from "the game decided to leave the group". */
-static void mp_trace_deauth(const char* what, const u8* frame, int framelen)
+static void mp_trace_deauth(const char* what, const u8* frame, int framelen, u64 t)
 {
     if (!mp_trace()) return;
 
@@ -131,8 +131,8 @@ static void mp_trace_deauth(const char* what, const u8* frame, int framelen)
     const unsigned reason = (body >= 2) ? (unsigned)(frame[24] | (frame[25] << 8)) : 0u;
 
     Log(LogLevel::Info,
-        "[mp] deauth %s: %s -> %s, %d byte frame, reason %04X%s\n",
-        what, txmac, rxmac, framelen, reason,
+        "[mp] deauth %s: %s -> %s at %llu us, %d byte frame, reason %04X%s\n",
+        what, txmac, rxmac, (unsigned long long)t, framelen, reason,
         (body == 2) ? "" : " (body is not the usual 2-byte reason code)");
 }
 
@@ -539,6 +539,11 @@ void Wifi::Reset()
     MPClientFail = 0;
     MPD.last_cmd_mask_game = 0xFFFF;
     MPD.last_cmd_mask_poll = 0xFFFF;
+    MPD.last_collect_mask = 0;
+    MPD.last_collect_us = 0;
+    MPD.close_tx = 0;
+    MPD.close_rx = 0;
+    MPD.close_rx_us = 0;
     MPLoopAlive = false;
     memset(MPClientReplies, 0, sizeof(MPClientReplies));
 
@@ -1182,8 +1187,22 @@ void Wifi::TXSendFrame(const TXSlot* slot, int num)
     {
         MPD.deauth_sent++;
         MPD.last_deauth_reason = (len >= 26) ? *(u16*)&TXBuffer[12 + 24] : 0;
-        mp_trace_deauth("sent", &TXBuffer[12], len);
+        mp_trace_deauth("sent", &TXBuffer[12], len, USTimestamp);
     }
+
+    /* A client's association request is the other half of the close slice: the
+       room's close is followed by both guests re-associating, and whether one
+       of them ever asks again is the difference between "the link would not
+       take it" and "the game decided not to". Timestamped so the two guests'
+       attempts line up against the close and against each other. */
+    if (mp_trace() && !IsMPClient && (framectl & 0x00FF) == 0x0000)
+        Log(LogLevel::Info,
+            "[mp] association requested: %llu us (%lld after the close if it had one), slot %d, "
+            "seq=%04X, deauths sent %llu\n",
+            (unsigned long long)USTimestamp,
+            MPD.close_rx_us ? (long long)(USTimestamp - MPD.close_rx_us) : 0LL,
+            num, (len >= 26) ? *(u16*)&TXBuffer[12 + 22] : 0,
+            (unsigned long long)MPD.deauth_sent);
 
     switch (num)
     {
@@ -1360,6 +1379,24 @@ void Wifi::StartTX_Cmd()
             (MPClientMask != game_mask) ? " - the transport narrowed it" : "");
         MPD.last_cmd_mask_game = game_mask;
         MPD.last_cmd_mask_poll = MPClientMask;
+    }
+
+    /* The close slice, host side. `06 01` is the command both games react to,
+       and at three consoles the room splits on it, so what the host had
+       credited when it sent the close is printed with the send rather than
+       inferred from the reply lines around it in a 200 MB log. */
+    if (mp_trace() && *(u16*)&RAM[slot->Addr + 12 + 24] == 0x0106)
+    {
+        char g[48], c[48];
+        Log(LogLevel::Info,
+            "[mp] close broadcast #%u at %llu us, game mask %04X (%s), last window "
+            "credited %04X (%s) %lld us earlier, clients joined %u, clientfail %04X\n",
+            (unsigned)MPD.close_tx, (unsigned long long)USTimestamp,
+            game_mask, mp_aid_list(game_mask, g, sizeof(g)),
+            MPD.last_collect_mask, mp_aid_list(MPD.last_collect_mask, c, sizeof(c)),
+            (long long)(USTimestamp - MPD.last_collect_us),
+            (unsigned)MPD.client_joins, MPClientFail);
+        MPD.close_tx++;
     }
 
 
@@ -1825,6 +1862,16 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
                 if (MPClientMask)
                     res = Platform::MP_RecvReplies(MPClientReplies, USTimestamp, MPClientMask, NDS.UserData);
                 MPClientFail &= ~res;
+
+                /* Which window the room was still crediting when its game sent
+                   the close: the only host-side fact that tells "both guests
+                   had answered" from "one of them had already stopped" at the
+                   moment the close went out. */
+                if (res)
+                {
+                    MPD.last_collect_mask = res;
+                    MPD.last_collect_us = USTimestamp;
+                }
 
                 // TODO: 112 likely includes the ack preamble, which needs adjusted
                 // for long-preamble settings
@@ -2496,6 +2543,28 @@ void Wifi::FinishRX()
                 (myaid && (cmdmask & (1 << myaid))) ? "this poll is ours"
                                                    : "this poll is NOT ours",
                 cmd_dupe ? ", a repeat of the previous seqno" : "");
+
+            /* The close slice, guest side: what this console held when the
+               host's `06 01` was handed to its game. The two guests' lines are
+               compared by their own clocks (the consoles run in lockstep), and
+               the seqno says whether both were handed the same send, so
+               "delivered to the same round" is read off the log, not assumed. */
+            if (*(u16*)&RAM[(z + 12 + 24) & 0x1FFE] == 0x0106)
+            {
+                char m[48];
+                Log(LogLevel::Info,
+                    "[mp] close received #%u: cmd seq=%04X at my clock %llu, mask %04X (%s), "
+                    "my AID %d, W_AIDLow %04X, clients joined %u, deauths sent %llu "
+                    "received %llu%s\n",
+                    (unsigned)MPD.close_rx, seqno, (unsigned long long)USTimestamp,
+                    cmdmask, mp_aid_list(cmdmask, m, sizeof(m)),
+                    MPReplyAID(), IOPORT(W_AIDLow),
+                    (unsigned)MPD.client_joins,
+                    (unsigned long long)MPD.deauth_sent, (unsigned long long)MPD.deauth_recv,
+                    cmd_dupe ? ", a repeat of the previous seqno" : "");
+                MPD.close_rx++;
+                MPD.close_rx_us = USTimestamp;
+            }
         }
 
         SetIRQ(0);
@@ -2983,7 +3052,7 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
         /* Out of the group: no poll is ours to answer any more. */
         MPArmHeld = false;
         MPMYAID = 0;
-        mp_trace_deauth("received", &RXBuffer[12], framelen);
+        mp_trace_deauth("received", &RXBuffer[12], framelen, USTimestamp);
         if (mp_trace())
             Log(LogLevel::Info,
                 "[mp] that deauth takes this console out of multiplayer (IsMPClient -> false), "
@@ -4553,8 +4622,8 @@ void Wifi::Write(u32 addr, u16 val)
 
         if (mp_trace() && (IOPORT(W_AIDLow) != (val & 0x000F)))
             Log(LogLevel::Debug,
-                "[mp] guest set its AID to %d (last cmd seq %04X): %s\n",
-                val & 0x000F, MPLastSeqno,
+                "[mp] guest set its AID to %d at %llu us (last cmd seq %04X): %s\n",
+                val & 0x000F, (unsigned long long)USTimestamp, MPLastSeqno,
                 (val & 0x000F) ? "it is ready to answer" : "it has nothing to answer with");
         IOPORT(W_AIDLow) = val & 0x000F;
         return;

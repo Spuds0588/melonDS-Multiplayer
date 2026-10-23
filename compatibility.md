@@ -2868,23 +2868,40 @@ host has pressed (five attempts, panel never moved, `probe4`), so guests-first i
 not a legal order at all - the two-console recipe's opening guest press only works
 there because the host reaches its press a second later.
 
-**What still fails is the re-entry after the pre-match close.** The close is the
-same `06 01` command at both player counts, and after it the guests diverge: one
-re-associates and keeps answering, the other's game abandons the room (`guest set
-its AID to 0 ... it has nothing to answer with`, then `deauth ... reason 0003`) and
-is back on the title screen. The run that got furthest started the game's own
-match family (`F6 00 02 00 04 9D 03 00 03 00`, client mask 0x03) with **3,641**
-`04 9D` commands, but the reply window credited only AID 1 (`collected=0002
-of mask 0002`), so two consoles played and the third sat at the title
-(`3p-match-2of3.png`, `probe5.log.gz`). Two other orders (one host press, four host
-presses) stayed in `05 9D` - 100 and 108 sends, 344 and 455 windows with `0006` -
-and then ended on the same `06 01`. So the wall is not the accept, the AID
-assignment or the reply window; it is the title's own two guests taking different
-paths out of the pre-match close, which is game-level.
+**The `06 01` is the room's handoff, and both guests take it identically.** A
+close slice was added for exactly this comparison (host: `close broadcast #n`
+with its game mask, the last window it credited and how long before; guest:
+`close received #n` with its clock, its AID and its deauth counters; `deauth
+sent/received ... at <us>`; `association requested ... at <us> (n after the
+close)`; and the reply window now names which senders a trim dropped). What it
+shows at three consoles: the host broadcasts `06 01` **15 ms after the second
+guest associates and before either guest has answered a command**, repeating it
+124-141 times; both guests clear their AID and deauth within **8.3 ms of each
+other**; both re-associate together **0.93-1.3 s later**; both are handed their
+old AIDs (1 and 2), the collision detector stays silent and the host credits both
+again. The previous entry's "one guest re-associates while the other's game
+leaves" was a misread: **both** guests leave and **both** come back, and the
+screen difference was only which console's press had dismissed the game's own
+error page. The link treats the two guests the same (`slice_run.log`,
+`probe9.log.gz`, `probe10.log.gz`).
 
-**The two-console control is live:** the route's own proven two-stage presses,
-2,344 `04 9D`, link mask 0x3 at +50 s, both boards falling with different NEXT
-queues (`2p-control-live.png`, `ctl2.log.gz`), save byte-identical afterwards.
+**What the three-player roster waits on is a per-guest bit the guests' own games
+set only sometimes.** After the handoff the room re-forms and all three consoles
+sit on the three-player table, each on its own NAME/ITEMS/HANDICAP/TEAM panel
+(`probe10-after-handoff.png`) - and the host then runs `05 9D` 999-1,796 times
+without ever reaching `04 9D`. The guests' answers show why: a guest that has set
+its rules answers `20 A0`, one that has not answers `20 20`, and that bit is a
+property of the guest's own game. In one run p2 held `A0` and p3 never did, in
+another neither did. Neither an A press on the panel nor a touch on its OK button
+reliably sets it at three consoles (p3 pressed twice with the panel proven to
+move, and stayed `20 20`), while the same A presses do set it at two consoles.
+So the split is inside the title's own per-console rule state; no AID, delivery
+frame or slot state differs between the two guests.
+
+**The two-console control is live on the instrumented build and on the committed
+binary**, re-run after this slice: the route's own proven presses, 3,062 and
+**3,120** `04 9D` in the two runs, link mask 0x3 at +50/+53 s, both boards
+falling, save byte-identical afterwards (`ctl2b.log.gz`, `ctl2c.log.gz`).
 
 ### 2026-10-22h — the 14:03 log was the room closing, not a match; the same timeline with every press proven plays a live match, and that is the whole difference
 

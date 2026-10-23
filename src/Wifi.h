@@ -310,6 +310,20 @@ public:
         u16 last_cmd_mask_game;
         u16 last_cmd_mask_poll;
 
+        /* ---- close slice (2026-10-22) ----
+
+           The host's `06 01` command is what both games react to, and the
+           three-console room splits on it - one guest re-associates, the
+           other's game leaves - so the close is compared between the two
+           consoles instead of reconstructed from counters afterwards. The
+           last window that credited anyone is kept because "whose answer the
+           close consumed last" is part of that comparison. */
+        u16 last_collect_mask;
+        u64 last_collect_us;
+        u16 close_tx;        // `06 01` this console broadcast
+        u16 close_rx;        // `06 01` this console was handed
+        u64 close_rx_us;     // ... and when (0 = never)
+
         // last frames seen, bodies included (both roles)
         u16 last_cmd_seq;
         u16 last_cmd_len;    // body bytes, after the 24-byte 802.11 header

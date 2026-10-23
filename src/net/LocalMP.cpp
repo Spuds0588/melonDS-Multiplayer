@@ -488,6 +488,23 @@ u32 LocalMP::TrimAnswers(int inst, int keep, u32* kept_out) noexcept
     self.answerRead = cursor;
     self.diag.reanchor_dropped += drop;
 
+    /* Who lost those answers. The counter alone says the host's queue re-anchored;
+       the three-console room needs to know whether it cost one guest its round
+       and not the other, because that is what a guest's game reacts to. */
+    if (drop && trace_replies())
+    {
+        char who[64];
+        size_t w = 0;
+        who[0] = 0;
+        for (u32 i = 0; i < drop; i++)
+        {
+            if ((w + 6) >= sizeof(who)) break;
+            w += (size_t)snprintf(&who[w], sizeof(who) - w, " p%d", entries[i].sender + 1);
+        }
+        Log(LogLevel::Debug, "reply window: p%d trimmed %u stale answer(s) from%s\n",
+            inst + 1, drop, who);
+    }
+
     if (kept_out) *kept_out = n - drop;
     return drop;
 }
