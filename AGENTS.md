@@ -196,6 +196,29 @@ Two boundaries worth stating because over-eager cleanup is worse than none:
   means, what you will do next. No play-by-play, no status-line chatter.
   One short prose line plus bullets beats a paragraph every time.
 
+### Wrap-up format (every completed task)
+
+End every finished task with a summary in exactly these three sections, in this
+order, each a heading followed by bullets. No fourth section, no prose
+substitute for a bullet list.
+
+**What I did**
+
+- One bullet per thing actually changed or measured, with the file, commit or
+  number it produced. State what was verified and what was not; do not list
+  intentions.
+
+**What you need to do**
+
+- Anything only the user can do: run a session on their machine, check a
+  screenshot, supply a ROM or key, decide a product question. Write "Nothing"
+  when there is genuinely nothing.
+
+**What I recommend we work on next**
+
+- One or two concrete next steps, most valuable first, each with the reason it
+  is next. Recommendations only - do not start them in the same turn.
+
 - For questions about melonDS core: Refer to original melonDS project channels
 - For project-specific questions: Use GitHub Issues
 - Discord: TBD

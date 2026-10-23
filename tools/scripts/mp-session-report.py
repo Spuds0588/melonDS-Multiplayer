@@ -40,6 +40,14 @@ HOSTDIG = re.compile(
 HOLD = re.compile(
     r"\[mp\] rendezvous hold: round ([0-9A-Fa-f]{4}), host frame (\d+), "
     r"(\d+) us wall, (\d+) polls for (\d+) us emulated \(([\d.]+) frames\)")
+# The host's current command body, printed in the periodic digest. The body is
+# how a room state is named from the wire: at two carts the match phase is
+# `F6 00 02 00 04 9D`, at four it is `F6 00 0E 00 06 9D` - the same family with
+# the client count folded into the phase byte - so counting only `04 9D`
+# reports zero matches on a four-console run that is visibly playing
+# (2026-10-23).
+LASTCMD = re.compile(
+    r"mp p(\d+) last: cmd seq ([0-9A-Fa-f]+) len \d+ body ((?:[0-9A-F]{2} ){6})")
 
 
 def ts(ms):
@@ -50,6 +58,7 @@ for path in sys.argv[1:]:
     lines = open(path, "rb").read().decode("utf-8", "replace").splitlines()
 
     windows = {}       # player -> [(frames_delta, mask, wifi_on)]
+    families = {}      # (mask, phase, opcode) -> [count, {seqnos already counted}]
     kicks = 0
     heart = None
     holds = []         # (frame, wall_us, polls, emulated_us)
@@ -82,6 +91,16 @@ for path in sys.argv[1:]:
         if m:
             acks += 1
             ack_masks.append(int(m.group(2), 16))
+            continue
+        m = LASTCMD.search(ln)
+        if m:
+            body = bytes.fromhex(m.group(3).replace(" ", ""))
+            key = (body[2], body[4], body[5])
+            ent = families.setdefault(key, [0, set()])
+            seq = m.group(2).upper()
+            if seq not in ent[1]:
+                ent[1].add(seq)
+                ent[0] += 1
             continue
         m = HOLD.search(ln)
         if m:
@@ -120,6 +139,20 @@ for path in sys.argv[1:]:
               f"mean {mean_emu / 1000:.2f}ms ({mean_emu / 16715:.2f} frames)")
         print(f"     polls per hold: mean {sum(polls) / len(polls):.0f}, max {max(polls)} · "
               f"wall per emulated frame held: {mean_wall / (mean_emu / 16715) / 1000:.1f}ms")
+    if families:
+        print("   command bodies the host carried (distinct seqno):")
+        for (mask, phase, op), (n, _) in sorted(
+                families.items(), key=lambda kv: (kv[0][2] != 0x9D, -kv[1][0]))[:8]:
+            print(f"     F6 00 {mask:02X} 00 {phase:02X} {op:02X} x{n}")
+        # The play phase, by cart count. The family is `F6 00 <mask> 00 <phase>
+        # 9D`, and the phase byte follows the number of clients in the room
+        # (04 at two carts, 05 at three, 06 at four): counting only 04 reports
+        # zero on a four-console run that is playing.
+        play = {4: "2 carts", 5: "3 carts", 6: "4 carts"}
+        for phase, label in play.items():
+            n = sum(v[0] for (m, p, o), v in families.items() if p == phase and o == 0x9D)
+            if n:
+                print(f"     play phase {phase:02X} ({label}): {n} digest sample(s)")
     if deauths:
         print(f"   deauths: {len(deauths)}")
         for p, kind, t, reason in deauths[:12]:

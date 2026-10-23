@@ -128,7 +128,26 @@ def stamp(ch, label):
     print(f"  t={emu_seconds(ch):6.2f} emulated s | {label}", flush=True)
 
 
-def press_all_proven(pads, mask=0x1, label="", attempts=5, patience=2.2):
+def reenter_room(pad):
+    """Walk a guest back into the host's room after the title's close put it
+    back on the join browser.
+
+    Measured 2026-10-23: the room closes once mid-handshake and re-forms, and the
+    guests handed that close return to their own join browser - the host's mask
+    reads 000E (all three in its room) while all three guests are still drawing
+    the browser page, and `A` moves none of their panels in five attempts. The
+    browser's own entry is the sequence this route already uses: JOIN's two
+    touches, then A once the room list has been drawn. Recovering per console
+    rather than for the whole batch is what keeps a guest that is already in the
+    room from being tapped out of it.
+    """
+    pad.tap2(MENU_JOIN)
+    time.sleep(0.8)
+    pad.press(0x1)
+    time.sleep(0.6)
+
+
+def press_all_proven(pads, mask=0x1, label="", attempts=5, patience=2.2, recover=None):
     """One press to every console at once, proven landed on each.
 
     The guests' rule panels do not depend on each other, so the presses go out
@@ -140,24 +159,38 @@ def press_all_proven(pads, mask=0x1, label="", attempts=5, patience=2.2):
     """
     pending = list(pads)
     before = {p.p: p.sig() for p in pending}
+    recovered = {p.p: 0 for p in pending}
     for attempt in range(1, attempts + 1):
         for p in pending:
             p.press(mask)
-        moved_count = 0
+        moved = []
         start = time.time()
         while pending and time.time() - start < patience:
             time.sleep(0.2)
             still = []
             for p in pending:
                 if p.diff(p.sig(), before[p.p]) > 6.0:
-                    moved_count += 1
+                    moved.append(p.p)
                 else:
                     still.append(p)
             pending = still
-        print(f"  batch '{label}' attempt {attempt}: {moved_count} moved, {len(pending)} to go",
+        moved_names = ",".join(f"p{n}" for n in moved) or "-"
+        silent_names = ",".join(f"p{p.p}" for p in pending) or "-"
+        print(f"  batch '{label}' attempt {attempt}: {moved_names} moved, {silent_names} silent",
               flush=True)
         if not pending:
             return attempt
+        # A console whose panel never moved is not hearing the button: the
+        # room's close put its game back on the join browser. Walk it back in
+        # and press again, twice at most so a genuinely stuck game still fails
+        # the route instead of being tapped forever.
+        if recover:
+            for p in list(pending):
+                if recovered.get(p.p, 0) < 2:
+                    recovered[p.p] = recovered.get(p.p, 0) + 1
+                    print(f"  p{p.p}: in the browser - re-entering the room", flush=True)
+                    recover(p)
+            before = {p.p: p.sig() for p in pending}
     raise SystemExit(f"batch '{label}': {len(pending)} console(s) never moved - see the stage shots")
 
 
@@ -274,7 +307,7 @@ def main():
     #    room stays on the table, because the presses are swallowed and nothing
     #    reports it; proven one at a time it starts on the first attempt.
     stamp(ch, "all guests in the room, before the rules presses")
-    press_all_proven(guests, 0x1, "rules panel open")
+    press_all_proven(guests, 0x1, "rules panel open", recover=reenter_room)
     host.press_proven(0x1, "host to please-wait")
     time.sleep(1.0)
     # The second host press is the one the room swallows: it is already on
@@ -283,7 +316,7 @@ def main():
     # started a match, and the driver aborted on it in the next run).
     host.press(0x1)
     time.sleep(1.0)
-    press_all_proven(guests, 0x1, "rules confirmed")
+    press_all_proven(guests, 0x1, "rules confirmed", recover=reenter_room)
     stamp(ch, "every guest's rules confirmed")
 
     # Give the room time to start, then photograph every console. The verdict is
