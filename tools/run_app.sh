@@ -29,6 +29,11 @@
 #                           reply rendezvous: the ack is not sent until every client
 #                           the command addressed has answered, or this bound is
 #                           spent (counted as a violation in the digest).
+#   MD_REPLY_POLL_TICKS     how often the rendezvous re-asks the bus, as a multiple
+#                           of its 4-tick (32us emulated) period (default 1). A
+#                           measurement knob: 2026-10-23 showed both ends of the
+#                           frame-rate difference poll the same 149-266 times per
+#                           hold, so the cadence was not the cost.
 #   MD_REPLY_BUDGET_FRAMES  emulated frames of wall clock a frame may spend on
 #                           reply waits in total (default 2; negative = no cap).
 #                           Both are forwarded explicitly: a knob this script does
@@ -148,6 +153,7 @@ setsid nohup bash -c '
     MD_REPLY_BUDGET_FRAMES="${MD_REPLY_BUDGET_FRAMES:-}" \
     MD_REPLY_EXTEND_FRAMES="${MD_REPLY_EXTEND_FRAMES:-}" \
     MD_REPLY_DEFER_FRAMES="${MD_REPLY_DEFER_FRAMES:-}" \
+    MD_REPLY_POLL_TICKS="${MD_REPLY_POLL_TICKS:-}" \
     MD_MP_FCS="${MD_MP_FCS:-}" MD_STOCK_MP="${MD_STOCK_MP:-}" \
     MD_RX_NOCROP="${MD_RX_NOCROP:-}" \
     MD_MP_REDELIVER="${MD_MP_REDELIVER:-}" \

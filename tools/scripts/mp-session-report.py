@@ -33,6 +33,13 @@ ACK = re.compile(r"\[\w+\]?.*?\[mp\] ack sent: cmdcount (\d+), clientfail ([0-9A
 HOSTDIG = re.compile(
     r"mp p(\d+) \[host\].*?cmds tx (\d+)\(.*?acks (\d+)\(.*?clientfail (\d+)\) · rendezvous (\d+)\("
     r"\+(\d+) gave up, (\d+)us held\)")
+# One closed hold, printed per hold with MD_LINK_VERBOSE=1. This is the only
+# place the rendezvous' *wall* cost appears: the digest counts emulated
+# microseconds held, which says how much of the console's own clock a hold
+# spent and nothing about what it cost the group.
+HOLD = re.compile(
+    r"\[mp\] rendezvous hold: round ([0-9A-Fa-f]{4}), host frame (\d+), "
+    r"(\d+) us wall, (\d+) polls for (\d+) us emulated \(([\d.]+) frames\)")
 
 
 def ts(ms):
@@ -45,6 +52,8 @@ for path in sys.argv[1:]:
     windows = {}       # player -> [(frames_delta, mask, wifi_on)]
     kicks = 0
     heart = None
+    holds = []         # (frame, wall_us, polls, emulated_us)
+    host_frames_seen = set()
     deauths = []
     acks = 0
     ack_masks = []
@@ -74,6 +83,11 @@ for path in sys.argv[1:]:
             acks += 1
             ack_masks.append(int(m.group(2), 16))
             continue
+        m = HOLD.search(ln)
+        if m:
+            holds.append((int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))))
+            host_frames_seen.add(int(m.group(2)))
+            continue
         m = HOSTDIG.search(ln)
         if m:
             # The digest prints running totals for the deferred count and deltas
@@ -93,6 +107,19 @@ for path in sys.argv[1:]:
     if host:
         print(f"   host digest: cmds tx {host[0]}, acks {host[1]}, clientfail {host[2]}, "
               f"rendezvous {host[3]} ({host[4]} gave up, {host[5]}us held)")
+    if holds:
+        wall = [h[1] for h in holds]
+        polls = [h[2] for h in holds]
+        emu = [h[3] for h in holds]
+        mean_wall = sum(wall) / len(wall)
+        mean_emu = sum(emu) / len(emu) or 1
+        print(f"   rendezvous holds: {len(holds)} over {len(host_frames_seen)} host frames "
+              f"({len(holds) / max(1, len(host_frames_seen)):.2f} per frame)")
+        print(f"     wall: {sum(wall) / 1e6:.2f}s total, mean {mean_wall / 1000:.1f}ms, "
+              f"max {max(wall) / 1000:.1f}ms · emulated: {sum(emu) / 1e6:.2f}s total, "
+              f"mean {mean_emu / 1000:.2f}ms ({mean_emu / 16715:.2f} frames)")
+        print(f"     polls per hold: mean {sum(polls) / len(polls):.0f}, max {max(polls)} · "
+              f"wall per emulated frame held: {mean_wall / (mean_emu / 16715) / 1000:.1f}ms")
     if deauths:
         print(f"   deauths: {len(deauths)}")
         for p, kind, t, reason in deauths[:12]:

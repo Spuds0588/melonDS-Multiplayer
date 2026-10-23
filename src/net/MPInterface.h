@@ -119,6 +119,26 @@ public:
     void SetReplyEager(bool eager) noexcept { ReplyEager = eager; }
     [[nodiscard]] bool GetReplyEager() const noexcept { return ReplyEager; }
 
+    /* The rendezvous is on, so a host's reply window must not wait on the wall
+       clock at all: a round whose clients have not answered is held open by
+       `Wifi::ProcessTX` phase 14 in *emulated* time, which is the clock the DS
+       protocol being imitated is written in, and which the group can afford.
+
+       This is separate from `ReplyEager` because it is a different statement.
+       Eager means "this particular poll is the rendezvous speaking, do not log
+       it as a window"; this one means "the frame's reply wait is covered by a
+       hold, so there is nothing for a wall-clock ceiling to buy" - and the
+       window still is a window: its counters and its trace line stay.
+
+       Measured on Tetris DS's four-console room, 2026-10-23: the same route,
+       the same four guests in the room, 211 rounds held at 6.6ms wall each
+       (1.4s across the session), and the frame rate 59-60fps with a 2ms
+       ceiling against 18fps with the shipped 67ms one, both with 0 failed acks.
+       The wall wait was not buying a collected answer - the hold collected it -
+       it was only making the group wait. See `LocalMP::RecvReplies`. */
+    void SetReplyHold(bool hold) noexcept { ReplyHold = hold; }
+    [[nodiscard]] bool GetReplyHold() const noexcept { return ReplyHold; }
+
     // function called every video frame
     virtual void Process() = 0;
 
@@ -137,6 +157,7 @@ protected:
     int RecvTimeout = 25;
     int ReplyTimeout = 25;
     bool ReplyEager = false;
+    bool ReplyHold = false;
 
     // per-instance reply-wait budget, see SetReplyBudget above
     static constexpr int kMaxMPInstances = 16;

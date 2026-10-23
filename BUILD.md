@@ -938,15 +938,26 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   up and exactly those three acks report `clientfail`, which is how the
   violation path is exercised. Healthy rounds never enter phase 14, so a
   two-console session's traffic is unchanged.
-  **What it costs, measured 2026-10-23:** at three consoles the room still runs
-  59-60 fps with the rendezvous on; at four consoles, holding all four guests
-  costs the room its frame rate - **14 fps** against **39-42 fps** with the
-  rendezvous off (where 85 of 622 acks, 13.7%, report a failed client and the
-  room collapses to the menus). The bound is not the lever: a 1-frame budget
-  gives the same 14 fps and 1/685 failed acks. The reply digest's
-  `reply_defer_us` measures 0.4 emulated frames per held round (~2% of the
-  session), which does not explain the wall-clock difference, so treat the
-  four-console cost as measured but not yet accounted for.
+  **What it costs, measured 2026-10-23:** nothing that the frame rate can see.
+  At three consoles the room runs 59-60 fps and at four **59.8 fps** with 0/426
+  failed acks, and a second four-console run 0/786 at 59.6-60. Each hold costs
+  1.3-9.7 ms of wall clock (0.11-0.51 emulated frames), about 42 a second at
+  four consoles, and a hold **overlaps** the guests' own frame work rather than
+  adding to it: a window that spent 64.8% of its wall inside holds still ran
+  59.8 fps. The cost that *was* real is not the hold but the wall-clock ceiling
+  on the reply window that precedes it - with `MD_REPLY_TIMEOUT_MS` at its
+  shipped 67 ms the same route ran at **18 fps**, at 2 ms it ran 59-60 fps with
+  the same 0 failed acks and the same holds. So a rendezvous-enabled host no
+  longer waits in the window at all (`MPInterface::SetReplyHold`, set by `Wifi`
+  for the round's first poll): the hold covers the lateness in emulated time,
+  and the ceiling survives only for `MD_REPLY_DEFER_FRAMES=0`.
+* **`MD_REPLY_POLL_TICKS` (default 1)** - how often the rendezvous re-asks the
+  bus, as a multiple of its 4-tick (32 us emulated) period, so a larger value
+  polls less often. It is a measurement knob, not a second policy: the 2026-10-23
+  A/B measured 149-266 polls per hold (max 1,568) at both ends of the frame-rate
+  difference, which cleared the poll cadence - the ceiling was what cost the
+  time. Kept because it is the one knob that would show the cadence becoming a
+  cost if a future change made the poll heavier.
 * **`MD_REPLY_EXTEND_FRAMES` lets a window outlive its ceiling for a client that
   has not taken its own round yet** (default **0**, i.e. never). When a window's
   ceiling expires with answers still owed, `LocalMP::RecvReplies` asks a question

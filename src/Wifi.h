@@ -688,6 +688,16 @@ private:
     u16 MPDeferCredited;
     u64 MPDeferStart;
 
+    /* What one hold cost, kept apart from what it waited for: `MPDeferPolls`
+       counts the eager polls this console made inside the open round, and
+       `MPDeferWallStart` is the wall clock when it opened. Emulated time says
+       how much of the console's own clock the hold consumed; only these two
+       can say what it cost the group, because a hold which spends a little
+       emulated time can still keep four threads waiting. See
+       `reply_poll_ticks` in Wifi.cpp for the 2026-10-23 four-console reading. */
+    u64 MPDeferPolls;
+    u64 MPDeferWallStart;
+
     /* Which piece of code is starting a reception, so the delivery trace can
        name it: 0 none, 1 the MP reply handoff, 2 an association response,
        3 a deauth, 4 a frame the regular path took, 5 a held MP frame whose

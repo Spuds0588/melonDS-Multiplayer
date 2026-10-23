@@ -1049,6 +1049,21 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
            MPInterface::SetReplyEager and Wifi::ProcessTX phase 14). */
         if (ReplyEager) waitms = 0;
 
+        /* ... and neither must the round's own first window when the host is
+           going to hold it open anyway (`ReplyHold`, set by Wifi for exactly
+           that poll). The wait this used to make was not buying the answer:
+           measured on Tetris DS's four-console room (2026-10-23), the same
+           route and the same four guests ran at 18fps with the shipped 67ms
+           ceiling and at 59-60fps with a 2ms one, 0 failed acks either way, and
+           the rounds the ceiling waited for were the rounds the hold then
+           collected. What the ceiling bought was 67ms of wall clock per frame
+           that the group could not use - a third of its speed - because the
+           peer it waits for answers at its own frame boundary, which the host
+           is the one holding back. So the lateness is measured in emulated
+           time from here on, and the ceiling stays for the arms that do not
+           hold (`MD_REPLY_DEFER_FRAMES=0`). */
+        if (ReplyHold) waitms = 0;
+
         /* ... and only while the clients this poll names are the ones that have
            been answering.
 

@@ -312,6 +312,11 @@ u16 MP_RecvReplies(u8* data, u64 timestamp, u16 aidmask, void* userdata);
    back empty. See MPInterface::SetReplyEager. */
 void MP_SetReplyEager(bool eager);
 
+/* The host's reply window does not wait on the wall clock: a late answer is
+   covered by holding the round open in emulated time (Wifi::ProcessTX phase 14).
+   See MPInterface::SetReplyHold for the measurement. */
+void MP_SetReplyHold(bool hold);
+
 
 // network comm interface
 // packet type: Ethernet (802.3)

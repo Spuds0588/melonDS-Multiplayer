@@ -16,6 +16,7 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
+#include <chrono>
 #include <cstdlib>
 #include <stdarg.h>
 #include <stdio.h>
@@ -285,6 +286,42 @@ static int reply_defer_frames()
         return 3;
     }();
     return frames;
+}
+
+/* How often the rendezvous re-asks the bus, as a multiple of the 4-tick
+   (32us emulated) period it starts with: `MD_REPLY_POLL_TICKS=1` is the phase
+   as first written, and larger values make it poll less often.
+
+   This is a measurement knob, not a second policy. The 2026-10-23 four-console
+   run measured the holds at 0.4 emulated frames each (~2% of the session) yet
+   the room ran at 14fps against 39-42 with the rendezvous off, so the poll was
+   a suspect. **It is cleared:** both ends of that difference polled 149-266
+   times per hold (max 1,568) and differed only in the reply *window*'s
+   wall-clock ceiling, and the ceiling - not this cadence - was the cost (see
+   `SetReplyHold`). The knob stays because it is the one setting that would
+   show the poll becoming a cost if it grew heavier. */
+static int reply_poll_ticks()
+{
+    static const int ticks = []() {
+        const char* v = std::getenv("MD_REPLY_POLL_TICKS");
+        if (v && *v)
+        {
+            const int t = (int)strtol(v, nullptr, 10);
+            if (t > 0) return t;
+        }
+        return 1;
+    }();
+    return ticks;
+}
+
+/* Wall clock in microseconds, for the rendezvous' own accounting. A steady
+   clock with a process-wide epoch: only differences are ever used, and the
+   value is never written to a savestate. */
+static u64 mp_wall_us()
+{
+    static const auto epoch = std::chrono::steady_clock::now();
+    return (u64)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - epoch).count();
 }
 
 /* Same-round reply (MD_SAME_ROUND_REPLY, default OFF).
@@ -1893,9 +1930,18 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
 
                 MPReplyTimer = 16 + PreambleLen(slot->Rate);
 
+                /* If this round is going to be held open for a client that
+                   owes an answer, this window asks once and does not wait: the
+                   hold is the mechanism that covers a late answer, and it does
+                   it in emulated time (see MPInterface::SetReplyHold). */
+                const int defer_frames = reply_defer_frames();
+                Platform::MP_SetReplyHold(defer_frames > 0);
+
                 u16 res = 0;
                 if (MPClientMask)
                     res = Platform::MP_RecvReplies(MPClientReplies, USTimestamp, MPClientMask, NDS.UserData);
+
+                Platform::MP_SetReplyHold(false);
                 MPClientFail &= ~res;
 
                 /* Which window the room was still crediting when its game sent
@@ -1917,13 +1963,14 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
                    already credited) never enter it, so the two-console path is
                    byte-for-byte what it was. */
                 {
-                    const int defer_frames = reply_defer_frames();
                     const u16 owed = (u16)(MPClientMask & ~res);
                     if ((defer_frames > 0) && owed)
                     {
                         MPDeferAsked = MPClientMask;
                         MPDeferCredited = res;
                         MPDeferStart = USTimestamp;
+                        MPDeferPolls = 0;
+                        MPDeferWallStart = mp_wall_us();
                         MPD.reply_deferred++;
 
                         if (mp_trace())
@@ -2064,6 +2111,7 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
                command addressed has answered, or when the frame budget is
                spent - the latter is the violation path a healthy link never
                takes, and it is counted so that "never" is a measurement. */
+            MPDeferPolls++;
             Platform::MP_SetReplyEager(true);
             u16 res = 0;
             if (MPClientMask)
@@ -2081,6 +2129,7 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
             const u16 owed = (u16)(MPDeferAsked & ~MPDeferCredited);
             const u64 waited = USTimestamp - MPDeferStart;
             const u64 budget = (u64)reply_defer_frames() * 16715; // one emulated frame, in US ticks
+            const u64 wall = mp_wall_us() - MPDeferWallStart;
 
             if (!owed || (waited >= budget))
             {
@@ -2101,6 +2150,17 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
                         MPDeferAsked, (unsigned long long)waited, waited / 16715.0);
                 }
 
+                if (mp_trace())
+                {
+                    Log(LogLevel::Debug,
+                        "[mp] rendezvous hold: round %04X, host frame %u, %llu us wall, %llu polls "
+                        "for %llu us emulated (%.2f frames) - %.0f us wall per emulated frame held\n",
+                        MPDeferAsked, NDS.NumFrames, (unsigned long long)wall,
+                        (unsigned long long)MPDeferPolls, (unsigned long long)waited,
+                        waited / 16715.0,
+                        (waited > 0) ? (double)wall * 16715.0 / (double)waited : 0.0);
+                }
+
                 MPD.reply_defer_us += waited;
 
                 // the ack goes out now, with whatever the round actually collected
@@ -2109,7 +2169,7 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
             }
             else
             {
-                slot->CurPhaseTime = 4 * kTimerInterval;
+                slot->CurPhaseTime = reply_poll_ticks() * 4 * kTimerInterval;
             }
         }
         /* Not finished: the slot stays open (W_TXBusy keeps its command bit,
