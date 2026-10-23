@@ -1825,6 +1825,12 @@ arm64) and macOS jobs died with `undefined symbol melonDS::Platform::MP_SetReply
 / `MP_SetReplyEager`. Both are now defined in the Qt frontend as forwards to
 `MPInterface::Get()`.
 
+This section describes the tree **as it stands**. Retiring the inherited Qt/SDL
+CI — and deciding whether that frontend stays in the tree at all — is a tracked
+task ("Rebuild the CI around what this repo ships", to-do.md, Phase 1). Until it
+lands, the Windows/macOS jobs are the only place this class of link failure is
+caught.
+
 Two things to know when reading a red or green run:
 
 * **The Ubuntu job passes without building the frontend correctly.** It sets
