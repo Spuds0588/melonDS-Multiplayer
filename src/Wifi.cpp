@@ -1251,14 +1251,19 @@ void Wifi::TXSendFrame(const TXSlot* slot, int num)
        room's close is followed by both guests re-associating, and whether one
        of them ever asks again is the difference between "the link would not
        take it" and "the game decided not to". Timestamped so the two guests'
-       attempts line up against the close and against each other. */
-    if (mp_trace() && !IsMPClient && (framectl & 0x00FF) == 0x0000)
+       attempts line up against the close and against each other. Logged for a
+       console that still thinks it is a client too (`role`): the request that
+       follows a close is emitted by a game that has just been deauthed, but a
+       request emitted before its own deauth lands was invisible to this line
+       and read as "the guest never asked". */
+    if (mp_trace() && (framectl & 0x00FF) == 0x0000)
         Log(LogLevel::Info,
             "[mp] association requested: %llu us (%lld after the close if it had one), slot %d, "
-            "seq=%04X, deauths sent %llu\n",
+            "seq=%04X, role %s, deauths sent %llu\n",
             (unsigned long long)USTimestamp,
             MPD.close_rx_us ? (long long)(USTimestamp - MPD.close_rx_us) : 0LL,
             num, (len >= 26) ? *(u16*)&TXBuffer[12 + 22] : 0,
+            IsMPClient ? "client" : (IsMP ? "host" : "idle"),
             (unsigned long long)MPD.deauth_sent);
 
     switch (num)
@@ -1430,9 +1435,11 @@ void Wifi::StartTX_Cmd()
     {
         char g[48], p[48];
         Log(LogLevel::Debug,
-            "[mp] command addressing changes: the game's own mask %04X (%s), polled as %04X (%s)%s\n",
+            "[mp] command addressing changes at %llu us: the game's own mask %04X (%s), "
+            "polled as %04X (%s), clientfail %04X%s\n",
+            (unsigned long long)USTimestamp,
             game_mask, mp_aid_list(game_mask, g, sizeof(g)),
-            MPClientMask, mp_aid_list(MPClientMask, p, sizeof(p)),
+            MPClientMask, mp_aid_list(MPClientMask, p, sizeof(p)), MPClientFail,
             (MPClientMask != game_mask) ? " - the transport narrowed it" : "");
         MPD.last_cmd_mask_game = game_mask;
         MPD.last_cmd_mask_poll = MPClientMask;
@@ -2054,6 +2061,25 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
             else                 slot->CurPhaseTime = 32 * 8;
 
             ReportMPReplyErrors(MPClientFail);
+
+            /* The ack is the one frame the host's game reads to decide a client
+               has gone: its `clientfail` field is the game's whole reason for
+               dropping an AID from its mask. Printed with the emulated time
+               and the mask the game addressed, because the question a dropped
+               client turns into - "which round told the game it was gone" - is
+               a timestamp no counter can answer. */
+            if (mp_trace() && MPClientFail)
+            {
+                char f[48], a[48];
+                Log(LogLevel::Info,
+                    "[mp] ack reports failed clients at %llu us: clientfail %04X (%s), "
+                    "addressed %04X (%s), last window credited %04X %lld us earlier\n",
+                    (unsigned long long)USTimestamp,
+                    MPClientFail, mp_aid_list(MPClientFail, f, sizeof(f)),
+                    MPClientMask, mp_aid_list(MPClientMask, a, sizeof(a)),
+                    MPD.last_collect_mask,
+                    MPD.last_collect_us ? (long long)(USTimestamp - MPD.last_collect_us) : 0LL);
+            }
 
             // send
             u16 cmdcount = (CmdCounter + 9) / 10;
