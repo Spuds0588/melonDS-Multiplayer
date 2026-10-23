@@ -2841,6 +2841,41 @@ Past the boot both consoles show the STANDARD lobby with a 2-player roster, the 
 
 First boot writes the game's save (new `Test Roms/Tetris DS (USA).sav`; supervisor-pinned, exit 0). Higher player counts (the title supports up to 10 over Download Play) and the other modes (MISSION, PUSH) are unmeasured.
 
+### 2026-10-23 — the roster record is not the wall: the host's three-player packet is fully populated, both guests' records reach its game in the same windows, and the room still closes on the rules confirmation
+
+**The packet, read per player.** The host's three-player body is
+`F6 00 | mask | 05 9D | 2N-1 | present-mask | <2 bytes per player> | counter` -
+`0006 / 0007 / 0007` once both guests are credited, with three player slots. The
+present mask climbs `0001` -> `0003` -> `0007` in the first three rounds, i.e. the
+host's game learns about player 2 and then player 3 from their own answers; from
+round 4 on the slots carry the same token the guests echo (`FF 7F`, `6A 82`,
+`30 98`, `04 C9`, ... and finally `20 20` for all three), and at no point does a
+slot stay blank or pending. **No side is dropping the record.** In the clean
+three-console session both clients' replies were handed to the host's game in
+444 of 454 reply windows (`scan4.log`), each guest's full name transfer arrived
+(chunks 0-4 from both), and the host's own ack told the guests `clientfail 0000`
+in 445 of 475 rounds. The two-console control runs the *same* exchange on the
+same binary with `cnt 0003` instead of `0007` and goes on to a live match, so the
+body's shape and content are not what the title rejects (`rounds.txt`).
+
+**What still ends it.** After the second guest's rules confirmation the host's
+screen stays on `Please wait until all of the players have set their rules`, the
+host's game closes the room (`06 01`), both guests deauth, and all three consoles
+land on `A communication error has occurred` (`please-wait-then-error.png`). The
+one measured transport asymmetry is the rate at which a guest puts *nothing* on
+the wire for a round: the host's ack reports a failed client in 6.3% of rounds at
+three consoles (30 of 475) against 0.3% in the two-console control (15 of 4,394).
+Each of those rounds is a window that closed `collected=0002` because the other
+guest never sent a reply - not a reply the transport lost, a reply that was never
+there. The ack line that measures this (`[mp] ack sent: cmdcount ... clientfail
+... last window credited ...`, verbose-gated) is new in `SendMPAck`.
+
+**Verdict:** the record is not dropped by the guest, the host, or the bus - all
+three are on the record and in step - so the three-player start's gate is the
+title's own, and the remaining measurable difference from the working
+configuration is a guest that skips answers ~7% of rounds when two guests share
+the room. No three-console match was played this pass.
+
 ### 2026-10-22j — the guest panel is swept with the menu harness and nothing on it moves the room: the answer byte follows the host's packet, and the host's game never leaves its three-player roster while both guests are credited
 
 `tools/scripts/tetris-rules-sweep.py` (new) reuses `menu-map.py`'s machinery -

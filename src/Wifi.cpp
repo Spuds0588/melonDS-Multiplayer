@@ -1725,6 +1725,21 @@ void Wifi::SendMPAck(u16 cmdcount, u16 clientfail)
         *(u32*)&ack[0] = PreambleLen(TXSlots[1].Rate);
     }
 
+    /* The one field a guest can use to decide it has been dropped: `clientfail`
+       is what the host's game tells each console about itself, so a guest that
+       leaves a room it is still answering every round has usually read its own
+       bit here. Printed with the mask the window actually credited, because the
+       two disagreeing is the transport blaming a client the host's game has the
+       answer from. */
+    if (mp_trace())
+    {
+        char cf[48];
+        Log(LogLevel::Debug,
+            "[mp] ack sent: cmdcount %u, clientfail %04X (%s), last window credited %04X\n",
+            cmdcount, clientfail, mp_aid_list(clientfail, cf, sizeof(cf)),
+            MPD.last_collect_mask);
+    }
+
     int txlen = Platform::MP_SendAck(ack, 12+32, USTimestamp, NDS.UserData);
     MPD.acks_sent++;
     if (clientfail) MPD.acks_client_fail++;
