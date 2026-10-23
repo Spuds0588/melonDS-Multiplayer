@@ -306,6 +306,12 @@ int MP_SendAck(u8* data, int len, u64 timestamp, void* userdata);
 int MP_RecvHostPacket(u8* data, u64* timestamp, void* userdata);
 u16 MP_RecvReplies(u8* data, u64 timestamp, u16 aidmask, void* userdata);
 
+/* Read replies without waiting inside the poll: the host's Wifi holds the round
+   open across frames instead (Wifi::ProcessTX phase 14), so a blocking poll
+   there would spend the frame's whole budget on the first try and still come
+   back empty. See MPInterface::SetReplyEager. */
+void MP_SetReplyEager(bool eager);
+
 
 // network comm interface
 // packet type: Ethernet (802.3)

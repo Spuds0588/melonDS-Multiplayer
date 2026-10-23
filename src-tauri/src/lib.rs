@@ -215,6 +215,9 @@ struct MDMPDigest {
     cmds_tx_dup: u64,
     acks_sent: u64,
     acks_client_fail: u64,
+    reply_deferred: u64,
+    reply_defer_exhausted: u64,
+    reply_defer_us: u64,
     replies_written: u64,
     replies_collected: u64,
     replies_blank: u64,
@@ -538,13 +541,16 @@ fn mp_digest_lines(p: usize, d: &MDMPDigest, prev: &MDMPDigest) -> Vec<String> {
     // transmitted a command has nothing to say here.
     if d.cmds_tx > 0 {
         counters.push_str(&format!(
-            " · host side: cmds tx {}(+{}, dup {}) · acks {}(+{}, clientfail {})",
+            " · host side: cmds tx {}(+{}, dup {}) · acks {}(+{}, clientfail {}) · rendezvous {}(+{} gave up, {}us held)",
             d.cmds_tx,
             d64(d.cmds_tx, prev.cmds_tx),
             d.cmds_tx_dup,
             d.acks_sent,
             d64(d.acks_sent, prev.acks_sent),
             d.acks_client_fail,
+            d.reply_deferred,
+            d64(d.reply_defer_exhausted, prev.reply_defer_exhausted),
+            d64(d.reply_defer_us, prev.reply_defer_us),
         ));
     }
 
@@ -4626,6 +4632,8 @@ fn ctrl_probe(app: &tauri::AppHandle, player: usize) -> Result<serde_json::Value
         "closed_owed": wifi.closed_owed,
         "reanchor_dropped": wifi.reanchor_dropped,
         "clientfail": wifi.acks_client_fail,
+        "rendezvous": wifi.reply_deferred,
+        "rendezvous_exhausted": wifi.reply_defer_exhausted,
         "cmds_tx": wifi.cmds_tx,
         "cmds_rx": wifi.cmds_rx,
         /* The rest of the reply queue's own ledger. The per-second log line

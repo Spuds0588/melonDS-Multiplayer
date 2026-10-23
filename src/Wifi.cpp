@@ -267,6 +267,26 @@ static bool arm_persist()
     return on;
 }
 
+/* Reply rendezvous (MD_REPLY_DEFER_FRAMES, default 3 frames; 0 = off).
+
+   How long a host's command slot may hold its ack open for clients that have
+   not answered yet, in emulated frames. Measured at three consoles (2026-10-23):
+   the rounds that were reported as `clientfail` had their owed answer collected
+   by the next window in 33 of 41 cases, i.e. the client's game produced it a
+   frame or two after the round that asked for it. The rendezvous turns the
+   round's close into "every client this command addressed has answered", with
+   this bound as the only way out (counted as `reply_defer_exhausted`, a
+   violation on a healthy link). */
+static int reply_defer_frames()
+{
+    static const int frames = []() {
+        const char* v = std::getenv("MD_REPLY_DEFER_FRAMES");
+        if (v && *v) return (int)strtol(v, nullptr, 10);
+        return 3;
+    }();
+    return frames;
+}
+
 /* Same-round reply (MD_SAME_ROUND_REPLY, default OFF).
 
    The held arm answers each poll with the arm the game wrote while handling the
@@ -1888,6 +1908,36 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
                     MPD.last_collect_us = USTimestamp;
                 }
 
+                /* Reply rendezvous: a client that owes an answer gets the
+                   round held open for it instead of being reported failed.
+                   The ack is not sent yet and W_TXBusy stays set, so the game
+                   waits exactly as it waits for a slow radio; phase 14 re-polls
+                   eagerly until the round's clients have all answered or the
+                   frame budget is spent. Healthy rounds (every asked client
+                   already credited) never enter it, so the two-console path is
+                   byte-for-byte what it was. */
+                {
+                    const int defer_frames = reply_defer_frames();
+                    const u16 owed = (u16)(MPClientMask & ~res);
+                    if ((defer_frames > 0) && owed)
+                    {
+                        MPDeferAsked = MPClientMask;
+                        MPDeferCredited = res;
+                        MPDeferStart = USTimestamp;
+                        MPD.reply_deferred++;
+
+                        if (mp_trace())
+                            Log(LogLevel::Debug,
+                                "[mp] reply rendezvous: round %04X held open - owed %04X, up to "
+                                "%d frames\n",
+                                MPDeferAsked, owed, defer_frames);
+
+                        slot->CurPhase = 14;
+                        slot->CurPhaseTime = 4 * kTimerInterval;
+                        return true;
+                    }
+                }
+
                 // TODO: 112 likely includes the ack preamble, which needs adjusted
                 // for long-preamble settings
                 slot->CurPhase = 2;
@@ -2005,6 +2055,66 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
             }
         }
         return true;
+
+    case 14: // MP host reply rendezvous (the ack is held open for a client that owes an answer)
+        {
+            /* Polled eagerly: the waiting here is this slot's own emulated
+               time, so a poll must cost nothing (see SetReplyEager). Every
+               tick asks the bus again; the round closes when every client the
+               command addressed has answered, or when the frame budget is
+               spent - the latter is the violation path a healthy link never
+               takes, and it is counted so that "never" is a measurement. */
+            Platform::MP_SetReplyEager(true);
+            u16 res = 0;
+            if (MPClientMask)
+                res = Platform::MP_RecvReplies(MPClientReplies, USTimestamp, MPClientMask, NDS.UserData);
+            Platform::MP_SetReplyEager(false);
+
+            MPClientFail &= ~res;
+            MPDeferCredited |= res;
+            if (res)
+            {
+                MPD.last_collect_mask = res;
+                MPD.last_collect_us = USTimestamp;
+            }
+
+            const u16 owed = (u16)(MPDeferAsked & ~MPDeferCredited);
+            const u64 waited = USTimestamp - MPDeferStart;
+            const u64 budget = (u64)reply_defer_frames() * 16715; // one emulated frame, in US ticks
+
+            if (!owed || (waited >= budget))
+            {
+                if (owed)
+                {
+                    MPD.reply_defer_exhausted++;
+                    if (mp_trace())
+                        Log(LogLevel::Warn,
+                            "[mp] reply rendezvous: gave up on %04X after %llu us (%.2f frames) - "
+                            "the client did not answer the round it was handed\n",
+                            owed, (unsigned long long)waited, waited / 16715.0);
+                }
+                else if (mp_trace())
+                {
+                    Log(LogLevel::Debug,
+                        "[mp] reply rendezvous: round %04X closed with every client answered after "
+                        "%llu us (%.2f frames)\n",
+                        MPDeferAsked, (unsigned long long)waited, waited / 16715.0);
+                }
+
+                MPD.reply_defer_us += waited;
+
+                // the ack goes out now, with whatever the round actually collected
+                slot->CurPhase = 2;
+                slot->CurPhaseTime = 112 + ((10 + IOPORT(W_CmdReplyTime)) * NumClients(MPClientMask));
+            }
+            else
+            {
+                slot->CurPhaseTime = 4 * kTimerInterval;
+            }
+        }
+        /* Not finished: the slot stays open (W_TXBusy keeps its command bit,
+           TXCurSlot stays 1) until the ack has actually gone out in phase 2. */
+        break;
 
     case 13: // MP transfer failed (timeout)
         {

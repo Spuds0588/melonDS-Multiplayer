@@ -1002,7 +1002,11 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
 
     const auto window_opened_at = std::chrono::steady_clock::now();
     const auto close_window = [&](const char* reason) {
-        if (!trace_replies()) return;
+        /* An eager poll is not a window: the host's reply rendezvous asks the
+           queue once per timer tick while its slot is held open, and logging
+           each one would bury a session's real windows under thousands of
+           "closed after 0us, still owed" lines that mean "not yet". */
+        if (ReplyEager || !trace_replies()) return;
         const long long spent = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - window_opened_at).count();
         const u16 owed = OwedReplies(inst, aidmask);
@@ -1038,6 +1042,12 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
            probes that each re-ran the 34ms ceiling turned one Tetris room's
            470ms windows into a 3fps stall group (2026-10-22). */
         if (extended_frames > 0) waitms = kExtendSliceMs;
+
+        /* A poll made by the host's reply rendezvous must not block at all:
+           the host's Wifi is holding the round open across frames for it, and
+           its own phase timers are the clock now (see
+           MPInterface::SetReplyEager and Wifi::ProcessTX phase 14). */
+        if (ReplyEager) waitms = 0;
 
         /* ... and only while the clients this poll names are the ones that have
            been answering.
@@ -1172,8 +1182,11 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
 
             // no more replies available
             close_window(owed ? "no reply after the client's own round" : "no reply in the slice");
-            if (!ret) self.diag.windows_empty++;
-            if (owed) self.diag.closed_owed++;
+            if (!ReplyEager)
+            {
+                if (!ret) self.diag.windows_empty++;
+                if (owed) self.diag.closed_owed++;
+            }
             return ret;
         }
 
@@ -1186,7 +1199,7 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
         {
             Mutex_Unlock(MPQueueLock);
             close_window("queue empty");
-            if (!ret) self.diag.windows_empty++;
+            if (!ReplyEager && !ret) self.diag.windows_empty++;
             return ret;
         }
 

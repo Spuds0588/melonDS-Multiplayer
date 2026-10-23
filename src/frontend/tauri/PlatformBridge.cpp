@@ -692,6 +692,11 @@ int MP_RecvHostPacket(u8* data, u64* timestamp, void* userdata)
     return got;
 }
 
+void MP_SetReplyEager(bool eager)
+{
+    if (auto* bus = md::link_bus()) bus->SetReplyEager(eager);
+}
+
 u16 MP_RecvReplies(u8* data, u64 timestamp, u16 aidmask, void* userdata)
 {
     auto* bus = md::link_bus();

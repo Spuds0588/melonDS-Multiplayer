@@ -429,6 +429,9 @@ typedef struct MDMPDigest
     uint64_t cmds_tx_dup;      /* ... of which repeated the previous seqno */
     uint64_t acks_sent;        /* acks it transmitted */
     uint64_t acks_client_fail; /* ... of which reported a failed client */
+    uint64_t reply_deferred;   /* rounds whose ack was held open for a client that owed an answer */
+    uint64_t reply_defer_exhausted; /* ... that gave up after the frame budget (violation path) */
+    uint64_t reply_defer_us;        /* emulated microseconds of that waiting, summed */
 
     /* the shared reply queue, from this console's point of view */
     uint64_t replies_written;  /* answers its own game handed to the bus */

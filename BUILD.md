@@ -920,6 +920,24 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   (`LocalMP::RecvReplies`), opens the room on all three at 59.7-59.9 fps. A
   window whose clients have all gone quiet keeps both old caps (one frame, and
   whatever the frame has left), which is the case this budget was written for.
+* **`MD_REPLY_DEFER_FRAMES` holds a host round open until its clients have
+  answered** (default **3** emulated frames; 0 turns it off). This is the reply
+  rendezvous, and it is the path the host takes whenever a command's first poll
+  leaves an addressed client uncredited: `Wifi::ProcessTX` phase 14 keeps
+  `W_TXBusy` set, so the game waits for the ack exactly as it waits for a slow
+  radio, and re-polls once per timer tick through `Platform::MP_SetReplyEager` -
+  a poll that never blocks, because the waiting is now the slot's own emulated
+  time. The ack goes out when every client the command addressed has answered,
+  or when the bound is spent; the give-up is the only timeout left on this path
+  and is counted as `reply_defer_exhausted` (with `reply_deferred` and
+  `reply_defer_us` in the reply digest and `probe`). Measured on Tetris DS's
+  card room (2026-10-23): `clientfail` **0/560** acks at three consoles and
+  **0/440** at four, against 9.5% at three before it, while the two-console
+  control keeps its live match (1/799). A round that has to wait holds for
+  about one emulated frame; forcing the bound to 1 frame makes three rounds give
+  up and exactly those three acks report `clientfail`, which is how the
+  violation path is exercised. Healthy rounds never enter phase 14, so a
+  two-console session's traffic is unchanged.
 * **`MD_REPLY_EXTEND_FRAMES` lets a window outlive its ceiling for a client that
   has not taken its own round yet** (default **0**, i.e. never). When a window's
   ceiling expires with answers still owed, `LocalMP::RecvReplies` asks a question

@@ -279,6 +279,9 @@ public:
         u64 cmds_tx_dup;     // ... of which repeated the previous seqno
         u64 acks_sent;       // acks transmitted
         u64 acks_client_fail;// ... of which reported a failed client
+        u64 reply_deferred;  // rounds whose ack was held open for a client that owed an answer
+        u64 reply_defer_exhausted; // ... that gave up after the frame budget (the violation path)
+        u64 reply_defer_us;        // emulated microseconds of that waiting, summed
 
         /* ---- the host's own round loop (v0.1.9bg) ----
 
@@ -667,6 +670,23 @@ private:
     int MPReplyTimer;
     u16 MPClientMask, MPClientFail;
     bool MPLoopAlive;      // the host's game is writing rounds (see MPDiag)
+
+    /* ---- reply rendezvous (2026-10-23) ----
+
+       The host's command slot used to decide the round in one instant: poll,
+       then ack with whatever was there, and a client whose answer was one frame
+       behind got `clientfail`. Measured at three consoles (9.5% of acks) the
+       owed answer was almost always collected by the next window, so the round
+       was being closed a moment too early. Phase 14 holds the slot open across
+       frame boundaries - the ack is not sent, W_TXBusy stays set, the game keeps
+       waiting exactly as it does for a slow radio - and re-polls eagerly once
+       per timer tick until every client the command addressed has answered, or
+       `MD_REPLY_DEFER_FRAMES` emulated frames have passed (the violation path).
+       `MPDeferAsked` is the round's addressed mask, `MPDeferCredited` what has
+       been collected so far, `MPDeferStart` the timestamp the round was opened. */
+    u16 MPDeferAsked;
+    u16 MPDeferCredited;
+    u64 MPDeferStart;
 
     /* Which piece of code is starting a reception, so the delivery trace can
        name it: 0 none, 1 the MP reply handoff, 2 an association response,

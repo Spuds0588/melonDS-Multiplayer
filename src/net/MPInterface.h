@@ -107,6 +107,18 @@ public:
         return left > 0 ? left : 0;
     }
 
+    /* Read the reply queue but never wait inside the poll.
+
+       The host's Wifi can hold a round open across the frame boundary instead
+       (`Wifi::ProcessTX` phase 14, the reply rendezvous): it re-polls once per
+       timer tick until the clients that owe an answer have produced it, or a
+       stated number of emulated frames has passed. In that mode each poll must
+       cost nothing, because the waiting is now the slot's own emulated time -
+       a poll that blocks for a wall-clock ceiling would spend the frame's budget
+       on the first try and then still be empty. */
+    void SetReplyEager(bool eager) noexcept { ReplyEager = eager; }
+    [[nodiscard]] bool GetReplyEager() const noexcept { return ReplyEager; }
+
     // function called every video frame
     virtual void Process() = 0;
 
@@ -124,6 +136,7 @@ public:
 protected:
     int RecvTimeout = 25;
     int ReplyTimeout = 25;
+    bool ReplyEager = false;
 
     // per-instance reply-wait budget, see SetReplyBudget above
     static constexpr int kMaxMPInstances = 16;

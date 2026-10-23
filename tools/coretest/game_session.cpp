@@ -794,6 +794,7 @@ int main(int argc, char** argv)
         std::printf("  player %d [%s]: cmds rx=%llu (dup %llu)  answers=%llu (blank %llu, canned %llu)\n"
                     "            arms=%llu  aids=%llu  window reads=%llu  deauth out/in=%llu/%llu\n"
                     "            host side: cmds tx=%llu (dup %llu)  acks=%llu (clientfail %llu)\n"
+                    "            reply rendezvous: %llu rounds held open, %llu gave up, %llu us held\n"
                     "            replies sent=%llu  collected=%llu  empty=%llu  blank=%llu  stale=%llu"
                     "  reanchor-drop=%llu  notlooking=%llu  window-extended=%llu (+%llu frames)  closed-owed=%llu\n"
                     "            last cmd: seq=%04X len=%u body[%s] at %s  last answer: len=%u body[%s] at %s\n"
@@ -808,6 +809,9 @@ int main(int argc, char** argv)
                     (unsigned long long)d.deauth_sent, (unsigned long long)d.deauth_recv,
                     (unsigned long long)d.cmds_tx, (unsigned long long)d.cmds_tx_dup,
                     (unsigned long long)d.acks_sent, (unsigned long long)d.acks_client_fail,
+                    (unsigned long long)d.reply_deferred,
+                    (unsigned long long)d.reply_defer_exhausted,
+                    (unsigned long long)d.reply_defer_us,
                     (unsigned long long)d.replies_written, (unsigned long long)d.replies_collected,
                     (unsigned long long)d.windows_empty, (unsigned long long)d.replies_blank,
                     (unsigned long long)d.stale_dropped, (unsigned long long)d.reanchor_dropped,

@@ -24,6 +24,11 @@
 #                           client whose own emulated round has not come round yet
 #                           (default 0; see LocalMP::RecvReplies - the probes are
 #                           measured not to deliver the answer at 3 consoles)
+#   MD_REPLY_DEFER_FRAMES   emulated frames a host's round may hold its ack open for
+#                           a client that owes an answer (default 3; 0 = off). The
+#                           reply rendezvous: the ack is not sent until every client
+#                           the command addressed has answered, or this bound is
+#                           spent (counted as a violation in the digest).
 #   MD_REPLY_BUDGET_FRAMES  emulated frames of wall clock a frame may spend on
 #                           reply waits in total (default 2; negative = no cap).
 #                           Both are forwarded explicitly: a knob this script does
@@ -142,6 +147,7 @@ setsid nohup bash -c '
     MD_REPLY_TIMEOUT_MS="${MD_REPLY_TIMEOUT_MS:-}" \
     MD_REPLY_BUDGET_FRAMES="${MD_REPLY_BUDGET_FRAMES:-}" \
     MD_REPLY_EXTEND_FRAMES="${MD_REPLY_EXTEND_FRAMES:-}" \
+    MD_REPLY_DEFER_FRAMES="${MD_REPLY_DEFER_FRAMES:-}" \
     MD_MP_FCS="${MD_MP_FCS:-}" MD_STOCK_MP="${MD_STOCK_MP:-}" \
     MD_RX_NOCROP="${MD_RX_NOCROP:-}" \
     MD_MP_REDELIVER="${MD_MP_REDELIVER:-}" \

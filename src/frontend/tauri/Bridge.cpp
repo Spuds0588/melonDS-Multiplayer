@@ -1501,6 +1501,9 @@ int md_link_mp_digest(MDInstance* inst, MDMPDigest* out)
         out->cmds_tx_dup = d.cmds_tx_dup;
         out->acks_sent = d.acks_sent;
         out->acks_client_fail = d.acks_client_fail;
+        out->reply_deferred = d.reply_deferred;
+        out->reply_defer_exhausted = d.reply_defer_exhausted;
+        out->reply_defer_us = d.reply_defer_us;
         out->last_cmd_seq = d.last_cmd_seq;
         out->last_cmd_len = d.last_cmd_len;
         memcpy(out->last_cmd_body, d.last_cmd_body, sizeof(out->last_cmd_body));
