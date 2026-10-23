@@ -476,6 +476,14 @@ public:
         u64 zone_total;
         u16 zone_off[kZone];
         u16 zone_val[kZone];
+        /* Where each of those reads was made. The offset and value say what the
+           game took; the PC says which instruction took it, and with the ROM in
+           hand that is the difference between "it looked at the length word" and
+           "this is the compare that turned it away". R[15] in the emulator
+           already carries the ARM7's pipeline offset, so `pc - 8` (ARM) or
+           `pc - 4` (Thumb) is the load itself. */
+        u32 zone_pc[kZone];
+        u32 zone_lr[kZone];
         u32 zone_n;
 
         /* ---- who wrote the frame the host is about to send ----

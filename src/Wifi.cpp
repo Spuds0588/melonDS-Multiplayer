@@ -4047,6 +4047,11 @@ void Wifi::RecordMPIoRead(u32 addr, u16 val)
             {
                 MPIO.zone_off[MPIO.zone_n] = off;
                 MPIO.zone_val[MPIO.zone_n] = val;
+                /* The load that made this read (see the note on zone_pc):
+                   this is what turns the read order into a place in the game's
+                   own code, which is where the branch behind a storm lives. */
+                MPIO.zone_pc[MPIO.zone_n] = NDS.ARM7.R[15];
+                MPIO.zone_lr[MPIO.zone_n] = NDS.ARM7.R[14];
                 MPIO.zone_n++;
             }
 
@@ -4070,9 +4075,10 @@ void Wifi::RecordMPIoRead(u32 addr, u16 val)
                 Log(LogLevel::Debug,
                     "[mp] the console's game reads the command it was handed: cmd seq=%04X, "
                     "%llu halfwords read so far, this one at %04X=%04X of the %u byte region "
-                    "from %04X\n",
+                    "from %04X, ARM7 pc=%08X lr=%08X\n",
                     MPIO.zone_seq, (unsigned long long)MPIO.zone_total, off, val,
-                    (unsigned)MPIO.zone_len, (unsigned)MPIO.zone_start);
+                    (unsigned)MPIO.zone_len, (unsigned)MPIO.zone_start,
+                    NDS.ARM7.R[15], NDS.ARM7.R[14]);
         }
     }
 }
@@ -4311,11 +4317,12 @@ int Wifi::FormatMPIoReport(char* out, size_t cap) const
         }
         put("\n");
 
-        put("  read order, oldest first (offset:value, H=RX header, B=frame body):\n   ");
+        put("  read order, oldest first (offset:value@pc, H=RX header, B=frame body):\n   ");
         for (u32 i = 0; i < MPIO.zone_n; i++)
         {
             const bool inbody = (u16)((MPIO.zone_off[i] - MPIO.zone_start) & 0x1FFE) >= 12;
-            put(" %04X:%04X%c", MPIO.zone_off[i], MPIO.zone_val[i], inbody ? 'B' : 'H');
+            put(" %04X:%04X@%08X%c", MPIO.zone_off[i], MPIO.zone_val[i],
+                MPIO.zone_pc[i], inbody ? 'B' : 'H');
             if ((i % 8) == 7) put("\n   ");
         }
         put("\n");

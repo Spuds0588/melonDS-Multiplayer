@@ -12,7 +12,7 @@ single-console play.
 > healthy around them. Several titles below clear the wire and stop at the
 > game's own screen — that is recorded as its own result, not rounded up.
 
-- Last updated: 2026-10-23, twenty-sixth pass (the guest's copy is self-consistent with the header it carries in every field a diff can see - payload, length 288, rate, RSSI, mask, AID, 1,248 fresh seqnos, 0 bus redeliveries - so nothing in this tree explains the decline; the wall is placed at the payload's first byte: the storm's driver makes exactly 6 accesses reaching offset 34, the whole 36-byte prefix and no body, while a win makes the same six and then 128 reads to offset 234; and the three `801C 0040 A5A5 5A5A A5A5 5A5A` headers that looked like a delivery defect were this trace reading past the ring's end, now fixed and marked `WRAPS`) (the save confound is retired by an A/B with equal arms - pin 7 wins/1 loss against written 8 wins/0 losses, Fisher p = 1.0 - and the start press's lock is localised: in a storm the guest's own software is handed 1,248 copies of the host's 264-byte start packet and its game reads the body of **none** of them, while every win reads a start packet's body (two or three packets of the two to five sent, never zero); the join-data chunk is neither necessary (abw3 won at 08) nor sufficient (t2t3 lost at 0B)) (the route's "setup table" proof was a false positive and is replaced: it only tested that the host's bottom panel moved, which the title's start handshake also does while the top screen still shows the waiting page - so eleven saved "table/setup" frames were re-scored and **one** is a table, and with an honest gate the two-cart start handshake is **15 wins in 20 trials** with the guest's own join-data chunk advancing past 08 as the only thing that separates them) (the Download Play reading of Tetris DS's start press is retired: the same 264-byte `06 01 <mask> 00 80 11 04 00 00 00 00 4E 49 4E 54 45 4E 44` handshake is sent at 2, 3 and 4 carts, and the two-cart run that plays sends it too - the card room's start is a data transfer at every count, and today's two-cart control failed it in the same shape as four carts, so player count is not the discriminator) (Tetris DS's four-console party assembles on this machine - host room listing Player 1-4, all three guests on "Accepting players now" - and then the host's own start press hands the room the download-image packet, drops its own mask to 0000 and returns all three guests to the join browser: 0 matches in one live run, with the link clean at clientfail 0; the room body is re-advertised 1.15 s after the close and read by every guest, so the browser's missing piece is its own scan, not the host's advertisement) (Tetris DS reached a live **four-console STANDARD match** for the first time, on the unchanged binary, after tracing the room's close: every guest's re-association is accepted with its AID and the host's mask returns to 000E; the same route on the next run re-formed the same room and took no press, so the match is real but not yet reproducible) (Tetris DS two-cart play is reproducible and reaches a live match - re-confirmed this pass, 1,607 match commands - while three and four carts end on the host's own room close, which lands 0.86-6.5 emulated s after each guest associates and is followed by the guests' return at two consoles and by none, or by a second close, at three and four; NSMB's host windows ran under the ask-once policy for the first time)
+- Last updated: 2026-10-23, twenty-seventh pass (the guest's six reads now carry the ARM7 instruction that made them: its wireless driver runs from shared WRAM, and the code after the sequence-control read consults only the driver's own state - bit 7 of `[session+0x33A]`, `[session+0x34C] == 0x40`, `W_AIDLow` - before any payload read; clearing the `0x40` word by poke did not stop the guest, so that field is not the gate and the static reading of the branch is retired) (the guest's copy is self-consistent with the header it carries in every field a diff can see - payload, length 288, rate, RSSI, mask, AID, 1,248 fresh seqnos, 0 bus redeliveries - so nothing in this tree explains the decline; the wall is placed at the payload's first byte: the storm's driver makes exactly 6 accesses reaching offset 34, the whole 36-byte prefix and no body, while a win makes the same six and then 128 reads to offset 234; and the three `801C 0040 A5A5 5A5A A5A5 5A5A` headers that looked like a delivery defect were this trace reading past the ring's end, now fixed and marked `WRAPS`) (the save confound is retired by an A/B with equal arms - pin 7 wins/1 loss against written 8 wins/0 losses, Fisher p = 1.0 - and the start press's lock is localised: in a storm the guest's own software is handed 1,248 copies of the host's 264-byte start packet and its game reads the body of **none** of them, while every win reads a start packet's body (two or three packets of the two to five sent, never zero); the join-data chunk is neither necessary (abw3 won at 08) nor sufficient (t2t3 lost at 0B)) (the route's "setup table" proof was a false positive and is replaced: it only tested that the host's bottom panel moved, which the title's start handshake also does while the top screen still shows the waiting page - so eleven saved "table/setup" frames were re-scored and **one** is a table, and with an honest gate the two-cart start handshake is **15 wins in 20 trials** with the guest's own join-data chunk advancing past 08 as the only thing that separates them) (the Download Play reading of Tetris DS's start press is retired: the same 264-byte `06 01 <mask> 00 80 11 04 00 00 00 00 4E 49 4E 54 45 4E 44` handshake is sent at 2, 3 and 4 carts, and the two-cart run that plays sends it too - the card room's start is a data transfer at every count, and today's two-cart control failed it in the same shape as four carts, so player count is not the discriminator) (Tetris DS's four-console party assembles on this machine - host room listing Player 1-4, all three guests on "Accepting players now" - and then the host's own start press hands the room the download-image packet, drops its own mask to 0000 and returns all three guests to the join browser: 0 matches in one live run, with the link clean at clientfail 0; the room body is re-advertised 1.15 s after the close and read by every guest, so the browser's missing piece is its own scan, not the host's advertisement) (Tetris DS reached a live **four-console STANDARD match** for the first time, on the unchanged binary, after tracing the room's close: every guest's re-association is accepted with its AID and the host's mask returns to 000E; the same route on the next run re-formed the same room and took no press, so the match is real but not yet reproducible) (Tetris DS two-cart play is reproducible and reaches a live match - re-confirmed this pass, 1,607 match commands - while three and four carts end on the host's own room close, which lands 0.86-6.5 emulated s after each guest associates and is followed by the guests' return at two consoles and by none, or by a second close, at three and four; NSMB's host windows ran under the ask-once policy for the first time)
 - Legend: ✅ playable · 🟡 partial (link or lobby, no match) · ⛔ blocked by
   single-card *Download Play* (not supported **yet** — it is a planned feature,
   Milestone 4 of [to-do.md](to-do.md#the-road-to-a-working-2-3-and-4-player-link)) ·
@@ -2841,6 +2841,57 @@ Route (P1 hosts, console 2 is the synthesized client), all taps bottom-screen co
 Past the boot both consoles show the STANDARD lobby with a 2-player roster, the host's A moves it to `Please wait until all of the players have set their rules`, the guest's A confirms, and a versus match runs on both screens with distinct live boards (different wells, different NEXT queues, gameplay-evolving 20 s apart), both frames advancing in lockstep, no further deauths. One host deauth (`reason 0x0013`) is on record mid-session with the session unaffected — unexplained, noted, nothing depends on it.
 
 First boot writes the game's save (new `Test Roms/Tetris DS (USA).sav`; supervisor-pinned, exit 0). Higher player counts (the title supports up to 10 over Download Play) and the other modes (MISSION, PUSH) are unmeasured.
+
+### 2026-10-23 (v0.1.9ey) — the six reads now have instructions, and the code behind them looks only at the driver
+
+The read recorder keeps the ARM7 `pc`/`lr` of every access inside the handed frame,
+and the trace prints them, so the read order can be read as code:
+
+| # | offset | value | ARM7 pc | instruction |
+|---|---|---|---|---|
+| 1-3 | 0, 2, 8 | `801C`, `0040`, `0026` | `037FA07C` | helper that adds `0x04804000` to a stack pointer |
+| 4 | 0 | `801C` | `037FA108` | window table at `0x37FA3DC` |
+| 5 | 12 | `0228` | `037FA1A8` | `ldrh fp,[r0]` at `1A4` — the frame control |
+| 6 | 34 | `0210` | `037FA1B4` | `ldrh r6,[r0]` at `1B0` — the sequence control |
+
+The PCs sit in `0x037F9xxx`, the ARM7's mirror of the 32 KB shared WRAM, so Tetris
+DS uploads its wireless driver there and runs it from WRAM. The region was dumped
+from a live session (`appctl.py mem --cpu 7`) and disassembled
+(`arm-none-eabi-objdump -b binary -m armv4t`); the dump and listing are
+`game-captures/pc-gate-2026-10-23/`.
+
+**What the code does after read 6** (disassembly, `0x37FA1A4`-`0x37FA21C`):
+
+```
+cmp  r0,r6            ; stored seq vs incoming sequence control
+bne  0x37FA1E8        ; different -> normal path
+ands r0,fp,#0x800     ; same seq: a frame-control bit
+beq  0x37FA1E8
+...                   ; duplicate: counted and dropped
+0x37FA1E8: bit 7 of [session+0x33A] -> return if set
+0x37FA204: [session+0x34C] == 0x40  -> return if not
+0x37FA210: W_AIDLow == 0            -> the no-AID path
+```
+
+So inside that block, from the duplicate test to its return, there is **no further
+access to the frame** — only the driver's own words and one register. In a live win
+those read `0x0047` (bit 7 clear), `0x00000040` and `0x0001`, i.e. all three pass
+and the driver goes on to read the payload (offsets 94 and 222 in a win). That is
+the field diff's verdict confirmed from inside the guest. Whether a short command
+frame reaches this block at all is what the poke below puts in doubt.
+
+**The one hypothesis this pass could test, and it failed.** If the `0x40` mode word
+were the storm's gate, clearing it should stop the guest consuming command frames.
+In a held session the word was poked from `0x00000040` to `0x00010000`; the poke
+persisted, and the guest went on answering (7,353 `answer sent`) and reading its six
+halfwords of every 38-byte command frame. So that field is not the gate on this
+path, and the static reading of `0x37FA1E8` is retired rather than published as the
+answer. The storm side is still the recorded t2t6 exemplar: the start packet was
+never sent in the poke session (the host's A press in the held state produced none).
+
+**Next:** run `appctl.py pctrace` over `0x037F8000-0x03800000` for the guest across
+a start packet, in a win and in a storm, and compare the executed paths after read
+6. Static reading has now given what it can.
 
 ### 2026-10-23 (v0.1.9ex) — the copy is self-consistent with its header, and the wall is exactly at the payload's first byte
 
