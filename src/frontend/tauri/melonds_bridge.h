@@ -438,6 +438,9 @@ typedef struct MDMPDigest
     uint64_t stale_dropped;    /* answers skipped for being too old */
     uint64_t reanchor_dropped; /* unread answers discarded by a new command */
     uint64_t not_looking;      /* windows that never ran: no peer attached */
+    uint64_t windows_extended; /* windows that outlived the ceiling for an owed client's round */
+    uint64_t extension_frames; /* emulated frames of extra wait those windows spent */
+    uint64_t closed_owed;      /* windows that closed with answers owed after their clients ran a round */
 
     /* the last frames seen, bodies included */
     uint16_t last_cmd_seq;

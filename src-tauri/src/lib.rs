@@ -222,6 +222,9 @@ struct MDMPDigest {
     stale_dropped: u64,
     reanchor_dropped: u64,
     not_looking: u64,
+    windows_extended: u64,
+    extension_frames: u64,
+    closed_owed: u64,
     last_cmd_seq: u16,
     last_cmd_len: u16,
     last_cmd_body: [u8; 16],
@@ -501,7 +504,7 @@ fn mp_digest_lines(p: usize, d: &MDMPDigest, prev: &MDMPDigest) -> Vec<String> {
     let d64 = |now: u64, then: u64| now.wrapping_sub(then);
 
     let mut counters = format!(
-        "mp p{} [{}]: cmds rx {}(+{}, dup {}) · answered {}(+{}, blank {}, canned {}) · arms {} aids {} · window reads {}(+{}) · replies sent {} collected {}(+{}) empty {}(+{}) stale {} reanchor-dropped {} blank {} notlooking {} · deauth out {} in {}",
+        "mp p{} [{}]: cmds rx {}(+{}, dup {}) · answered {}(+{}, blank {}, canned {}) · arms {} aids {} · window reads {}(+{}) · replies sent {} collected {}(+{}) empty {}(+{}) stale {} reanchor-dropped {} blank {} notlooking {} · window extended {}(+{} frames) closed-owed {} · deauth out {} in {}",
         p + 1,
         role,
         d.cmds_rx,
@@ -524,6 +527,9 @@ fn mp_digest_lines(p: usize, d: &MDMPDigest, prev: &MDMPDigest) -> Vec<String> {
         d.reanchor_dropped,
         d.replies_blank,
         d.not_looking,
+        d.windows_extended,
+        d.extension_frames,
+        d.closed_owed,
         d.deauth_sent,
         d.deauth_recv,
     );
@@ -4615,6 +4621,9 @@ fn ctrl_probe(app: &tauri::AppHandle, player: usize) -> Result<serde_json::Value
         "deauth_reason": format!("{:04X}", wifi.last_deauth_reason),
         "collected": wifi.replies_collected,
         "empty": wifi.windows_empty,
+        "window_extended": wifi.windows_extended,
+        "extension_frames": wifi.extension_frames,
+        "closed_owed": wifi.closed_owed,
         "reanchor_dropped": wifi.reanchor_dropped,
         "clientfail": wifi.acks_client_fail,
         "cmds_tx": wifi.cmds_tx,

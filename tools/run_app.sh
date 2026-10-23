@@ -19,7 +19,11 @@
 #   RUST_LOG          host log level (default info; "debug" is very chatty)
 #   MD_LINK_VERBOSE=1 per-kind link counters in the health lines
 #   MD_LINK_PROBE=1   enable packet-injecting link probes (off by default)
-#   MD_REPLY_TIMEOUT_MS     per-window reply ceiling (default 34 = ~2 emulated frames)
+#   MD_REPLY_TIMEOUT_MS     per-window reply ceiling (default 67 = ~4 emulated frames)
+#   MD_REPLY_EXTEND_FRAMES  how many frames a window may outlive that ceiling for a
+#                           client whose own emulated round has not come round yet
+#                           (default 0; see LocalMP::RecvReplies - the probes are
+#                           measured not to deliver the answer at 3 consoles)
 #   MD_REPLY_BUDGET_FRAMES  emulated frames of wall clock a frame may spend on
 #                           reply waits in total (default 2; negative = no cap).
 #                           Both are forwarded explicitly: a knob this script does
@@ -137,6 +141,7 @@ setsid nohup bash -c '
     MD_CMD_RETRY_NOTIFY="${MD_CMD_RETRY_NOTIFY:-}" \
     MD_REPLY_TIMEOUT_MS="${MD_REPLY_TIMEOUT_MS:-}" \
     MD_REPLY_BUDGET_FRAMES="${MD_REPLY_BUDGET_FRAMES:-}" \
+    MD_REPLY_EXTEND_FRAMES="${MD_REPLY_EXTEND_FRAMES:-}" \
     MD_MP_FCS="${MD_MP_FCS:-}" MD_STOCK_MP="${MD_STOCK_MP:-}" \
     MD_RX_NOCROP="${MD_RX_NOCROP:-}" \
     MD_MP_REDELIVER="${MD_MP_REDELIVER:-}" \

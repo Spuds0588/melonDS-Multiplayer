@@ -795,7 +795,7 @@ int main(int argc, char** argv)
                     "            arms=%llu  aids=%llu  window reads=%llu  deauth out/in=%llu/%llu\n"
                     "            host side: cmds tx=%llu (dup %llu)  acks=%llu (clientfail %llu)\n"
                     "            replies sent=%llu  collected=%llu  empty=%llu  blank=%llu  stale=%llu"
-                    "  reanchor-drop=%llu  notlooking=%llu\n"
+                    "  reanchor-drop=%llu  notlooking=%llu  window-extended=%llu (+%llu frames)  closed-owed=%llu\n"
                     "            last cmd: seq=%04X len=%u body[%s] at %s  last answer: len=%u body[%s] at %s\n"
                     "            last deauth reason=%04X  last ack clientfail=%04X\n",
                     p + 1,
@@ -812,6 +812,9 @@ int main(int argc, char** argv)
                     (unsigned long long)d.windows_empty, (unsigned long long)d.replies_blank,
                     (unsigned long long)d.stale_dropped, (unsigned long long)d.reanchor_dropped,
                     (unsigned long long)d.not_looking,
+                    (unsigned long long)d.windows_extended,
+                    (unsigned long long)d.extension_frames,
+                    (unsigned long long)d.closed_owed,
                     d.last_cmd_seq, (unsigned)d.last_cmd_len, cmdbody, at_us(d.last_cmd_us).c_str(),
                     (unsigned)d.last_answer_len, ansbody, at_us(d.last_answer_us).c_str(),
                     d.last_deauth_reason, d.last_ack_clientfail);

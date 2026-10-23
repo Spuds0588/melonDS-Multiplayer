@@ -920,6 +920,26 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   (`LocalMP::RecvReplies`), opens the room on all three at 59.7-59.9 fps. A
   window whose clients have all gone quiet keeps both old caps (one frame, and
   whatever the frame has left), which is the case this budget was written for.
+* **`MD_REPLY_EXTEND_FRAMES` lets a window outlive its ceiling for a client that
+  has not taken its own round yet** (default **0**, i.e. never). When a window's
+  ceiling expires with answers still owed, `LocalMP::RecvReplies` asks a question
+  about the client's own emulated progress instead of a clock - how many times
+  that client has polled for its host's command since this one went out, against
+  a per-AID baseline taken at send time - and, if it has not yet run a whole
+  round past the command, waits one more frame per probe up to this many frames.
+  The digest and `probe` carry what it did: `windows_extended`,
+  `extension_frames` and `closed_owed` (windows that closed with answers owed
+  after those clients had had their round). It is **off by default because the
+  probes are measured not to deliver**: on Tetris DS's three-console card room
+  (2026-10-23) six probe frames cut `clientfail` from 9.5 % to 6.1 % of acks, but
+  every remaining miss still closed owed after ~165 ms and the room died earlier
+  than it does with the probes off. The consoles cross a per-frame barrier
+  together (`Lockstep`, `src-tauri/src/lib.rs`), so a host waiting inside a
+  window is holding the client that owes the answer - only ending the frame lets
+  it run, and the owed answer is then collected by the next window (33 of 41 in
+  the same run). A build that re-ran the full ceiling per probe instead of one
+  frame produced 470 ms windows and a 3 fps group, which is why a probe is one
+  frame and the total is bounded.
 * **Each console has its own MAC.** `md_load_rom` assigns a per-slot MAC out of
   the firmware image (slot 0 keeps the firmware's, the rest get offsets - the
   same scheme melonDS's Qt frontend uses for its extra instances), because two

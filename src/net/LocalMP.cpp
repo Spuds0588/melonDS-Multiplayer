@@ -54,12 +54,15 @@
 
 #include "LocalMP.h"
 
+#include <chrono>
+
 using namespace melonDS;
 using namespace melonDS::Platform;
 
 namespace melonDS {
 static bool trace_replies();
 static int reply_keep();
+static int reply_extend_frames();
 static bool stock_mp();
 static bool mp_fcs();
 static u32 mp_fcs32(const u8* frame, int len) noexcept;
@@ -586,6 +589,25 @@ int LocalMP::SendPacketGeneric(int inst, u32 type, u8* packet, int len, u64 time
         Semaphore_Reset(Consoles[inst].answerSem);
         if (kept)
             Semaphore_Post(Consoles[inst].answerSem, (int)kept);
+
+        /* Every asked client owes this round a reply, and "owes" is counted
+           from that client's own send side: the bus knows how many replies it
+           has routed for each console, so "has this client put anything on the
+           wire since this command went out" needs no clock at all. The
+           baseline is per AID because that is the identity the command's mask
+           speaks in; the AID's owner is the console that last stamped it (see
+           the note on aid_owner), so a client that has not answered since the
+           room opened is outside the count for its first round only. */
+        for (int a = 1; a < 16; a++)
+        {
+            const int owner = Consoles[inst].aid_owner[a];
+            Consoles[inst].aid_baseline[a] =
+                ((owner >= 0) && (owner < kMaxMPConsoles))
+                    ? Consoles[owner].diag.replies_written : 0;
+            Consoles[inst].aid_poll_baseline[a] =
+                ((owner >= 0) && (owner < kMaxMPConsoles))
+                    ? Consoles[owner].host_polls : 0;
+        }
     }
 
     Platform::Semaphore* posts[kMaxMPConsoles];
@@ -682,6 +704,21 @@ static int reply_keep()
     return keep;
 }
 
+/* How many frames a reply window may outlive its ceiling for a client that has
+   not yet taken its own round (see RecvReplies). Default 0: the measurement
+   that introduced the gate showed the extra wait does not get the answer the
+   window is waiting for - the answer arrives once the *host's* frame ends - so
+   the ceiling stays the honest close until a run says otherwise. */
+static int reply_extend_frames()
+{
+    static const int frames = []() {
+        const char* v = std::getenv("MD_REPLY_EXTEND_FRAMES");
+        if (v && *v) return (int)strtol(v, nullptr, 10);
+        return 0;
+    }();
+    return frames;
+}
+
 /* The pre-fork transport, for the reference A/B the 2026-09-28 pass was asked
    to run: `MD_STOCK_MP=1` puts this file's two reply-queue decisions back to
    what stock melonDS does (drop every unread answer when a command goes out,
@@ -752,6 +789,13 @@ bool LocalMP::ApplyWireFCS(u8* dst, const u8* src, size_t len) noexcept
 int LocalMP::RecvPacketGeneric(int inst, u8* packet, bool block, u64* timestamp) noexcept
 {
     Console& self = Consoles[inst];
+
+    /* A blocking poll is a guest asking for its host's next command, i.e. it
+       opening one of its own emulated rounds. Counted before the wait: a poll
+       that finds nothing is still a round this console took, and the host's
+       reply window uses the count to tell "this client has not run its round
+       yet" from "this client ran its round and chose not to answer". */
+    if (block) self.host_polls++;
 
     if (!Semaphore_TryWait(self.frameSem, block ? RecvTimeout : 0))
         return 0;
@@ -891,6 +935,24 @@ int LocalMP::RecvHostPacket(int inst, u8* packet, u64* timestamp)
     return RecvPacketGeneric(inst, packet, true, timestamp);
 }
 
+/* The asked AIDs whose console has put nothing on the wire since the newest
+   command went out: that client has not answered this round, by its own send
+   counter rather than by a clock. An AID whose owner is unknown is not counted
+   as owing - there is nothing to ask. */
+u16 LocalMP::OwedReplies(int inst, u16 aidmask) const noexcept
+{
+    u16 owed = 0;
+    for (int a = 1; (a < 16) && (a <= kMaxMPConsoles); a++)
+    {
+        if (!(aidmask & (1 << a))) continue;
+        const int owner = Consoles[inst].aid_owner[a];
+        if ((owner < 0) || (owner >= kMaxMPConsoles)) continue;
+        if (Consoles[owner].diag.replies_written == Consoles[inst].aid_baseline[a])
+            owed |= (u16)(1 << a);
+    }
+    return owed;
+}
+
 u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
 {
     Console& self = Consoles[inst];
@@ -924,6 +986,39 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
     u16 ret = 0;
     u16 heard = (u16)(1 << inst);
 
+    /* Wall time a window spends waiting is time the group spends anyway when
+       the client it waits for is working on the answer, and pure loss when it
+       is not. Both sides are on the record here: what arrived, and what the
+       asked clients still owed on their own send counters when the window
+       closed. */
+    /* How far a window may outlive its own ceiling for a client whose round has
+       not come round yet, as a hard bound in emulated frames. The gate below
+       decides *whether* to wait; this decides that the waiting always ends.
+       MD_REPLY_EXTEND_FRAMES sets it, so the gate can be compared against the
+       plain ceiling on the same binary (0 = never outlive the ceiling). */
+    const int extend_budget = reply_extend_frames();
+    constexpr int kExtendSliceMs = 16; // one emulated frame per probe
+    int extended_frames = 0;
+
+    const auto window_opened_at = std::chrono::steady_clock::now();
+    const auto close_window = [&](const char* reason) {
+        if (!trace_replies()) return;
+        const long long spent = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - window_opened_at).count();
+        const u16 owed = OwedReplies(inst, aidmask);
+        char list[32] = "none";
+        if (owed)
+        {
+            int w = 0;
+            for (int a = 1; (a < 16) && (w < (int)sizeof(list) - 4); a++)
+                if (owed & (1 << a)) w += snprintf(&list[w], sizeof(list) - (size_t)w, "%s%d", w ? "," : "", a);
+        }
+        Log(LogLevel::Debug,
+            "reply window: p%d closed (%s) after %lldus wall, collected=%04X of %04X, "
+            "still owed %04X (%s)\n",
+            inst + 1, reason, spent, ret, aidmask, owed, list);
+    };
+
     for (;;)
     {
         /* Waiting for a reply is wall-clock time spent inside an emulated
@@ -936,6 +1031,13 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
            nobody is answering; see the `answering` test under them for the
            case they must not apply to. */
         int waitms = ReplyTimeout;
+
+        /* An extension probe is one frame long, not another full ceiling: the
+           point of the probe is to ask the queue again after giving a peer one
+           more frame's worth of wall clock, not to restart the ceiling. Six
+           probes that each re-ran the 34ms ceiling turned one Tetris room's
+           470ms windows into a 3fps stall group (2026-10-22). */
+        if (extended_frames > 0) waitms = kExtendSliceMs;
 
         /* ... and only while the clients this poll names are the ones that have
            been answering.
@@ -1006,11 +1108,72 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
 
         if (!Semaphore_TryWait(self.answerSem, waitms))
         {
+            /* The ceiling is wall clock, and what the window actually means is
+               emulated rounds: every client it asked has had one of its own
+               rounds in which to answer. Those are not the same thing at three
+               consoles - measured on Tetris DS's card room, 2026-10-22: 38 of
+               571 windows closed empty after burning the full ceiling, and in
+               almost every one of them the owed client's answer turned up
+               within the next few windows, i.e. the client was working on a
+               round of its own whose wall cost was longer than the ceiling.
+               Each of those windows became a `clientfail` bit in the host's
+               ack, and the title answered a handful of them by closing the
+               room.
+
+               So an expiry is re-asked as a question about the client's own
+               progress, by counters only: has it polled since this command's
+               round, and has it run a whole round past it? Two polls means it
+               had its chance in its own round and still put nothing on the
+               wire - a real miss, counted (closed_owed) rather than guessed
+               at; fewer than two means the client may still be inside the
+               round that answers this command.
+
+               MD_REPLY_EXTEND_FRAMES (default 0) turns that answer into extra
+               wait, one frame per probe. It defaults off because the probes do
+               not deliver: on the three-console Tetris room (2026-10-22) 6
+               probes cut `clientfail` from 9.5% to 6.1% (34/359 acks to
+               28/460) but every one of the 28 remaining windows still closed
+               owed after ~165ms, and the room died earlier than it does without
+               the probes. The consoles advance their frames together at the
+               Rust host's per-frame barrier, so the client whose answer is
+               missing is held by the same barrier the host is sitting in: the
+               wait cannot let it run, only the host ending its frame can, and
+               the answer that was owed at the close is collected by the next
+               window (measured: 33 of 41 owed AIDs within three windows). So
+               the ceiling is the honest close even though it is wall clock,
+               and what is left to fix is the cadence itself, not this wait. */
+            const u16 owed = OwedReplies(inst, aidmask);
+            bool before_chance = false;
+            bool past_chance = false;
+            for (int a = 1; (a < 16) && (a <= kMaxMPConsoles); a++)
+            {
+                if (!(owed & (1 << a))) continue;
+                const int owner = Consoles[inst].aid_owner[a];
+                if ((owner < 0) || (owner >= kMaxMPConsoles)) continue;
+                /* One poll is the command's own round (the client may still be
+                   inside it); two means it opened a round after this command
+                   and still had nothing to put on the wire. */
+                const u64 rounds = Consoles[owner].host_polls - Consoles[inst].aid_poll_baseline[a];
+                if (rounds >= 2) past_chance = true;
+                else before_chance = true;
+            }
+
+            if (owed && before_chance && !past_chance && (extended_frames < extend_budget))
+            {
+                if (extended_frames++ == 0) self.diag.windows_extended++;
+                self.diag.extension_frames++;
+                if (trace_replies())
+                    Log(LogLevel::Debug,
+                        "reply window: p%d outlived its ceiling with %04X still owed - the client "
+                        "has not seen this round yet, waiting one more (%d of %d frames)\n",
+                        inst + 1, owed, extended_frames, extend_budget);
+                continue;
+            }
+
             // no more replies available
-            if (trace_replies())
-                Log(LogLevel::Debug, "reply window closed for p%d with collected=%04X\n",
-                    inst + 1, ret);
+            close_window(owed ? "no reply after the client's own round" : "no reply in the slice");
             if (!ret) self.diag.windows_empty++;
+            if (owed) self.diag.closed_owed++;
             return ret;
         }
 
@@ -1022,6 +1185,7 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
         if (self.answerRead == self.answerWrite)
         {
             Mutex_Unlock(MPQueueLock);
+            close_window("queue empty");
             if (!ret) self.diag.windows_empty++;
             return ret;
         }
@@ -1211,6 +1375,7 @@ u16 LocalMP::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
                     inst + 1, ret, aidmask);
 
             Mutex_Unlock(MPQueueLock);
+            close_window("all asked for");
             return ret;
         }
 

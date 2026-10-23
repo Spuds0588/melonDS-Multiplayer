@@ -1549,6 +1549,9 @@ int md_link_mp_digest(MDInstance* inst, MDMPDigest* out)
         out->stale_dropped = rd.stale_dropped;
         out->reanchor_dropped = rd.reanchor_dropped;
         out->not_looking = rd.not_looking;
+        out->windows_extended = rd.windows_extended;
+        out->extension_frames = rd.extension_frames;
+        out->closed_owed = rd.closed_owed;
     }
 
     return 0;

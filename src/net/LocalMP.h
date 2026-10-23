@@ -95,6 +95,11 @@ public:
     int RecvHostPacket(int inst, u8* data, u64* timestamp);
     u16 RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask);
 
+    /* The asked AIDs whose console has sent nothing since the newest command:
+       by that console's own write counter, so "this client has not answered
+       this round" is a fact about the bus, not a guess from a clock. */
+    u16 OwedReplies(int inst, u16 aidmask) const noexcept;
+
     /* ---- reply-queue flight recorder (see Wifi::MPDiag for the other half) ----
 
        The host's side of the conversation, per instance: how many answers the
@@ -112,7 +117,10 @@ public:
         u64 stale_dropped;     // answers skipped for being older than the window
         u64 reanchor_dropped;  // unread answers discarded when a command re-anchored, or
                                // dropped to make room for a newer one (see QueueAppend)
-        u64 not_looking;       // windows that never looked: no peer on the bus
+        u64  not_looking;      // windows that never looked: no peer on the bus
+        u64  windows_extended; // windows that outlived the wall ceiling for an owed client's round
+        u64  extension_frames; // emulated frames of extra wait those windows spent
+        u64  closed_owed;      // windows that closed with answers owed after their clients ran a round
     };
 
     void GetReplyDiag(int inst, MPReplyDiag* out) const noexcept;
@@ -200,6 +208,20 @@ private:
            the peers were spending anyway, the second is frame rate thrown
            away (2026-10-22, LocalMP.cpp's reply-window cap). */
         u64  answer_us[16] {};
+
+        /* Each answered AID's console send counter at the moment the newest
+           command went out (see the note in SendPacketGeneric). An aid whose
+           owner's counter has not moved since is a client that has put nothing
+           on the wire for this round. */
+        u64  aid_baseline[16] {};
+
+        /* The same baseline for that console's own *rounds*: how many times it
+           has polled for its host's command. A guest's answer for a command
+           cannot come before it has polled that command, so this is what the
+           host's reply window measures "has the client had its chance" with
+           instead of a clock (see the note in RecvReplies). */
+        u64  host_polls = 0;
+        u64  aid_poll_baseline[16] {};
 
         /* Which console last stamped each AID, when it did, and whether a
            second console has been seen doing the same while the first was
