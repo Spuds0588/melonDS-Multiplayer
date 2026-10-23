@@ -109,6 +109,58 @@ class Pad:
         print(f"  p{self.p}: {stage} -> {out['path']}", flush=True)
 
 
+def emu_seconds(ch):
+    """The group's emulated clock, from the frame counters the host reports.
+
+    The room's own patience is written in emulated seconds (the title's deauth
+    timer), while every wall-clock sleep in this route is a wall-clock sleep;
+    at 18fps and at 60fps the same sleep is a different number of emulated
+    seconds, which is how the four-console route came to fit inside the room's
+    window on a slow group and miss it on a fast one. Stamping each step with
+    this makes the two clocks comparable in the route's own output.
+    """
+    st = ch.call(cmd="status")
+    frames = [f["seq"] for f in st.get("frames", []) if "seq" in f]
+    return min(frames) / 59.826 if frames else 0.0
+
+
+def stamp(ch, label):
+    print(f"  t={emu_seconds(ch):6.2f} emulated s | {label}", flush=True)
+
+
+def press_all_proven(pads, mask=0x1, label="", attempts=5, patience=2.2):
+    """One press to every console at once, proven landed on each.
+
+    The guests' rule panels do not depend on each other, so the presses go out
+    as a batch and the proof runs per console afterwards: a console that moved
+    drops out of the batch and the rest are pressed again. The serial form this
+    replaces paid up to 5 attempts x 2.2s *per console* - about 13s of the
+    room's emulated-second patience for three guests, which is a third of the
+    window the title gives the room.
+    """
+    pending = list(pads)
+    before = {p.p: p.sig() for p in pending}
+    for attempt in range(1, attempts + 1):
+        for p in pending:
+            p.press(mask)
+        moved_count = 0
+        start = time.time()
+        while pending and time.time() - start < patience:
+            time.sleep(0.2)
+            still = []
+            for p in pending:
+                if p.diff(p.sig(), before[p.p]) > 6.0:
+                    moved_count += 1
+                else:
+                    still.append(p)
+            pending = still
+        print(f"  batch '{label}' attempt {attempt}: {moved_count} moved, {len(pending)} to go",
+              flush=True)
+        if not pending:
+            return attempt
+    raise SystemExit(f"batch '{label}': {len(pending)} console(s) never moved - see the stage shots")
+
+
 def boot_wait(ch, players, frames=900):
     start = time.time()
     seq = {}
@@ -191,6 +243,7 @@ def main():
                 f"p{p.p}: still on the multiplayer page - the JOIN touches never "
                 "landed (see joined shot)")
     print(f"{len(guests)} guest(s) left the join browser", flush=True)
+    stamp(ch, "all guests out of the join browser")
 
     if args.hold:
         for p in pads.values():
@@ -220,9 +273,8 @@ def main():
     #    - the press the host's game waits on. Sent blind in this same order the
     #    room stays on the table, because the presses are swallowed and nothing
     #    reports it; proven one at a time it starts on the first attempt.
-    for p in guests:
-        p.press_proven(0x1, "rules panel open")
-        time.sleep(0.8)
+    stamp(ch, "all guests in the room, before the rules presses")
+    press_all_proven(guests, 0x1, "rules panel open")
     host.press_proven(0x1, "host to please-wait")
     time.sleep(1.0)
     # The second host press is the one the room swallows: it is already on
@@ -231,9 +283,8 @@ def main():
     # started a match, and the driver aborted on it in the next run).
     host.press(0x1)
     time.sleep(1.0)
-    for p in guests:
-        p.press_proven(0x1, "rules confirmed")
-        time.sleep(0.8)
+    press_all_proven(guests, 0x1, "rules confirmed")
+    stamp(ch, "every guest's rules confirmed")
 
     # Give the room time to start, then photograph every console. The verdict is
     # read from the game's own protocol afterwards - the host's log carries

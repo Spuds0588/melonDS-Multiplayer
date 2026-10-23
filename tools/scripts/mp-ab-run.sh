@@ -30,6 +30,10 @@ SAV="$PWD/Test Roms/Tetris DS (USA).sav"
 # group is *waiting* (low CPU) or *working* (CPU at the machine's limit), which
 # is how a hold's wall cost is separated from the price of the room itself.
 HOLD_S="${HOLD_S:-0}"
+# ROUTE_ARGS defaults to the route's match-start arm; `--hold` stops with every
+# guest in the room and the host's start press not made, which is the arm that
+# measures the room's own patience with nothing racing it.
+ROUTE_ARGS="${ROUTE_ARGS:---start}"
 
 python3 tools/appctl.py quit >/dev/null 2>&1
 sleep 2
@@ -47,7 +51,7 @@ for _ in $(seq 1 40); do
     sleep 1
 done
 
-python3 tools/scripts/tetris-4p.py --players "$PLAYERS" --host 1 --start > "logs/${TAG}_route.txt" 2>&1
+python3 tools/scripts/tetris-4p.py --players "$PLAYERS" --host 1 $ROUTE_ARGS > "logs/${TAG}_route.txt" 2>&1
 tail -6 "logs/${TAG}_route.txt"
 
 if [ "$HOLD_S" -gt 0 ]; then
