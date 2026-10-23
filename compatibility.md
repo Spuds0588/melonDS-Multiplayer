@@ -12,7 +12,7 @@ single-console play.
 > healthy around them. Several titles below clear the wire and stop at the
 > game's own screen — that is recorded as its own result, not rounded up.
 
-- Last updated: 2026-10-23, twenty-fifth pass (the save confound is retired by an A/B with equal arms - pin 7 wins/1 loss against written 8 wins/0 losses, Fisher p = 1.0 - and the start press's lock is localised: in a storm the guest's own software is handed 1,248 copies of the host's 264-byte start packet and its game reads the body of **none** of them, while every win reads a start packet's body (two or three packets of the two to five sent, never zero); the join-data chunk is neither necessary (abw3 won at 08) nor sufficient (t2t3 lost at 0B)) (the route's "setup table" proof was a false positive and is replaced: it only tested that the host's bottom panel moved, which the title's start handshake also does while the top screen still shows the waiting page - so eleven saved "table/setup" frames were re-scored and **one** is a table, and with an honest gate the two-cart start handshake is **15 wins in 20 trials** with the guest's own join-data chunk advancing past 08 as the only thing that separates them) (the Download Play reading of Tetris DS's start press is retired: the same 264-byte `06 01 <mask> 00 80 11 04 00 00 00 00 4E 49 4E 54 45 4E 44` handshake is sent at 2, 3 and 4 carts, and the two-cart run that plays sends it too - the card room's start is a data transfer at every count, and today's two-cart control failed it in the same shape as four carts, so player count is not the discriminator) (Tetris DS's four-console party assembles on this machine - host room listing Player 1-4, all three guests on "Accepting players now" - and then the host's own start press hands the room the download-image packet, drops its own mask to 0000 and returns all three guests to the join browser: 0 matches in one live run, with the link clean at clientfail 0; the room body is re-advertised 1.15 s after the close and read by every guest, so the browser's missing piece is its own scan, not the host's advertisement) (Tetris DS reached a live **four-console STANDARD match** for the first time, on the unchanged binary, after tracing the room's close: every guest's re-association is accepted with its AID and the host's mask returns to 000E; the same route on the next run re-formed the same room and took no press, so the match is real but not yet reproducible) (Tetris DS two-cart play is reproducible and reaches a live match - re-confirmed this pass, 1,607 match commands - while three and four carts end on the host's own room close, which lands 0.86-6.5 emulated s after each guest associates and is followed by the guests' return at two consoles and by none, or by a second close, at three and four; NSMB's host windows ran under the ask-once policy for the first time)
+- Last updated: 2026-10-23, twenty-sixth pass (the guest's copy is self-consistent with the header it carries in every field a diff can see - payload, length 288, rate, RSSI, mask, AID, 1,248 fresh seqnos, 0 bus redeliveries - so nothing in this tree explains the decline; the wall is placed at the payload's first byte: the storm's driver makes exactly 6 accesses reaching offset 34, the whole 36-byte prefix and no body, while a win makes the same six and then 128 reads to offset 234; and the three `801C 0040 A5A5 5A5A A5A5 5A5A` headers that looked like a delivery defect were this trace reading past the ring's end, now fixed and marked `WRAPS`) (the save confound is retired by an A/B with equal arms - pin 7 wins/1 loss against written 8 wins/0 losses, Fisher p = 1.0 - and the start press's lock is localised: in a storm the guest's own software is handed 1,248 copies of the host's 264-byte start packet and its game reads the body of **none** of them, while every win reads a start packet's body (two or three packets of the two to five sent, never zero); the join-data chunk is neither necessary (abw3 won at 08) nor sufficient (t2t3 lost at 0B)) (the route's "setup table" proof was a false positive and is replaced: it only tested that the host's bottom panel moved, which the title's start handshake also does while the top screen still shows the waiting page - so eleven saved "table/setup" frames were re-scored and **one** is a table, and with an honest gate the two-cart start handshake is **15 wins in 20 trials** with the guest's own join-data chunk advancing past 08 as the only thing that separates them) (the Download Play reading of Tetris DS's start press is retired: the same 264-byte `06 01 <mask> 00 80 11 04 00 00 00 00 4E 49 4E 54 45 4E 44` handshake is sent at 2, 3 and 4 carts, and the two-cart run that plays sends it too - the card room's start is a data transfer at every count, and today's two-cart control failed it in the same shape as four carts, so player count is not the discriminator) (Tetris DS's four-console party assembles on this machine - host room listing Player 1-4, all three guests on "Accepting players now" - and then the host's own start press hands the room the download-image packet, drops its own mask to 0000 and returns all three guests to the join browser: 0 matches in one live run, with the link clean at clientfail 0; the room body is re-advertised 1.15 s after the close and read by every guest, so the browser's missing piece is its own scan, not the host's advertisement) (Tetris DS reached a live **four-console STANDARD match** for the first time, on the unchanged binary, after tracing the room's close: every guest's re-association is accepted with its AID and the host's mask returns to 000E; the same route on the next run re-formed the same room and took no press, so the match is real but not yet reproducible) (Tetris DS two-cart play is reproducible and reaches a live match - re-confirmed this pass, 1,607 match commands - while three and four carts end on the host's own room close, which lands 0.86-6.5 emulated s after each guest associates and is followed by the guests' return at two consoles and by none, or by a second close, at three and four; NSMB's host windows ran under the ask-once policy for the first time)
 - Legend: ✅ playable · 🟡 partial (link or lobby, no match) · ⛔ blocked by
   single-card *Download Play* (not supported **yet** — it is a planned feature,
   Milestone 4 of [to-do.md](to-do.md#the-road-to-a-working-2-3-and-4-player-link)) ·
@@ -2841,6 +2841,60 @@ Route (P1 hosts, console 2 is the synthesized client), all taps bottom-screen co
 Past the boot both consoles show the STANDARD lobby with a 2-player roster, the host's A moves it to `Please wait until all of the players have set their rules`, the guest's A confirms, and a versus match runs on both screens with distinct live boards (different wells, different NEXT queues, gameplay-evolving 20 s apart), both frames advancing in lockstep, no further deauths. One host deauth (`reason 0x0013`) is on record mid-session with the session unaffected — unexplained, noted, nothing depends on it.
 
 First boot writes the game's save (new `Test Roms/Tetris DS (USA).sav`; supervisor-pinned, exit 0). Higher player counts (the title supports up to 10 over Download Play) and the other modes (MISSION, PUSH) are unmeasured.
+
+### 2026-10-23 (v0.1.9ex) — the copy is self-consistent with its header, and the wall is exactly at the payload's first byte
+
+The storm could not be provoked again (0 in 22 trials), so this is asked of the
+recorded exemplar instead: is the frame this tree hands the guest
+self-consistent with the 12-byte header the guest's own game reads first? The
+diff is a tool, not a reading, so it can be re-run on any pair of logs:
+`tools/scripts/delivery-field-diff.py WIN.log STORM.log`
+(`game-captures/tetris-gate-2026-10-23/delivery-field-diff.txt`).
+
+On the host's 264-byte start packet, abw3 (win) against t2t6 (storm):
+
+| field | storm (1,248 copies) | win (3 copies) |
+|---|---|---|
+| MP payload prefix | `06 01 02 00 80 11 04 00 00 00 00 4E 49 4E 54 45` | identical |
+| header length field vs reported count | `0120` = 288 in **1,245/1,248** | `0120` = 288 in 3/3 |
+| TX rate / RSSI / flags / `+2` | `0014` / `4080` / `801C` / `0040` | identical |
+| `+4` (GBATEK: not written by hardware) | varies (`0000`, `FFFF`, ...) | varies |
+| client mask / AID | `0002` / 1, "this poll is ours" | identical |
+| distinct 802.11 seqnos | **1,248 for 1,248 copies**, 0 bus redeliveries | 3 for 3 |
+| ring gap between copies | 0x154 = the frames delivered in between | 0x154 |
+| accesses the guest's game made | **exactly 6**, reaching offset 34 | same 6, then reads #64 at 106 and #128 at 234 |
+
+The last row is the finding. Six accesses in the order 0, 2, 8, 0, 12, 34 read
+the RX header's flags/`+2`/length words and then the frame's **control and
+sequence** fields - the whole 36-byte prefix, i.e. the 12-byte header and the
+24-byte 802.11 header - and not one byte of the MP body, which begins at offset
+36. The winning run's driver makes the same six accesses and then two more
+passes into the payload (offsets 106 and 234), so the decision is downstream of
+reads that are identical in both arms. It also sharpens v0.1.9ew's "header-only,
+3-6 halfwords": the counter is 6 for every storm copy, and 6 accesses reach the
+last field before the payload, not just the first three words.
+
+**The one defect the diff found was in the instrument.** Ten copies printed a
+payload of RAM fill and three printed `801C 0040 A5A5 5A5A A5A5 5A5A`, and every
+one of them sat where the printed window runs past the ring's end (0x1F60): the
+header at 1F58/1F5C, the payload window of a zone at 1F30 printing 1F54..1F63.
+The trace read the region linearly and ran past `W_RXBufEnd` into the page beyond
+the ring, where `A5`/`5A` fill lives; the frame the console was handed was
+written correctly all along. `Wifi.cpp` now walks the region with
+`IncrementRXAddr` - what the console itself does - and appends the ring's
+geometry and a `WRAPS` marker, so a log can no longer show a header that was
+never written. Checked live: `tools/scripts/mp-ab-run.sh fd2 2` reached the match
+(play phase 04, both boards, 59.8 fps, 1 failed ack of 1,474, screen at 44.45
+emulated s) and all **16** of its `WRAPS` deliveries print the same payload and a
+self-consistent header (`001E`/`0026`/`002A` lengths, `0014`, `4080`) as their
+non-wrapping siblings, where two would have printed `A5A5 5A5A` before.
+
+**Named, not fixed:** with the copy identical field for field, nothing in this
+tree is turned against the wall. The next measurement is the branch the guest's
+driver takes *after* the sixth access (a PC-tagged read at the payload boundary),
+and a capture is only worth reading when its straddling deliveries say `WRAPS`:
+the read recorder's single `[start, start+len)` bracket does not span the ring's
+wrap, so a wrapping copy's wrapped part is not attributed to it.
 
 ### 2026-10-23 (v0.1.9ew) — the save is not the variable, and the start press locks because the guest's game will not read the start packet's body
 

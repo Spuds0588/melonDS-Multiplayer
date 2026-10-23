@@ -6,8 +6,10 @@
 
 A storm (the host repeating its 264-byte start packet hundreds of times while the
 guest's join-data chunk stays at 08) is the loss this project keeps hitting, and
-the question this answers is *where* the stall lives: in the link, or in the
-guest's own game. It prints, per log:
+the question this answers is *where* the stall lives: in the link, in the copy
+this tree hands the console, or in the guest's own game.
+
+It prints, per log:
 
     host start packet   first / last time the host sent
                         `06 01 <mask> 00 80 11 04 ...` (264 B), and how many times
@@ -22,9 +24,15 @@ guest's own game. It prints, per log:
                         288 byte frame is the host's 264 byte start packet plus
                         its 24 byte 802.11 header, so this says whether the
                         packet the host is repeating ever reached the game
-    guest reads         command halfwords the guest's game read, split into
-                        header-only (3-6 halfwords: the game looks and moves on)
-                        and body (64/128 halfwords: the game read the payload)
+    guest reads         the halfwords the guest's game read out of the frame it
+                        was handed, split by where they sit: the first 12 bytes
+                        are the RX header this tree writes, everything behind it
+                        is the payload. From v0.1.9ex the value each read
+                        returned is logged too, and then the header values are
+                        compared against the header the delivery logged
+                        (`offered to this console's game: ..., header[...]`) -
+                        that comparison is the field diff: it says whether the
+                        console's game is reading the copy this tree wrote.
     guest answers after answers its game armed / sent after the first start packet
 
 Reads only what `MD_LINK_VERBOSE=1` already prints. No emulator needed.
@@ -40,8 +48,12 @@ ARM = re.compile(r"\[melonDS p(\d):Debug\] \[mp\] guest arms an answer: arm #(\d
 SENT = re.compile(r"\[melonDS p(\d):Debug\] \[mp\] answer sent: .*?body\[(\d+)\]=([0-9A-F ]+)")
 DELIVERED = re.compile(r"\[melonDS p(\d):Debug\] \[mp\] packet delivered to the console's own software: "
                        r"\d+ so far, (\d+) byte frame")
+OFFERED = re.compile(r"\[melonDS p(\d):Debug\] \[mp\] cmd seq=(\w+) offered to this console's game: "
+                     r"rxflags=(\w+), (\d+) byte 802\.11 frame, header\[([0-9A-F ]+)\] at (\w+)")
+# v0.1.9ev logged the offset only; v0.1.9ex adds `=value`.
 READ = re.compile(r"\[melonDS p(\d):Debug\] \[mp\] the console's game reads the command it was handed: "
-                  r"cmd seq=(\w+), (\d+) halfwords read so far")
+                  r"cmd seq=(\w+), (\d+) halfwords read so far, this one at (\w+)(?:=(\w+))?"
+                  r" of the (\d+) byte region from (\w+)")
 RX = re.compile(r"\[link-trace\] p(\d) rx (cmd|bcast).*?t=(\d+)")
 
 
@@ -53,16 +65,13 @@ def chunk_of(body):
     return None
 
 
-def report(path):
+def parse(path):
+    """Everything the report needs, from one log."""
     op = gzip.open if path.endswith(".gz") else open
+    out = {"frames": [], "arms": [], "sent": [], "rx": [], "delivered": [],
+           "reads": [], "body_of": {}, "offered": {}}
     pending = {}
-    frames = []          # (t, body) host transmissions
-    arms = []            # (guest, clock_us, chunk)
-    sent = []            # (guest, chunk)
-    rx = []              # (guest, kind, t)
-    delivered = []       # (guest, bytes)
-    reads = []           # (guest, halfwords, seq)
-    body_of = {}         # seq -> body, for every command the host sent
+    body_of = out["body_of"]
     with op(path, "rt", errors="replace") as f:
         for line in f:
             m = BODY.search(line)
@@ -70,41 +79,96 @@ def report(path):
                 pending[m.group(1)] = m.group(4).strip()
                 # The trace prints `body[N]=` with N the body's length but only
                 # the first 18 bytes as hex, so the length, not the text, is
-                # what classifies a command.
+                # what classifies a command. Only the host's transmissions index
+                # them: the guest's own frames reuse sequence numbers.
                 if m.group(2) == "1":
                     body_of[m.group(1)] = int(m.group(3))
                 continue
             m = TX.search(line)
             if m:
-                frames.append((int(m.group(4)), pending.pop(m.group(3), "")))
+                out["frames"].append((int(m.group(4)), pending.pop(m.group(3), "")))
                 continue
             m = DELIVERED.search(line)
             if m:
-                delivered.append((int(m.group(1)), int(m.group(2))))
+                out["delivered"].append((int(m.group(1)), int(m.group(2))))
+                continue
+            m = OFFERED.search(line)
+            if m:
+                out["offered"][(int(m.group(1)), m.group(2))] = m.group(5).split()
                 continue
             m = READ.search(line)
             if m:
-                reads.append((int(m.group(1)), int(m.group(3)), m.group(2)))
+                out["reads"].append({
+                    "guest": int(m.group(1)), "seq": m.group(2),
+                    "hw": int(m.group(3)), "off": int(m.group(4), 16),
+                    "val": int(m.group(5), 16) if m.group(5) else None,
+                    "zlen": int(m.group(6)), "zstart": int(m.group(7), 16)})
                 continue
             m = ARM.search(line)
             if m:
                 c = chunk_of(m.group(4))
                 if c is not None:
-                    arms.append((int(m.group(1)), int(m.group(6)), c))
+                    out["arms"].append((int(m.group(1)), int(m.group(6)), c))
                 continue
             m = SENT.search(line)
             if m:
                 c = chunk_of(m.group(3))
                 if c is not None:
-                    sent.append((int(m.group(1)), c))
+                    out["sent"].append((int(m.group(1)), c))
                 continue
             m = RX.search(line)
             if m:
-                rx.append((int(m.group(1)), m.group(2), int(m.group(3))))
+                out["rx"].append((int(m.group(1)), m.group(2), int(m.group(3))))
+    return out
 
-    start = [(t, b) for t, b in frames
-             if b.startswith("06 01") and " 80 11 04 " in b]
-    cont = [(t, b) for t, b in frames if b.startswith("06 01") and " 11 05 " in b]
+
+def split_reads(reads, guest):
+    """(header reads, reads past the header) for one guest.
+
+    The log line is throttled hard (first six reads of a zone, then every 64th),
+    so the *count* of lines is not a read count. What each line carries is how
+    many halfwords of that zone the game had taken when it was printed, so a
+    line at 3-6 halfwords is the game still inside the 12-byte header and a line
+    at 64+ is the game past it, reading the payload. The offset says where in
+    the zone the read landed.
+    """
+    hdr, deep = [], []
+    for r in reads:
+        if r["guest"] != guest:
+            continue
+        rel = (r["off"] - r["zstart"]) & 0x1FFE
+        (hdr if r["hw"] <= 6 else deep).append(r)
+    return hdr, deep
+
+
+def header_check(hdr, offered, only_written=True):
+    """Do the header values the game read match the header the delivery logged?
+
+    `only_written` skips halfword 2, the `+4` word the hardware leaves as it
+    stands (see `Wifi::CheckRX`): this tree does not write it, so a mismatch
+    there is the old RAM content changing, not a field we got wrong.
+    """
+    checked = mismatched = 0
+    for seq, zone in sorted({(r["seq"], r["zstart"]) for r in hdr}):
+        h = offered.get((hdr[0]["guest"], seq))
+        if not h:
+            continue
+        for r in hdr:
+            if r["seq"] != seq or r["zstart"] != zone or r["val"] is None:
+                continue
+            i = ((r["off"] - r["zstart"]) & 0x1FFE) // 2
+            if i >= len(h) or (only_written and i == 2):
+                continue
+            checked += 1
+            if r["val"] != int(h[i], 16):
+                mismatched += 1
+    return checked, mismatched
+
+
+def report(path):
+    d = parse(path)
+    start = [(t, b) for t, b in d["frames"] if b.startswith("06 01") and " 80 11 04 " in b]
+    cont = [(t, b) for t, b in d["frames"] if b.startswith("06 01") and " 11 05 " in b]
 
     print(f"== {path}")
     if not start:
@@ -112,96 +176,90 @@ def report(path):
         return
     t0, tN = start[0][0], start[-1][0]
     print(f"  host start packet: {len(start)} times, first {t0/1e6:.3f} s, "
-          f"last {tN/1e6:.3f} s, {cont and len(cont) or 0} `05` continues")
+          f"last {tN/1e6:.3f} s, {len(cont)} `05` continues")
 
     per_guest = {}
-    for g, clock, c in arms:
+    for g, clock, c in d["arms"]:
         per_guest.setdefault(g, []).append((clock, c))
-    for g in sorted(per_guest):
-        seq, last = [], None
-        for clock, c in per_guest[g]:
+    guests = sorted(per_guest)
+    for g in guests:
+        seqs, last = [], None
+        for clock, c in per_guest.get(g, []):
             if c != last:
-                seq.append(f"{c}@{clock/1e6:.3f}s")
+                seqs.append(f"{c}@{clock/1e6:.3f}s")
                 last = c
-        print(f"  guest p{g} chunks: {' -> '.join(seq) if seq else '-'}"
-              f"  ({len(per_guest[g])} answers)")
-        after = [t for gg, k, t in rx if gg == g and t > t0]
-        after_last = [t for gg, k, t in rx if gg == g and t > tN]
+        print(f"  guest p{g} chunks: {' -> '.join(seqs) if seqs else '-'}")
+
+        reads = [r for r in d["rx"] if r[0] == g]
+        after = [t for _, k, t in reads if t > t0]
+        after_last = [t for _, k, t in reads if t > tN]
         kinds = {}
-        for gg, k, t in rx:
-            if gg == g and t > t0:
+        for gg, k, _ in reads:
+            if gg == g:
                 kinds[k] = kinds.get(k, 0) + 1
-        last_read = max((t for gg, k, t in rx if gg == g), default=None)
+        last_read = max((t for _, _, t in reads), default=None)
         print(f"  guest p{g} reads after the first start packet: {len(after)} "
               f"({', '.join(f'{k} {v}' for k, v in sorted(kinds.items())) or 'none'}), "
               f"after the last one: {len(after_last)}, "
               f"last read at {last_read/1e6:.3f} s" if last_read else
               f"  guest p{g} reads after the first start packet: {len(after)}")
-        wrote = [c for g2, c in sent if g2 == g]
-        moved = len({c for c in wrote}) > 1
-        print(f"  guest p{g} answers sent after the press: {len(wrote)}, "
-              f"chunks written: {' '.join(sorted(set(wrote))) or '-'}"
-              f"{'' if moved else '  (no chunk written after the press)'}")
-        big = [b for gg, b in delivered if gg == g]
+
+        big = [b for gg, b in d["delivered"] if gg == g]
         sizes = {}
         for b in big:
             sizes[b] = sizes.get(b, 0) + 1
-        start_packets = sizes.get(288, 0)
-        print(f"  guest p{g} delivered by its own software: "
-              f"{start_packets} x 288 byte (the host's start packet) of {len(big)} frames, "
+        print(f"  guest p{g} delivered by its own software: {sizes.get(288, 0)} x 288 byte "
+              f"(the host's start packet) of {len(big)} frames, "
               f"sizes {' '.join(f'{b}:{n}' for b, n in sorted(sizes.items())[-5:])}")
-        rd = [h for gg, h, _ in reads if gg == g]
-        header = sum(1 for h in rd if h <= 6)
-        body = sum(1 for h in rd if h >= 64)
-        print(f"  guest p{g} command reads: {len(rd)} ({header} header-only, {body} read the body)")
-        # Which commands' bodies did the guest's game actually read? A payload it
-        # reads is a payload it accepted; a start packet it only header-reads is
-        # a start packet it left in the buffer.
-        kinds = {}
-        for gg, h, seq in reads:
-            if gg != g or h < 64:
-                continue
-            n = body_of.get(seq)
-            if n == 264:
-                kinds["start packet (264 B)"] = kinds.get("start packet (264 B)", 0) + 1
-            elif n == 242:
-                kinds["roster (242 B)"] = kinds.get("roster (242 B)", 0) + 1
-            else:
-                kinds[f"other ({n} B)"] = kinds.get(f"other ({n} B)", 0) + 1
-        print(f"  guest p{g} read the body of: "
-              f"{', '.join(f'{k} x{v}' for k, v in sorted(kinds.items())) or 'nothing'}")
+
+        mine = [r for r in d["reads"] if r["guest"] == g]
+        hdr, deep = split_reads(mine, g)
+        if mine:
+            print(f"  guest p{g} reads logged: {len(mine)} lines "
+                  f"({len(hdr)} still inside the 12-byte RX header, {len(deep)} past it)")
+            if deep:
+                first = min(deep, key=lambda r: r["hw"])
+                rel = (first["off"] - first["zstart"]) & 0x1FFE
+                print(f"  guest p{g} first logged read past the header (any command): "
+                      f"{first['hw']} halfwords of {first['zlen']} bytes taken, "
+                      f"at {rel} bytes into the region (the command body starts at 36)")
+            if hdr and all(r["val"] is not None for r in hdr):
+                first = hdr[0]
+                offered = d["offered"].get((g, first["seq"]))
+                if offered:
+                    print(f"  guest p{g} first command read: {' '.join(o[:4] for o in offered[:6])} "
+                          f"offered, {first['val']:04X} taken at +{((first['off'] - first['zstart']) & 0x1FFE)}")
+                checked, bad = header_check(hdr, d["offered"])
+                print(f"  guest p{g} header fields checked against the delivery: {checked}, "
+                      f"{bad} differ"
+                      f"{'' if bad == 0 else ' (halfword +4 is not written by the hardware and is not counted)'}")
+            elif hdr:
+                print(f"  guest p{g} header reads: offsets only (this log predates the "
+                      f"value being printed)")
+
+        wrote = [c for g2, c in d["sent"] if g2 == g]
+        moved = len(set(wrote)) > 1
+        print(f"  guest p{g} answers sent: {len(wrote)}, "
+              f"chunks written: {' '.join(sorted(set(wrote))) or '-'}"
+              f"{'' if moved else '  (no second chunk written)'}")
 
 
 def rows(path):
     """One line per log: the two numbers that decide whether the guest's game
     took the host's start packet, and the chunk sequence it armed."""
-    op = gzip.open if path.endswith(".gz") else open
-    body_of, reads, arms = {}, [], []
-    with op(path, "rt", errors="replace") as f:
-        for line in f:
-            m = BODY.search(line)
-            if m:
-                if m.group(2) == "1":
-                    body_of[m.group(1)] = int(m.group(3))
-                continue
-            m = READ.search(line)
-            if m and int(m.group(1)) == 2:
-                reads.append((int(m.group(3)), m.group(2)))
-                continue
-            m = ARM.search(line)
-            if m and int(m.group(1)) == 2:
-                c = chunk_of(m.group(4))
-                if c:
-                    arms.append((int(m.group(6)), c))
-    start = sum(1 for h, s in reads if h >= 64 and body_of.get(s) == 264)
-    roster = sum(1 for h, s in reads if h >= 64 and body_of.get(s) == 242)
-    seq, last = [], None
-    for _, c in arms:
-        if c != last:
-            seq.append(c)
-            last = c
-    print(f"{path.split('/')[-1]:20s} start-body-reads={start:2d} roster={roster:2d} "
-          f"chunks={'->'.join(seq) or '-'}")
+    d = parse(path)
+    for g in sorted({a[0] for a in d["arms"]}):
+        hdr, deep = split_reads(d["reads"], g)
+        start_body = sum(1 for r in deep if d["body_of"].get(r["seq"]) == 264)
+        roster = sum(1 for r in deep if d["body_of"].get(r["seq"]) == 242)
+        seq, last = [], None
+        for _, c in [(a[1], a[2]) for a in d["arms"] if a[0] == g]:
+            if c != last:
+                seq.append(c)
+                last = c
+        print(f"{path.split('/')[-1]:20s} p{g} header-reads={len(hdr):4d} "
+              f"start-body-reads={start_body:3d} roster={roster:2d} "
+              f"chunks={'->'.join(seq) or '-'}")
 
 
 def main():

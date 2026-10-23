@@ -2716,20 +2716,70 @@ void Wifi::FinishRX()
         {
             const u16 z = rxzone_start;
 
+            /* Read the region back the way the console reads it: through
+               IncrementRXAddr, which wraps at the ring's programmed end
+               (`W_RXBufEnd` -> `W_RXBufBegin`), not at the end of the RAM
+               window. The two differ, and printing the region linearly is how
+               the 2026-10-23 Tetris storm (t2t6) came to hold 3 of 1,248
+               deliveries whose header said `801C 0040 A5A5 5A5A A5A5 5A5A` and
+               10 whose payload prefix was RAM fill: every one of them had its
+               region straddle the ring end, and the page between the ring's
+               end and 0x1FFF is where the fill lives. The frame was written
+               correctly all along - the trace was reading past it, which is
+               the one thing a field diff must never do (see
+               tools/scripts/delivery-field-diff.py, which flags exactly those
+               copies). */
             char hdr[5 * 6 + 1] = "-";
+            u16 ha = z;
             for (int i = 0; i < 6; i++)
-                snprintf(&hdr[i * 5], 6, "%04X ", *(u16*)&RAM[(z + (i * 2)) & 0x1FFE]);
+            {
+                snprintf(&hdr[i * 5], 6, "%04X ", *(u16*)&RAM[ha & 0x1FFE]);
+                IncrementRXAddr(ha);
+            }
             hdr[6 * 5 - 1] = 0;
 
             /* The frame itself sits behind the 12-byte header as the console's
                own copy of it: a 24-byte 802.11 header and then the payload, so
-               the payload the game matches on is at +12+24. */
+               the payload the game matches on is at +12+24. Walked the same
+               way, halfwords at a time, because the byte order the console sees
+               is the halfword order the receive loop wrote. */
             char pay[3 * 16 + 1] = "-";
             const int paylen = (rxlen > 24) ? (rxlen - 24) : 0;
             const int payn = (paylen > 16) ? 16 : paylen;
-            for (int i = 0; i < payn; i++)
-                snprintf(&pay[i * 3], 4, "%02X ", RAM[(z + 12 + 24 + i) & 0x1FFF]);
-            if (payn > 0) pay[payn * 3 - 1] = 0;
+            {
+                u16 pa = z;
+                IncrementRXAddr(pa, 12 + 24);
+                for (int i = 0; i < payn; i += 2)
+                {
+                    const u16 hw = *(u16*)&RAM[pa & 0x1FFE];
+                    snprintf(&pay[i * 3], 4, "%02X ", hw & 0xFF);
+                    if (i + 1 < payn) snprintf(&pay[(i + 1) * 3], 4, "%02X ", hw >> 8);
+                    IncrementRXAddr(pa);
+                }
+                if (payn > 0) pay[payn * 3 - 1] = 0;
+            }
+
+            /* Whether this region straddles the ring's end, and the ring's own
+               geometry. A straddling region is the one case where the
+               recorder's single `[start, start+len)` bracket (see MPIo) cannot
+               account for every read, so a log that says `WRAPS` here is the
+               log to re-take before anything is concluded from its read
+               counts. */
+            const u16 ringbegin = IOPORT(W_RXBufBegin) & 0x1FFE;
+            const u16 ringend = IOPORT(W_RXBufEnd) & 0x1FFE;
+            bool wraps = false;
+            {
+                u16 w = z;
+                for (int i = 0; i < 12 + rxlen; i += 2)
+                {
+                    IncrementRXAddr(w);
+                    if (w == ringbegin && ringend != ringbegin) { wraps = true; break; }
+                }
+            }
+            char ring[48];
+            snprintf(ring, sizeof(ring), " ring %04X..%04X wr=%04X rd=%04X%s",
+                     ringbegin, ringend, IOPORT(W_RXBufWriteCursor),
+                     IOPORT(W_RXBufReadCursor), wraps ? " WRAPS" : "");
 
             /* Whose poll this is has to be read the way the answer path reads it
                (see MPReplyAID): the live register first, and the remembered
@@ -2745,7 +2795,7 @@ void Wifi::FinishRX()
             Log(LogLevel::Debug,
                 "[mp] cmd seq=%04X offered to this console's game: rxflags=%04X, %d byte "
                 "802.11 frame, header[%s] at %04X, payload@24[%s], clienttime %d, mask %04X, "
-                "AID %d%s (associated %d: %s)%s\n",
+                "AID %d%s (associated %d: %s)%s%s\n",
                 seqno, rxflags, rxlen, hdr, rxzone_start, pay,
                 *(u16*)&RXBuffer[0xC + 24], cmdmask,
                 myaid,
@@ -2753,7 +2803,8 @@ void Wifi::FinishRX()
                 MPMYAID,
                 (myaid && (cmdmask & (1 << myaid))) ? "this poll is ours"
                                                    : "this poll is NOT ours",
-                cmd_dupe ? ", a repeat of the previous seqno" : "");
+                cmd_dupe ? ", a repeat of the previous seqno" : "",
+                ring);
 
             /* The close slice, guest side: what this console held when the
                host's `06 01` was handed to its game. The two guests' lines are
@@ -4004,14 +4055,23 @@ void Wifi::RecordMPIoRead(u32 addr, u16 val)
                guest's game looked at the transition and stayed where it was"
                from "the frame never reached the game's hands at all", and it
                is the first few of them that matter, so it is throttled hard
-               while the recorder keeps all of them. */
+               while the recorder keeps all of them.
+
+               The value the read returned is printed with the offset since
+               v0.1.9ex: the offset alone says the game looked inside the frame
+               the recorder bracketed, but not that what it took was the header
+               this tree wrote (`801C 0040 .. TX rate, length, 4080`). With the
+               value on the line, a storm can be checked field by field against
+               a win from the log, which is the question `stall-report.py`
+               answers and the one a live MPIo dump (`appctl.py wifiio`) can only
+               answer for the delivery still in the buffer. */
             if (mp_trace() && MPIO.zone_is_cmd &&
                 (MPIO.zone_total <= 6 || (MPIO.zone_total % 64) == 0))
                 Log(LogLevel::Debug,
                     "[mp] the console's game reads the command it was handed: cmd seq=%04X, "
-                    "%llu halfwords read so far, this one at %04X of the %u byte region "
+                    "%llu halfwords read so far, this one at %04X=%04X of the %u byte region "
                     "from %04X\n",
-                    MPIO.zone_seq, (unsigned long long)MPIO.zone_total, off,
+                    MPIO.zone_seq, (unsigned long long)MPIO.zone_total, off, val,
                     (unsigned)MPIO.zone_len, (unsigned)MPIO.zone_start);
         }
     }
