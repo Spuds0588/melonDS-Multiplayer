@@ -96,7 +96,15 @@ endif()
 
 if (ENABLE_OGLRENDERER)
     add_subdirectory(OpenGL_shaders)
+    # glad is the loader the OpenGL renderer resolves its entry points through,
+    # and it used to be compiled by the Qt/SDL frontend's target. With that
+    # frontend retired (2026-10-23), core owns it: without glad.c an
+    # ENABLE_OGLRENDERER=ON build compiles and then fails at link with every
+    # gl* symbol undefined. PlatformOGL.h includes the header by path relative
+    # to itself ("frontend/glad/glad.h"), so no include directory is needed.
     target_sources(core PRIVATE
+        frontend/glad/glad.c
+
         GPU_OpenGL.cpp
         GPU2D_OpenGL.cpp
         GPU3D_OpenGL.cpp

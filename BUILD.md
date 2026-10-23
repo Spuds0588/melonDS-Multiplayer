@@ -1,33 +1,29 @@
 # Building melonDS Multiplayer
 
-This project is based on melonDS. See the original [BUILD.md](https://github.com/melonDS-emu/melonDS/blob/master/BUILD.md) for detailed build instructions for the emulator core.
-
-The build process below applies to the melonDS core. For the Tauri frontend, see the Tauri documentation.
+This repository is downstream of melonDS and has diverged far enough to be
+maintained as a sister project (history.md, "Upstream Relationship"); the recipe
+below is the one that builds what ships. Upstream's own BUILD.md covers its
+frontend, which this tree no longer carries.
 
 ## Building the multiplayer bridge
 
-The Tauri host does not use the Qt/SDL frontend. It talks to the emulator core
+The tree's only frontend is the Tauri bridge. It talks to the emulator core
 through a small C API (`src/frontend/tauri/melonds_bridge.h`), one emulator
-instance per player. That path needs no Qt and no SDL:
+instance per player. That path needs no Qt, no SDL and no enet:
 
 ```bash
 cmake -S . -B build-tauri \
   -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_QT_SDL=OFF \
-  -DBUILD_TAURI_BRIDGE=ON \
   -DENABLE_OGLRENDERER=OFF
 cmake --build build-tauri -j$(nproc)
 ```
 
-Three of those flags are not optional:
-
-* `-DENABLE_OGLRENDERER=OFF` — the OpenGL renderer compiles against the glad
-  headers that ship inside the Qt/SDL frontend, so it cannot build without it.
-  Configure stops with an explicit message if you leave it on. The bridge uses
-  the software renderer anyway, because the host reads every instance's
-  framebuffers back on the CPU each frame.
-* `-DBUILD_QT_SDL=OFF` — leaves out the desktop frontend we do not ship.
-* `-DBUILD_TAURI_BRIDGE=ON` — builds the bridge and the headless core tests.
+* `BUILD_TAURI_BRIDGE` is `ON` by default and also builds the headless core
+  tests (`md_smoke_test`, `md_capture`, `md_game_session`).
+* `-DENABLE_OGLRENDERER=OFF` is what the app wants, not what it requires: the
+  bridge reads every instance's framebuffers back on the CPU and uses the
+  software renderer. The OpenGL renderer configures and links with no frontend
+  present (`glad.c` is compiled into `core`), so a build can leave it on.
 
 ### Tauri host application
 
@@ -68,7 +64,7 @@ Release` for MSVC's multi-config generator:
 
 ```bash
 cmake -S . -B build-tauri -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_QT_SDL=OFF -DBUILD_TAURI_BRIDGE=ON -DENABLE_OGLRENDERER=OFF
+  -DENABLE_OGLRENDERER=OFF
 cmake --build build-tauri --config Release --parallel
 cargo tauri build            # from src-tauri/, bundles the host
 ```
@@ -249,7 +245,7 @@ cmake -S . -B build-tauri-win -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=<cargo-xwin's x86_64-pc-windows-msvc-toolchain.cmake> \
   -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl \
   -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_QT_SDL=OFF -DBUILD_TAURI_BRIDGE=ON -DENABLE_OGLRENDERER=OFF \
+  -DENABLE_OGLRENDERER=OFF \
   -DENABLE_LTO_RELEASE=OFF -DENABLE_LTO=OFF \
   -DDIRENT_INCLUDE_DIRS=<directory with dirent.h>
 cmake --build build-tauri-win --target melonds_bridge -j$(nproc)
@@ -980,7 +976,7 @@ trace stops at the platform boundary. Inside the emulated wireless hardware a
   frame and the total is bounded.
 * **Each console has its own MAC.** `md_load_rom` assigns a per-slot MAC out of
   the firmware image (slot 0 keeps the firmware's, the rest get offsets - the
-  same scheme melonDS's Qt frontend uses for its extra instances), because two
+  same scheme upstream melonDS's Qt frontend used for its extra instances), because two
   consoles that present the same identity cannot be told apart by a game: MKDS
   builds its group list out of host MACs, so a joiner sharing the host's MAC
   cannot see the group. The bridge logs the address it gave each console
@@ -1801,123 +1797,6 @@ Notes from building it:
   1-based everywhere in `appctl.py`; the button names are `a b select start
   right left up down r l x y`, composable with `+`, or a raw mask in hex.
 
-## Building the melonDS Core
-
-* [Linux](#linux)
-* [Windows](#windows)
-* [macOS](#macos)
-
-### The core is linked by two frontends, and CI builds both
-
-The desktop app is the Tauri host (`release-tauri.yml`), but this fork still
-carries the inherited Qt/SDL frontend in `src/frontend/qt_sdl`, and the upstream
-workflows (`.github/workflows/build-{ubuntu,windows,macos,bsd}.yml`) build and
-package it on every push to `master`. That frontend links the same `core`
-archive as the Tauri bridge, so **anything the core calls through `Platform::`
-has to exist in both `src/frontend/tauri/PlatformBridge.cpp` and
-`src/frontend/qt_sdl/Platform.cpp`** - a hook added to one of them is an
-undefined symbol in the other, at link time, only on the platform that builds
-that frontend.
-
-That is how the reply rendezvous broke CI on 2026-10-23: `MP_SetReplyEager` and
-`MP_SetReplyHold` were added for the Tauri bridge, and the Windows (x86_64 and
-arm64) and macOS jobs died with `undefined symbol melonDS::Platform::MP_SetReplyHold`
-/ `MP_SetReplyEager`. Both are now defined in the Qt frontend as forwards to
-`MPInterface::Get()`.
-
-This section describes the tree **as it stands**. Retiring the inherited Qt/SDL
-CI — and deciding whether that frontend stays in the tree at all — is a tracked
-task ("Rebuild the CI around what this repo ships", to-do.md, Phase 1). Until it
-lands, the Windows/macOS jobs are the only place this class of link failure is
-caught.
-
-Two things to know when reading a red or green run:
-
-* **The Ubuntu job passes without building the frontend correctly.** It sets
-  `continue-on-error: true` at job level, so a link failure there is reported as
-  a green workflow; do not read its artifact as proof.
-* **A local Tauri build cannot catch this class of failure.** It configures with
-  `-DBUILD_QT_SDL=OFF`, so the Qt translation units are never compiled. If a
-  `Platform::` function is added, either build the Qt frontend (`cmake -B build
-  -DBUILD_QT_SDL=ON`, needs Qt6 + SDL2) or wait for the Windows/macOS CI run,
-  which is the only place it is exercised here.
-
-## Linux
-1. Install dependencies:
-   * Ubuntu:
-     * All versions: `sudo apt install cmake extra-cmake-modules libcurl4-gnutls-dev libpcap0.8-dev libsdl2-dev libarchive-dev libenet-dev libzstd-dev libfaad-dev`
-     * 24.04: `sudo apt install qt6-{base,base-private,multimedia,svg}-dev`
-     * 22.04: `sudo apt install qtbase6-dev qtbase6-private-dev qtmultimedia6-dev libqt6svg6-dev`
-     * Older versions: `sudo apt install qtbase5-dev qtbase5-private-dev qtmultimedia5-dev libqt5svg5-dev`  
-       Also add `-DUSE_QT6=OFF` to the first CMake command below.
-   * Fedora: `sudo dnf install gcc-c++ cmake extra-cmake-modules SDL2-devel libarchive-devel enet-devel libzstd-devel faad2-devel qt6-{qtbase,qtbase-private,qtmultimedia,qtsvg}-devel wayland-devel`
-   * Arch Linux: `sudo pacman -S base-devel cmake extra-cmake-modules git libpcap sdl2 qt6-{base,multimedia,svg} libarchive enet zstd faad2`
-2. Download the melonDS repository and prepare:
-   ```bash
-   git clone https://github.com/melonDS-emu/melonDS
-   cd melonDS
-   ```
-3. Compile:
-   ```bash
-   cmake -B build
-   cmake --build build -j$(nproc --all)
-   ```
-
-## Windows
-1. Install [MSYS2](https://www.msys2.org/)
-2. Open the MSYS2 terminal from the Start menu:
-   * For x64 systems (most common), use **MSYS2 UCRT64**
-   * For ARM64 systems, use **MSYS2 CLANGARM64**
-3. Update the packages using `pacman -Syu` and reopen the same terminal if it asks you to
-4. Install git and clone the repository
-   ```bash
-   pacman -S git
-   git clone https://github.com/melonDS-emu/melonDS
-   cd melonDS
-   ```
-5. Install dependencies:  
-   Replace `<prefix>` below with `mingw-w64-ucrt-x86_64` on x64 systems, or `mingw-w64-clang-aarch64` on ARM64 systems.
-   ```bash
-   pacman -S <prefix>-{toolchain,cmake,SDL2,libarchive,enet,zstd,faad2}
-   ```
-6. Install Qt and configure the build directory
-   * Dynamic builds (with DLLs)
-     1. Install Qt: `pacman -S <prefix>-{qt6-base,qt6-svg,qt6-multimedia,qt6-svg,qt6-tools}`
-     2. Set up the build directory with `cmake -B build`
-   * Static builds (without DLLs, standalone executable)
-     1. Install Qt: `pacman -S <prefix>-qt5-static`  
-        (Note: As of writing, the `qt6-static` package does not work.)
-     2. Set up the build directory with `cmake -B build -DBUILD_STATIC=ON -DUSE_QT6=OFF -DCMAKE_PREFIX_PATH=$MSYSTEM_PREFIX/qt5-static`
-7. Compile: `cmake --build build`
-
-If everything went well, melonDS should now be in the `build` folder. For dynamic builds, you may need to run melonDS from the MSYS2 terminal in order for it to find the required DLLs.
-
-## macOS
-1. Install the [Homebrew Package Manager](https://brew.sh)
-2. Install dependencies: `brew install git pkg-config cmake sdl2 qt@6 libarchive enet zstd faad2`
-3. Download the melonDS repository and prepare:
-   ```zsh
-   git clone https://github.com/melonDS-emu/melonDS
-   cd melonDS
-   ```
-4. Compile:
-   ```zsh
-   cmake -B build -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6);$(brew --prefix libarchive)"
-   cmake --build build -j$(sysctl -n hw.logicalcpu)
-   ```
-If everything went well, melonDS.app should now be in the `build` directory.
-
-### Self-contained app bundle
-If you want an app bundle that can be distributed to other computers without needing to install dependencies through Homebrew, you can additionally run `
-../tools/mac-libs.rb .` after the build is completed, or add `-DMACOS_BUNDLE_LIBS=ON` to the first CMake command.
-
-## Nix (macOS/Linux)
-
-melonDS provides a Nix flake with support for both macOS and Linux. The [Nix package manager](https://nixos.org) needs to be installed to use it.
-
-* To run melonDS, just type `nix run github:melonDS-emu/melonDS`.
-* To get a shell for development, clone the melonDS repository and type `nix develop` in its directory.
-
 **`mem --cpu 7` reads the ARM7's own address space, and until 2026-09-29 nothing
 could.** `md_read_ram` walked `ARM9Read32`, so every question about the ARM7 side
 (WRAM at `0x03800000`, the game's own ARM7 image in shared WRAM at `0x06000000`)
@@ -1998,3 +1877,49 @@ at `0x037F8000` where the SDK's IPC library lives, holding the `0x04000188` and
 `0x04000184` literals and the `WaitForInterrupt` loop - is a different memory from
 ARM7 WRAM (`0x03800000`, which reads zero at those offsets) and is what
 `mem --cpu 7 037F8000` returns.
+
+## Building the melonDS Core
+
+The core (`src/`, CMake target `core`) builds with no frontend at all: no Qt, no
+SDL, no enet. The tree's only frontend is the Tauri bridge
+(`src/frontend/tauri`), and the desktop app's recipe at the top of this file is
+the whole build. For a bare core plus bridge:
+
+```bash
+cmake -S . -B build-tauri -DCMAKE_BUILD_TYPE=Release
+cmake --build build-tauri -j$(nproc)
+```
+
+`BUILD_TAURI_BRIDGE` now defaults to `ON` (it was the only reason the option
+existed), and `ENABLE_OGLRENDERER` is independent of any frontend: the OpenGL
+renderer compiles against the glad headers that live at `src/frontend/glad`, and
+the Tauri bridge configures it off because it reads each instance's framebuffers
+back on the CPU.
+
+### The Qt/SDL frontend is retired (2026-10-23)
+
+`src/frontend/qt_sdl` was upstream melonDS's desktop frontend. This fork's app is
+a Tauri host plus webview, and the Qt frontend was never shipped; keeping it had
+a real cost. The four inherited workflows (`build-{ubuntu,windows,macos,bsd}.yml`)
+built and packaged it on every push, so when the core grew a `Platform::` hook
+only the Tauri bridge implemented, Windows and macOS went red on a frontend this
+project does not distribute - and the Ubuntu job hid the same link failure behind
+`continue-on-error: true`. It is gone, along with those four workflows and the
+`BUILD_QT_SDL` option. What remains under `src/frontend` is the GL helpers
+(`glad`, `duckstation`), kept because the core's OpenGL renderer compiles against
+glad - and now compiles `glad.c` into `core` itself - while a future frontend would
+want the context code.
+
+**What a frontend has to provide** - a libretro core included - is `src/Platform.h`:
+implement those functions (network/MP, audio, input, timing, logging; the MP
+hooks are `MP_SetReplyEager`/`MP_SetReplyHold`, and the Tauri bridge shows the
+shape) and link `core`. Nothing else in the Qt frontend was load-bearing for the
+core: no core translation unit includes a header from it, and the core's own
+`LocalMP` bus (the virtual link cable) lives in `src/net/`. A libretro port is a
+new frontend, not a restoration of this one.
+
+Upstream fixes are pulled by hand from here. This repository is downstream of
+melonDS and has diverged far enough to be maintained as a sister project; the
+upstream build matrix is not inherited any more. See the CI task in `to-do.md`
+for what still has to replace it (a Tauri matrix on `master`/PRs plus the core
+gates).

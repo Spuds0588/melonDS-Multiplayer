@@ -239,6 +239,3 @@ Inspired by the approach of [mgba-splitscreen](https://github.com/Spuds0588/mgba
 ## License
 
 This project incorporates code from melonDS which is licensed under the GNU GPL v3. See the [LICENSE](./LICENSE) file for details.
-
-### External
-* Images used in the Input Config Dialog - see `src/frontend/qt_sdl/InputConfig/resources/LICENSE.md`

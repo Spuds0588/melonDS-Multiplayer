@@ -118,9 +118,10 @@ jobs:
             # core is not slower in any way this app can measure.
             args+=("-DENABLE_LTO_RELEASE=OFF" "-DENABLE_LTO=OFF")
           fi
+          # BUILD_QT_SDL is gone with the retired Qt/SDL frontend (2026-10-23):
+          # the Tauri bridge is the tree's only frontend now.
           cmake -S . -B build-tauri \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_QT_SDL=OFF \
             -DBUILD_TAURI_BRIDGE=ON \
             -DENABLE_OGLRENDERER=OFF \
             "${args[@]}"

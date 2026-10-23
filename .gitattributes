@@ -1,7 +1,5 @@
 # Vendored Dependencies
 src/frontend/glad/**                         linguist-vendored
-src/frontend/qt_sdl/gif-h/**                 linguist-vendored
-src/frontend/qt_sdl/toml/**                  linguist-vendored
 src/net/libslirp/**                          linguist-vendored
 src/net/pcap/**                              linguist-vendored
 src/sha1/**                                  linguist-vendored

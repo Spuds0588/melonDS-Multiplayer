@@ -22,12 +22,10 @@ project(melonDS-Multiplayer
     HOMEPAGE_URL "https://github.com/Spuds0588/melonDS-Multiplayer"
     LANGUAGES C CXX)
 
-# Upstream's Qt frontend stamps this into the Windows resource file
-# (src/frontend/qt_sdl/CMakeLists.txt, `string(REPLACE ... MELON_RC_VERSION)`)
-# and the .rc template's FileVersion. Upstream defines it beside its own
-# project() call; renaming the project here dropped it, and a Windows configure
-# then failed with "string sub-command REPLACE requires at least four arguments"
-# because the argument was empty. Keep it defined for every platform.
+# Stamped into src/version.h (`MELONDS_VERSION_BASE`), which the app's About
+# panel and the bridge's version check read. The Windows resource template that
+# used to need `MELON_RC_VERSION` next to it went out with the retired Qt/SDL
+# frontend (2026-10-23); this variable is still the app's version.
 set(melonDS_VERSION "${PROJECT_VERSION}")
 
 include(CheckSymbolExists)
@@ -111,29 +109,20 @@ if (ENABLE_GDBSTUB)
     add_definitions(-DGDBSTUB_ENABLED)
 endif()
 
-option(BUILD_QT_SDL "Build Qt/SDL frontend" ON)
+# melonDS Multiplayer: the Tauri host drives the core through this bridge.
+# This is the tree's only frontend since the inherited Qt/SDL one was retired
+# (2026-10-23, history.md); the core builds on its own, and a future frontend
+# (a libretro core included) links it by implementing src/Platform.h.
+option(BUILD_TAURI_BRIDGE "Build the Tauri multiplayer native bridge" ON)
 
-# melonDS Multiplayer: the Tauri host drives the core through this bridge
-# instead of the Qt/SDL frontend. Turn BUILD_QT_SDL off when building for
-# the multiplayer app.
-option(BUILD_TAURI_BRIDGE "Build the Tauri multiplayer native bridge" OFF)
-
-# The OpenGL renderer compiles against the glad headers that ship inside the
-# Qt/SDL frontend, so it cannot be built without it. Without this check the
-# failure surfaces much later as a missing "frontend/glad/glad.h".
-if (ENABLE_OGLRENDERER AND NOT BUILD_QT_SDL)
-    message(FATAL_ERROR
-        "ENABLE_OGLRENDERER requires the glad headers that come with the Qt/SDL frontend. "
-        "Either configure with -DBUILD_QT_SDL=ON, or use -DENABLE_OGLRENDERER=OFF "
-        "(which is what the Tauri multiplayer bridge wants, since it reads each "
-        "instance's framebuffers back on the CPU).")
-endif()
+# The OpenGL renderer (ENABLE_OGLRENDERER, above) compiles against the glad
+# headers at src/frontend/glad, which are kept in the tree for it - they used to
+# arrive with the Qt/SDL frontend, and a configure without it failed later as a
+# missing "frontend/glad/glad.h". The Tauri bridge reads framebuffers on the CPU
+# and configures with -DENABLE_OGLRENDERER=OFF; nothing needs the Qt frontend
+# for the GL path any more.
 
 add_subdirectory(src)
-
-if (BUILD_QT_SDL)
-    add_subdirectory(src/frontend/qt_sdl)
-endif()
 
 if (BUILD_TAURI_BRIDGE)
     add_subdirectory(src/frontend/tauri)
