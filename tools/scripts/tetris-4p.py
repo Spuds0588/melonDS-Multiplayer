@@ -91,6 +91,23 @@ class Pad:
         left = (self.p - 1) * 256
         return im.crop((left, 192, left + 256, 384)).resize((64, 48), Image.BOX).tobytes()
 
+    def top_page(self):
+        """(mean grey level, thumbnail) of this console's top screen, one shot.
+
+        The lit pages this route cares about sit around 100-123 (the waiting
+        page 122.7, the setup table 100.7); the title's transition and its "A
+        communication error has occurred" page sit at 5-7. Measured on the
+        saved screenshots, 2026-10-23.
+        """
+        from PIL import Image
+
+        out = self.ch.call(cmd="shot", name=f"tetris4p-top-p{self.p}")
+        im = Image.open(out["path"]).convert("L")
+        left = (self.p - 1) * 256
+        page = im.crop((left, 0, left + 256, 192))
+        px = list(page.getdata())
+        return sum(px) / len(px), page.resize((64, 48), Image.BOX).tobytes()
+
     @staticmethod
     def diff(a, b):
         return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
@@ -145,6 +162,71 @@ def reenter_room(pad):
     time.sleep(0.8)
     pad.press(0x1)
     time.sleep(0.6)
+
+
+def open_setup_table(host, presses=2, settle=8.0, lit=80.0, top=115.0):
+    """The host's A opens the setup table - or runs the start handshake and takes
+    the party with it, and only the first of those may be called a stage.
+
+    The proof this replaces was `press_proven`, whose only test is "this console's
+    bottom panel moved". Measured 2026-10-23: when the handshake runs, the host's
+    **bottom** panel moves to "Transmitting data... Please wait a moment." /
+    "Sending data..." while its **top** screen stays on "Waiting for other players
+    to join" - so a party that was already gone passed that proof (t2ctl, and the
+    saved `tetris4p-setup-p1.png` of the 2026-10-22 driver run, whose top screen
+    averages 7/255).
+
+    The stage is therefore a page read off the host's own top screen, in two
+    parts, both measured rather than assumed:
+
+      * **a band, not a floor.** The table reads 100.7-101/255 on this machine,
+        the waiting page 122.6, the host's cross-fade 51 (t2t3, which then lost
+        its rules press) and the blank / communication-error pages 4.8-7. So the
+        table sits *below* the waiting page: a floor of 40 already admitted a
+        fade, and the top of the band keeps a waiting page whose player list
+        changed (``d`` alone cannot, the list moves the page by ~8).
+      * **two samples in a row.** One sample can land mid-fade; the confirmation
+        costs 0.4 s of a settle budget of 8.0.
+
+    A dark screen mid-wait is not a failure by itself - the title blanks its
+    screen while it hands the party over - so the loop waits it out and only
+    reports at the end, naming which shape was on screen. A press that moves
+    nothing at all was swallowed and is sent once more.
+    """
+    waiting = host.top_page()[1]
+    landing = False
+    for attempt in range(1, presses + 1):
+        before_bottom = host.sig()
+        host.press(0x1)
+        start = time.time()
+        confirms = 0
+        while time.time() - start < settle:
+            time.sleep(0.4)
+            bright, page = host.top_page()
+            found = lit <= bright <= top and host.diff(page, waiting) > 6.0
+            confirms = confirms + 1 if found else 0
+            if confirms >= 2:
+                print(f"  p{host.p}: setup table (attempt {attempt}), top screen "
+                      f"{bright:.0f}/255, confirmed on two samples", flush=True)
+                return attempt
+            if host.diff(host.sig(), before_bottom) > 6.0:
+                landing = True
+        if landing:
+            break
+        print(f"  p{host.p}: setup press swallowed (nothing on this console moved)",
+              flush=True)
+    bright, page = host.top_page()
+    shape = ("the waiting page" if host.diff(page, waiting) <= 6.0
+             else "a page that is not the waiting page")
+    host.shot("setup-failed")
+    raise SystemExit(
+        f"p{host.p}: the setup table never opened - the host's top screen shows "
+        f"{shape} at {bright:.0f}/255 (the table reads {lit:.0f}-{top:.0f}). A lit "
+        "waiting page over a bottom panel that moved is the title's data transfer "
+        "('Transmitting data... Please wait a moment.' / 'Sending data...'), a "
+        "mid-grey page is its cross-fade, and a dark screen is its transition or "
+        "its 'A communication error has occurred' page - either way the party is "
+        "not in the room. See the stage shots.")
 
 
 def press_all_proven(pads, mask=0x1, label="", attempts=5, patience=2.2, recover=None):
@@ -289,8 +371,10 @@ def main():
     #    once each guest's own game has finished associating: pressed too early
     #    it is swallowed (measured 2026-10-22 - the same press that opens the
     #    table 6s after a guest's accept does nothing 1.5s after it). So it is
-    #    pressed until the host's own panel changes, not once.
-    host.press_proven(0x1, "setup table")
+    #    pressed until the host's own top page changes, not once - and the same
+    #    check is what tells "table" from "the handshake ran and the party went
+    #    with it" (see open_setup_table).
+    open_setup_table(host)
     time.sleep(1.0)
     for p in pads.values():
         p.shot("setup")
