@@ -1807,6 +1807,35 @@ Notes from building it:
 * [Windows](#windows)
 * [macOS](#macos)
 
+### The core is linked by two frontends, and CI builds both
+
+The desktop app is the Tauri host (`release-tauri.yml`), but this fork still
+carries the inherited Qt/SDL frontend in `src/frontend/qt_sdl`, and the upstream
+workflows (`.github/workflows/build-{ubuntu,windows,macos,bsd}.yml`) build and
+package it on every push to `master`. That frontend links the same `core`
+archive as the Tauri bridge, so **anything the core calls through `Platform::`
+has to exist in both `src/frontend/tauri/PlatformBridge.cpp` and
+`src/frontend/qt_sdl/Platform.cpp`** - a hook added to one of them is an
+undefined symbol in the other, at link time, only on the platform that builds
+that frontend.
+
+That is how the reply rendezvous broke CI on 2026-10-23: `MP_SetReplyEager` and
+`MP_SetReplyHold` were added for the Tauri bridge, and the Windows (x86_64 and
+arm64) and macOS jobs died with `undefined symbol melonDS::Platform::MP_SetReplyHold`
+/ `MP_SetReplyEager`. Both are now defined in the Qt frontend as forwards to
+`MPInterface::Get()`.
+
+Two things to know when reading a red or green run:
+
+* **The Ubuntu job passes without building the frontend correctly.** It sets
+  `continue-on-error: true` at job level, so a link failure there is reported as
+  a green workflow; do not read its artifact as proof.
+* **A local Tauri build cannot catch this class of failure.** It configures with
+  `-DBUILD_QT_SDL=OFF`, so the Qt translation units are never compiled. If a
+  `Platform::` function is added, either build the Qt frontend (`cmake -B build
+  -DBUILD_QT_SDL=ON`, needs Qt6 + SDL2) or wait for the Windows/macOS CI run,
+  which is the only place it is exercised here.
+
 ## Linux
 1. Install dependencies:
    * Ubuntu:
