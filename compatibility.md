@@ -12,7 +12,7 @@ single-console play.
 > healthy around them. Several titles below clear the wire and stop at the
 > game's own screen — that is recorded as its own result, not rounded up.
 
-- Last updated: 2026-10-23, twenty-fourth pass (the route's "setup table" proof was a false positive and is replaced: it only tested that the host's bottom panel moved, which the title's start handshake also does while the top screen still shows the waiting page - so eleven saved "table/setup" frames were re-scored and **one** is a table, and with an honest gate the two-cart start handshake is **9 wins in 14 trials** with the guest's own join-data chunk advancing past 08 as the only thing that separates them) (the Download Play reading of Tetris DS's start press is retired: the same 264-byte `06 01 <mask> 00 80 11 04 00 00 00 00 4E 49 4E 54 45 4E 44` handshake is sent at 2, 3 and 4 carts, and the two-cart run that plays sends it too - the card room's start is a data transfer at every count, and today's two-cart control failed it in the same shape as four carts, so player count is not the discriminator) (Tetris DS's four-console party assembles on this machine - host room listing Player 1-4, all three guests on "Accepting players now" - and then the host's own start press hands the room the download-image packet, drops its own mask to 0000 and returns all three guests to the join browser: 0 matches in one live run, with the link clean at clientfail 0; the room body is re-advertised 1.15 s after the close and read by every guest, so the browser's missing piece is its own scan, not the host's advertisement) (Tetris DS reached a live **four-console STANDARD match** for the first time, on the unchanged binary, after tracing the room's close: every guest's re-association is accepted with its AID and the host's mask returns to 000E; the same route on the next run re-formed the same room and took no press, so the match is real but not yet reproducible) (Tetris DS two-cart play is reproducible and reaches a live match - re-confirmed this pass, 1,607 match commands - while three and four carts end on the host's own room close, which lands 0.86-6.5 emulated s after each guest associates and is followed by the guests' return at two consoles and by none, or by a second close, at three and four; NSMB's host windows ran under the ask-once policy for the first time)
+- Last updated: 2026-10-23, twenty-fourth pass (the route's "setup table" proof was a false positive and is replaced: it only tested that the host's bottom panel moved, which the title's start handshake also does while the top screen still shows the waiting page - so eleven saved "table/setup" frames were re-scored and **one** is a table, and with an honest gate the two-cart start handshake is **15 wins in 20 trials** with the guest's own join-data chunk advancing past 08 as the only thing that separates them) (the Download Play reading of Tetris DS's start press is retired: the same 264-byte `06 01 <mask> 00 80 11 04 00 00 00 00 4E 49 4E 54 45 4E 44` handshake is sent at 2, 3 and 4 carts, and the two-cart run that plays sends it too - the card room's start is a data transfer at every count, and today's two-cart control failed it in the same shape as four carts, so player count is not the discriminator) (Tetris DS's four-console party assembles on this machine - host room listing Player 1-4, all three guests on "Accepting players now" - and then the host's own start press hands the room the download-image packet, drops its own mask to 0000 and returns all three guests to the join browser: 0 matches in one live run, with the link clean at clientfail 0; the room body is re-advertised 1.15 s after the close and read by every guest, so the browser's missing piece is its own scan, not the host's advertisement) (Tetris DS reached a live **four-console STANDARD match** for the first time, on the unchanged binary, after tracing the room's close: every guest's re-association is accepted with its AID and the host's mask returns to 000E; the same route on the next run re-formed the same room and took no press, so the match is real but not yet reproducible) (Tetris DS two-cart play is reproducible and reaches a live match - re-confirmed this pass, 1,607 match commands - while three and four carts end on the host's own room close, which lands 0.86-6.5 emulated s after each guest associates and is followed by the guests' return at two consoles and by none, or by a second close, at three and four; NSMB's host windows ran under the ask-once policy for the first time)
 - Legend: ✅ playable · 🟡 partial (link or lobby, no match) · ⛔ blocked by
   single-card *Download Play* (not supported **yet** — it is a planned feature,
   Milestone 4 of [to-do.md](to-do.md#the-road-to-a-working-2-3-and-4-player-link)) ·
@@ -2842,7 +2842,7 @@ Past the boot both consoles show the STANDARD lobby with a 2-player roster, the 
 
 First boot writes the game's save (new `Test Roms/Tetris DS (USA).sav`; supervisor-pinned, exit 0). Higher player counts (the title supports up to 10 over Download Play) and the other modes (MISSION, PUSH) are unmeasured.
 
-### 2026-10-23 (v0.1.9ev) — the "setup table" proof was a false positive, and with it honest the two-cart start handshake is 9 wins in 14 trials whose only separator is the guest's own join-data chunk
+### 2026-10-23 (v0.1.9ev) — the "setup table" proof was a false positive, and with it honest the two-cart start handshake is 15 wins in 20 trials whose only separator is the guest's own join-data chunk
 
 The route proved the stage with `press_proven(0x1, "setup table")`, whose only test
 is that the host's bottom panel moved. The title's start handshake also moves that
@@ -2875,9 +2875,14 @@ saved files; of eleven saved "table/setup" frames **one** is a table.
 | `3p_table_p1/p2/p3.png`, `ctl_nopress_table.png`, `tetris4p-setup-p1/p2.png`, `three-console-setup-p1.png` | 7.0 | dark transition |
 | `tetris-3p-rendezvous-2026-10-23/three-console-table.png`, `tetris-3p-2026-10-22/3p-table-pleasewait.png` | 4.8 | dark page |
 
-**Fourteen two-cart trials, one cold binary, one route** (`game-captures/tetris-gate-2026-10-23/`):
-**9 wins, 5 losses** - 2 with no room at all (no start packet), 2 storms, 1 clean
-handshake whose guest never took a rules press. The fastest win against the
+**Twenty two-cart trials, one cold binary, one route** (`game-captures/tetris-gate-2026-10-23/`):
+**15 wins, 5 losses** - 9/5 in the first fourteen, then **6/6** once the gate had
+its final rule and the app's own per-console frame counters were sampled (2,377-2,409
+frames in 39.8-40.3 s, **59.8 fps** on both consoles, 0.90-0.93 cores of app CPU).
+The five losses: 2 with no room at all (no start packet), 2 storms, 1 clean
+handshake whose guest never took a rules press; all five are in the first block, so
+the last eight trials are 8 wins in a row since the Tetris save was restored to its
+pinned md5 - a lead for a controlled A/B, not a cause. The fastest win against the
 fastest storm (t2t2 35.7 s vs t2t6 35.5 s):
 
 | | t2t2 (win) | t2t6 (storm) |
@@ -2886,11 +2891,11 @@ fastest storm (t2t2 35.7 s vs t2t6 35.5 s):
 | guest join-data chunk | 08 -> 0B | **08 -> 08** |
 | room body | 30.639 s | never |
 | acks / clientfail | 785 / 0 | 1,475 / 0 |
-| fps | 59.8 / 59.9 | 59.6 / 59.9 |
 | app CPU | 0.87 cores | 0.86 cores |
 
-So the separator is not the wire, the load or the frame rate: it is whether the
-guest's own game advances its join-data chunk past 08. Wins are not one recipe
+So the separator is not the wire, the load or the frame rate (the sampled block ran
+at 59.8 fps with CPU 0.04-0.07 cores above the storm's, the same order as the run-to-run spread): it is whether the guest's
+own game advances its join-data chunk past 08. Wins are not one recipe
 either - seven landed on 0B, **two on 0A**, and t2w1 needed 5 start packets and 294
 continues. Nothing in this tree gates that chunk, so no source change follows from
 it; and t2t3 shows a completed transfer (chunk 0B, room body) can still die at the
