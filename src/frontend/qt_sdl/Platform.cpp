@@ -511,6 +511,27 @@ u16 MP_RecvReplies(u8* data, u64 timestamp, u16 aidmask, void* userdata)
     return MPInterface::Get().RecvReplies(inst, data, timestamp, aidmask);
 }
 
+/* The two reply-window modes the core's Wifi asks the platform for. They exist
+   in `Platform.h` for every frontend because `Wifi::ProcessTX` calls them
+   unconditionally, but they are properties of the bus, not of a console, so the
+   Qt frontend's single shared bus takes them without an instance.
+
+   Missing these two was not a warning: the inherited Qt/SDL build links
+   `core.lib` against this file, and on 2026-10-23 its Windows and macOS jobs
+   failed with `undefined symbol melonDS::Platform::MP_SetReplyEager(bool)` and
+   `... MP_SetReplyHold(bool)` - the Tauri bridge defines them, so only the
+   desktop app's own build was green. Anything the core calls has to exist in
+   every frontend that links it. */
+void MP_SetReplyEager(bool eager)
+{
+    MPInterface::Get().SetReplyEager(eager);
+}
+
+void MP_SetReplyHold(bool hold)
+{
+    MPInterface::Get().SetReplyHold(hold);
+}
+
 
 int Net_SendPacket(u8* data, int len, void* userdata)
 {
